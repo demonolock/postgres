@@ -18,7 +18,7 @@ include $(top_builddir)/src/Makefile.global
 
 export GZIP_PROGRAM=$(GZIP)
 
-override CPPFLAGS := -I$(libpq_srcdir) $(CPPFLAGS)
+override CPPFLAGS := -g -I$(libpq_srcdir) $(CPPFLAGS)
 LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport)
 
 OBJS = \
@@ -32,7 +32,8 @@ OBJS = \
 	pg_backup_directory.o \
 	pg_backup_null.o \
 	pg_backup_tar.o \
-	pg_backup_utils.o
+	pg_backup_utils.o \
+	masking.o
 
 all: pg_dump pg_restore pg_dumpall
 

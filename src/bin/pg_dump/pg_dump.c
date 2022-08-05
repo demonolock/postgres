@@ -65,6 +65,7 @@
 #include "pg_backup_utils.h"
 #include "pg_dump.h"
 #include "storage/block.h"
+#include "masking.h"
 
 typedef struct
 {
@@ -585,7 +586,6 @@ main(int argc, char **argv)
 
 			case 5:				/* section */
 				set_dump_section(optarg, &dopt.dumpSections);
-                dopt.cant_be_masked = true;
 				break;
 
 			case 6:				/* snapshot */
@@ -625,7 +625,7 @@ main(int argc, char **argv)
 				break;
 
             case 13:			/* masking */
-                simple_string_list_append(optarg, &dopt);
+                dopt.masking_params = parse_masking_params(optarg, &dopt);
                 break;
 
 			default:
@@ -678,7 +678,7 @@ main(int argc, char **argv)
 	if (dopt.if_exists && !dopt.outputClean)
 		pg_fatal("option --if-exists requires option -c/--clean");
 
-    if (dopt.can_be_masked)
+    if (dopt.cant_be_masked)
         pg_fatal("option --masking doesn't work with options: --section");
 
 
