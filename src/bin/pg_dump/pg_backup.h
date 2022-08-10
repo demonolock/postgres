@@ -198,7 +198,6 @@ typedef struct _dumpOptions
 
 	int			sequence_data;	/* dump sequence data even in schema-only mode */
 	int			do_nothing;
-	int 	    masking_params;
 	bool		cant_be_masked; /* set true if we have options that don't work with masking */
 } DumpOptions;
 

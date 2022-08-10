@@ -60,12 +60,12 @@
 #include "fe_utils/string_utils.h"
 #include "getopt_long.h"
 #include "libpq/libpq-fs.h"
+#include "masking.h"
 #include "parallel.h"
 #include "pg_backup_db.h"
 #include "pg_backup_utils.h"
 #include "pg_dump.h"
 #include "storage/block.h"
-#include "masking.h"
 
 typedef struct
 {
@@ -318,7 +318,7 @@ static void appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 static char *get_synchronized_snapshot(Archive *fout);
 static void setupDumpWorker(Archive *AHX);
 static TableInfo *getRootTableInfo(const TableInfo *tbinfo);
-
+static MaskingRulesTree *getMaskingPatternFromFile(const char *filename, DumpOptions *dopt);
 
 int
 main(int argc, char **argv)
@@ -397,7 +397,8 @@ main(int argc, char **argv)
 		{"no-tablespaces", no_argument, &dopt.outputNoTablespaces, 1},
 		{"quote-all-identifiers", no_argument, &quote_all_identifiers, 1},
 		{"load-via-partition-root", no_argument, &dopt.load_via_partition_root, 1},
-		{"role", required_argument, NULL, 3},
+        {"masking", required_argument, NULL, 13},
+        {"role", required_argument, NULL, 3},
 		{"section", required_argument, NULL, 5},
 		{"serializable-deferrable", no_argument, &dopt.serializable_deferrable, 1},
 		{"snapshot", required_argument, NULL, 6},
@@ -413,7 +414,6 @@ main(int argc, char **argv)
 		{"on-conflict-do-nothing", no_argument, &dopt.do_nothing, 1},
 		{"rows-per-insert", required_argument, NULL, 10},
 		{"include-foreign-data", required_argument, NULL, 11},
-        {"masking", no_argument, NULL, 13},
 
         {NULL, 0, NULL, 0}
 	};
@@ -625,7 +625,7 @@ main(int argc, char **argv)
 				break;
 
             case 13:			/* masking */
-                dopt.masking_params = parse_masking_params(optarg, &dopt);
+                getMaskingPatternFromFile(optarg, &dopt);
                 break;
 
 			default:
@@ -1787,7 +1787,7 @@ selectDumpableType(TypeInfo *tyinfo, Archive *fout)
  *		Mark a default ACL as to be dumped or not
  *
  * For per-schema default ACLs, dump if the schema is to be dumped.
- * Otherwise dump if we are dumping "everything".  Note that dataOnly
+ * Otherwise, dump if we are dumping "everything".  Note that dataOnly
  * and aclsSkip are checked separately.
  */
 static void
@@ -1928,7 +1928,7 @@ selectDumpableExtension(ExtensionInfo *extinfo, DumpOptions *dopt)
  *		Mark a publication object as to be dumped or not
  *
  * A publication can have schemas and tables which have schemas, but those are
- * ignored in decision making, because publications are only dumped when we are
+ * ignored in decision-making, because publications are only dumped when we are
  * dumping everything.
  */
 static void
@@ -2046,9 +2046,9 @@ dumpTableData_copy(Archive *fout, const void *dcontext)
 		/* ----------
 		 * THROTTLE:
 		 *
-		 * There was considerable discussion in late July, 2000 regarding
+		 * There was considerable discussion in late July 2000 regarding
 		 * slowing down pg_dump when backing up large tables. Users with both
-		 * slow & fast (multi-processor) machines experienced performance
+		 * slow & fast (multiprocessor) machines experienced performance
 		 * degradation when doing a backup.
 		 *
 		 * Initial attempts based on sleeping for a number of ms for each ms
@@ -2071,7 +2071,7 @@ dumpTableData_copy(Archive *fout, const void *dcontext)
 		 * Most of the hard work is done in the backend, and this solution
 		 * still did not work particularly well: on slow machines, the ratio
 		 * was 50:1, and on medium paced machines, 1:1, and on fast
-		 * multi-processor machines, it had little or no effect, for reasons
+		 * multiprocessor machines, it had little or no effect, for reasons
 		 * that were unclear.
 		 *
 		 * Further discussion ensued, and the proposal was dropped.
@@ -18174,4 +18174,34 @@ appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 								fout->std_strings);
 	if (!res)
 		pg_log_warning("could not parse %s array", "reloptions");
+}
+
+/*
+ * getMaskingPatternFromFile - get ...
+ *
+ * Parse the specified filter file for include and exclude patterns, and add
+ * them to the relevant lists.  If the filename is "-" then filters will be
+ * read from STDIN rather than a file.
+ */
+
+static MaskingRulesTree *
+getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
+{
+    char * fileName;
+
+    FILE * fin = fopen(fileName, "r");
+
+    if (fin == NULL)
+    {
+        exit_nicely(1);
+    }
+
+    char root_name[64] = "Root";
+    MaskingRulesTree *rules_tree = reserve_memory_for_node(root_name);
+
+    read_masking_pattern_from_file(fin, rules_tree);
+    print_tree(rules_tree);
+
+    fclose(fin);
+    return rules_tree;
 }

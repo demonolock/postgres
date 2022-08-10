@@ -145,7 +145,7 @@ ParseVariableBool(const char *value, const char *name, bool *result)
 
 /*
  * Try to interpret "value" as an integer value, and if successful,
- * store it in *result.  Otherwise don't clobber *result.
+ * store it in *result.  Otherwise, don't clobber *result.
  *
  * "name" is the name of the variable we're assigning to, to use in error
  * report if any.  Pass name == NULL to suppress the error report.
