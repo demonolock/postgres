@@ -18179,17 +18179,15 @@ appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 /*
  * getMaskingPatternFromFile - get ...
  *
- * Parse the specified filter file for include and exclude patterns, and add
- * them to the relevant lists.  If the filename is "-" then filters will be
+ * Parse the specified masking file with description of what we need to mask
+ * If the filename is "-" then filters will be
  * read from STDIN rather than a file.
  */
 
 static MaskingRulesTree *
 getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
 {
-    char * fileName;
-
-    FILE * fin = fopen(fileName, "r");
+    FILE * fin = fopen(filename, "r");
 
     if (fin == NULL)
     {
@@ -18197,10 +18195,10 @@ getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
     }
 
     char root_name[64] = "Root";
-    MaskingRulesTree *rules_tree = reserve_memory_for_node(root_name);
+    MaskingRulesTree *rules_tree = reserveMemoryForNode(root_name);
 
-    read_masking_pattern_from_file(fin, rules_tree);
-    print_tree(rules_tree);
+    readMaskingPatternFromFile(fin, rules_tree);
+    printTree(rules_tree);
 
     fclose(fin);
     return rules_tree;

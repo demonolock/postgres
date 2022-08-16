@@ -20,7 +20,7 @@
 #include <string.h>
 
 int
-read_masking_pattern_from_file(FILE *fin, MaskingRulesTree *rules_tree)
+readMaskingPatternFromFile(FILE *fin, MaskingRulesTree *rules_tree)
 {
     struct MaskingDebugDetails md;
     md.line_num = 1;
@@ -35,86 +35,86 @@ read_masking_pattern_from_file(FILE *fin, MaskingRulesTree *rules_tree)
     char c = ' ';
     while(c != EOF)
     {
-        if (!is_terminal(c))
+        if (!isTerminal(c))
         {
-            c = read_next_symbol(&md, fin);
+            c = readNextSymbol(&md, fin);
         }
 
         switch(md.parsing_state)
         {
             case TABLE_NAME:
                 memset(table_name, 0, sizeof table_name);
-                c = name_reader(table_name, c, &md, fin);
-                add_node(rules_tree, root_name, table_name);
+                c = nameReader(table_name, c, &md, fin);
+                addNode(rules_tree, root_name, table_name);
                 md.parsing_state = WAIT_OPEN_BRACE;
                 break;
 
             case FIELD_NAME:
                 memset(field_name, 0, sizeof field_name);
-                c = name_reader(field_name, c, &md, fin);
-                add_node(rules_tree, table_name, field_name);
+                c = nameReader(field_name, c, &md, fin);
+                addNode(rules_tree, table_name, field_name);
                 md.parsing_state = WAIT_COLON;
                 break;
 
             case FUNCTION_NAME:
                 memset(function_name, 0, sizeof function_name);
-                c = name_reader(function_name, c, &md, fin);
-                add_node(rules_tree, field_name, function_name);
+                c = nameReader(function_name, c, &md, fin);
+                addNode(rules_tree, field_name, function_name);
                 md.parsing_state = WAIT_COMMA;
                 break;
 
             case WAIT_COLON:
-                if (is_space(c))
+                if (isSpace(c))
                     break;
                 if (c != ':')
                 {
-                    print_parsing_error(&md, "Waiting symbol ':'", c);
+                    printParsingError(&md, "Waiting symbol ':'", c);
                     return EXIT_FAILURE;
                 }
                 md.parsing_state = FUNCTION_NAME;
-                c = read_next_symbol(&md, fin);
+                c = readNextSymbol(&md, fin);
                 break;
 
             case WAIT_OPEN_BRACE:
-                if (is_space(c))
+                if (isSpace(c))
                     break;
                 if (c != '{')
                 {
-                    print_parsing_error(&md, "Waiting symbol '{'", c);
+                    printParsingError(&md, "Waiting symbol '{'", c);
                     return EXIT_FAILURE;
                 }
                 md.parsing_state = FIELD_NAME;
-                c = read_next_symbol(&md, fin);
+                c = readNextSymbol(&md, fin);
                 break;
 
             case WAIT_CLOSE_BRACE:
-                if (is_space(c))
+                if (isSpace(c))
                     break;
                 if (c != '{')
                 {
-                    print_parsing_error(&md, "Waiting symbol '}'", c);
+                    printParsingError(&md, "Waiting symbol '}'", c);
                     return EXIT_FAILURE;
                 }
                 md.parsing_state = TABLE_NAME;
-                c = read_next_symbol(&md, fin);
+                c = readNextSymbol(&md, fin);
                 break;
 
             case WAIT_COMMA:
-                if (is_space(c))
+                if (isSpace(c))
                     break;
                 if (c == '}')
                 {
                     md.parsing_state = TABLE_NAME;
-                    c = read_next_symbol(&md, fin);
+                    c = readNextSymbol(&md, fin);
                     break;
                 }
                 if (c != ',')
                 {
-                    print_parsing_error(&md, "Waiting symbol ','", c);
+                    printParsingError(&md, "Waiting symbol ','", c);
                     return EXIT_FAILURE;
                 }
                 md.parsing_state = FIELD_NAME;
-                c = read_next_symbol(&md, fin);
+                c = readNextSymbol(&md, fin);
                 break;
 
         }
@@ -126,25 +126,25 @@ read_masking_pattern_from_file(FILE *fin, MaskingRulesTree *rules_tree)
  * Functions for file parsing
  */
 void
-print_parsing_error(struct MaskingDebugDetails *md, char *message, char current_symbol)
+printParsingError(struct MaskingDebugDetails *md, char *message, char current_symbol)
 {
     printf("Error position (symbol '%c'): line: %d pos: %d. %s\n", current_symbol, md->line_num, md->symbol_num, message);
 }
 
 bool
-is_terminal(char c)
+isTerminal(char c)
 {
     return c == ':' || c == ',' || c == '{' || c == '}' || c == EOF;
 };
 
 bool
-is_space(char c)
+isSpace(char c)
 {
     return c == ' ' || c == '\t' || c == '\n' || c == '\000';
 }
 
 char
-read_next_symbol(struct MaskingDebugDetails *md, FILE *fin)
+readNextSymbol(struct MaskingDebugDetails *md, FILE *fin)
 {
     char c = fgetc(fin);
     if (c == '\n')
@@ -160,9 +160,9 @@ read_next_symbol(struct MaskingDebugDetails *md, FILE *fin)
 
 /* Read name of table, function or table field */
 char
-name_reader(char *name, char c, struct MaskingDebugDetails *md, FILE *fin)
+nameReader(char *name, char c, struct MaskingDebugDetails *md, FILE *fin)
 {
-    while(!is_terminal(c)) {
+    while(!isTerminal(c)) {
 
         switch(c)
         {
@@ -176,7 +176,7 @@ name_reader(char *name, char c, struct MaskingDebugDetails *md, FILE *fin)
                 strncat(name, &c, 1);
                 break;
         }
-        c = read_next_symbol(md, fin);
+        c = readNextSymbol(md, fin);
     }
 
     return c;
@@ -195,7 +195,7 @@ name_reader(char *name, char c, struct MaskingDebugDetails *md, FILE *fin)
  *
  */
 MaskingRulesTree *
-reserve_memory_for_node(const char *node_name)
+reserveMemoryForNode(const char *node_name)
 {
     MaskingRulesTree *node = malloc(sizeof(MaskingRulesTree));
 
@@ -211,9 +211,9 @@ reserve_memory_for_node(const char *node_name)
 }
 
 MaskingRulesTree *
-add_sibling(const char *node_name, MaskingRulesTree *node)
+addSibling(const char *node_name, MaskingRulesTree *node)
 {
-    MaskingRulesTree *new_node = reserve_memory_for_node(node_name);
+    MaskingRulesTree *new_node = reserveMemoryForNode(node_name);
 
     if (node == NULL)
     {
@@ -235,28 +235,28 @@ add_sibling(const char *node_name, MaskingRulesTree *node)
 }
 
 MaskingRulesTree *
-add_node(MaskingRulesTree *node, const char *name_root, const char *node_name)
+addNode(MaskingRulesTree *node, const char *name_root, const char *node_name)
 {
-    if (node == NULL || node_name == "")
+    if (node == NULL || node_name == NULL)
     {
         return NULL;
     }
 
     if (strcmp(node->name, name_root) == 0) /* Are equal */
     {
-        node->child = add_sibling(node_name, node->child);
+        node->child = addSibling(node_name, node->child);
 
         return node;
     }
 
     MaskingRulesTree *found;
     /* Search in Siblings */
-    if ((found = add_node(node->next, name_root, node_name)) != NULL)
+    if ((found = addNode(node->next, name_root, node_name)) != NULL)
     {
         return found;
     }
 
-    if ((found = add_node(node->child, name_root, node_name)) != NULL)
+    if ((found = addNode(node->child, name_root, node_name)) != NULL)
     {
         return found;
     }
@@ -265,7 +265,7 @@ add_node(MaskingRulesTree *node, const char *name_root, const char *node_name)
 }
 
 void
-print_tabs(int level)
+printTabs(int level)
 {
     for (int i = 0; i < level; i++)
     {
@@ -273,26 +273,27 @@ print_tabs(int level)
     }
 }
 
-void
-print_tree_recursive(MaskingRulesTree *node, int level)
+int
+printTreeRecursive(MaskingRulesTree *node, int level)
 {
     while (node != NULL)
     {
-        print_tabs(level);
+        printTabs(level);
         printf("%s\n", node->name);
 
         if (node->child != NULL)
         {
-            print_tabs(level);
-            print_tree_recursive(node->child, level + 1);
+            printTabs(level);
+            printTreeRecursive(node->child, level + 1);
         }
 
         node = node->next;
     }
+    return EXIT_SUCCESS;
 }
 
 void
-print_tree(MaskingRulesTree *node)
+printTree(MaskingRulesTree *node)
 {
-    print_tree_recursive(node, 0);
+    printTreeRecursive(node, 0);
 }

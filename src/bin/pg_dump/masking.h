@@ -48,37 +48,37 @@ typedef struct _Tree
 } MaskingRulesTree;
 
 void
-print_parsing_error(struct MaskingDebugDetails *md, char *message, char current_symbol);
+printParsingError(struct MaskingDebugDetails *md, char *message, char current_symbol);
 
 bool
-is_terminal(char c);
+isTerminal(char c);
 
 bool
-is_space(char c);
+isSpace(char c);
 
 char
-read_next_symbol(struct MaskingDebugDetails *md, FILE *fin);
+readNextSymbol(struct MaskingDebugDetails *md, FILE *fin);
 
 char
-name_reader(char * name, char c, struct MaskingDebugDetails * md, FILE * fin);
+nameReader(char * name, char c, struct MaskingDebugDetails * md, FILE * fin);
 
 MaskingRulesTree *
-reserve_memory_for_node(const char *node_name);
+reserveMemoryForNode(const char *node_name);
 
 MaskingRulesTree *
-add_sibling(const char *node_name, MaskingRulesTree *node);
+addSibling(const char *node_name, MaskingRulesTree *node);
 
 MaskingRulesTree *
-add_node(MaskingRulesTree *node, const char *name_root, const char *node_name);
+addNode(MaskingRulesTree *node, const char *name_root, const char *node_name);
 
 void
-print_tabs(int level);
-
-void
-print_tree_recursive(MaskingRulesTree *node, int level);
-
-void
-print_tree(MaskingRulesTree *node);
+printTabs(int level);
 
 int
-read_masking_pattern_from_file(FILE * fin, MaskingRulesTree *rules_tree);
+printTreeRecursive(MaskingRulesTree *node, int level);
+
+void
+printTree(MaskingRulesTree *node);
+
+int
+readMaskingPatternFromFile(FILE * fin, MaskingRulesTree *rules_tree);
