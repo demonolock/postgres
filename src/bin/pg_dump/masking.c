@@ -12,288 +12,296 @@
  *
  *-------------------------------------------------------------------------
  */
-
-#include "masking.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #include <string.h>
+#include <stdbool.h>
+#include "masking.h"
+
+char REL_SEP = '.'; /* Relation separator */
+size_t size = 64 * 8; /* Length of relation name - 64 bytes */
+
+MaskingMap *
+newMaskingMap() {
+    MaskingMap *map = malloc(sizeof(MaskingMap));
+    map->size = 0;
+    map->capacity = 8;
+    map->data = malloc(sizeof(Pair) * map->capacity);
+    memset(map->data, 0, sizeof(Pair) * map->capacity);
+    return map;
+}
 
 int
-readMaskingPatternFromFile(FILE *fin, MaskingRulesTree *rules_tree)
-{
+get(MaskingMap *map, char *key) {
+    int index = 0;
+    while (map->data[index] != NULL) {
+        if (strcmp(map->data[index]->key, key) == 0) {
+            return index;
+        }
+        index++;
+    }
+    return -1;
+}
+
+void
+printMap(MaskingMap *map) {
+    if (map != NULL && map->data != NULL) {
+        for (int i = 0; map->data[i] != NULL; i++) {
+            printf("key: %s, value: %s\n", (char *) map->data[i]->key, (char *) map->data[i]->value);
+            free(map->data[i]->key);
+            free(map->data[i]->value);
+            free(map->data[i]);
+
+        }
+        printf("capacity:%d, size:%d\n", map->capacity, map->size);
+        free(map->data);
+        free(map);
+    }
+}
+
+void
+set(MaskingMap *map, char *key, char *value) {
+    int index = get(map, key);
+    if (index != -1) // Already have key in map
+    {
+        free(map->data[index]->value);
+        map->data[index]->value = malloc(strlen(value) + 1);
+        strcpy(map->data[index]->value, value);
+
+    } else {
+
+        Pair *pair = malloc(sizeof(Pair));
+        pair->key = malloc(strlen(key) + 1);
+        pair->value = malloc(strlen(value) + 1);
+        memset(pair->key, 0, strlen(key));
+        memset(pair->value, 0, strlen(value));
+        strcpy(pair->key, key);
+        strcpy(pair->value, value);
+
+        map->data[map->size] = malloc(sizeof(Pair));
+        *map->data[map->size] = *pair;
+        map->size++;
+        free(pair);
+    }
+    if (map->size == map->capacity) { /* Increase capacity */
+        map->capacity *= 1.5;
+        map->data = realloc(map->data, sizeof(Pair) * map->capacity);
+    }
+    free(key);
+}
+
+void
+printParsingError(struct MaskingDebugDetails *md, char *message, char current_symbol) {
+    printf("Error position (symbol '%c'): line: %d pos: %d. %s\n", current_symbol, md->line_num, md->symbol_num,
+           message);
+};
+
+bool
+isTerminal(char c) {
+    return c == ':' || c == ',' || c == '{' || c == '}' || c == EOF;
+};
+
+bool
+isSpace(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == EOF;
+};
+
+char
+readNextSymbol(struct MaskingDebugDetails *md, FILE *fin) {
+    char c = fgetc(fin);
+    if (c == '\n') {
+        md->line_num++;
+        md->symbol_num = 1;
+    } else {
+        md->symbol_num++;
+    }
+    return c;
+};
+
+/* Read relation name*/
+char
+nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin) {
+    memset(rel_name, 0, size);
+    while (!isTerminal(c)) {
+
+        switch (c) {
+            case ' ':
+            case '\t':
+            case '\n':
+                break; /* Skip space symbols */
+            case EOF:
+                return c;
+
+            default:
+                strncat(rel_name, &c, 1);
+                break;
+        }
+        c = readNextSymbol(md, fin);
+    }
+    return c;
+};
+
+char *
+getFullRelName(char *schema_name, char *table_name, char *field_name) {
+    char *full_name = malloc(size * 3); /* Schema.Table.Field */
+    memset(full_name, 0, size * 3);
+    strcpy(full_name, schema_name);
+    strncat(full_name, &REL_SEP, 1);
+    strcat(full_name, table_name);
+    strncat(full_name, &REL_SEP, 1);
+    strcat(full_name, field_name);
+    return full_name;
+}
+
+int
+readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
     struct MaskingDebugDetails md;
     md.line_num = 1;
     md.symbol_num = 0;
-    md.parsing_state = TABLE_NAME;
+    md.parsing_state = SCHEMA_NAME;
+    int exit_status = EXIT_SUCCESS;
 
-    char *root_name = "Root";
-    char table_name[64] = "";
-    char field_name[64] = "";
-    char function_name[64] = ""; /* Max length of a table or a field name */
+    char *schema_name = malloc(size);
+    char *table_name = malloc(size);
+    char *field_name = malloc(size);
+    char *func_name = malloc(size);
+
+    int brace_counter = 0;
+    int close_brace_counter = 0;
+    bool skip_reading = false;
 
     char c = ' ';
-    while(c != EOF)
-    {
-        if (!isTerminal(c))
-        {
+    while (c != EOF) {
+        if (skip_reading) {
+            skip_reading = false;
+        } else if (!isTerminal(c)) {
             c = readNextSymbol(&md, fin);
         }
+        switch (md.parsing_state) {
+            case SCHEMA_NAME:
+                c = nameReader(schema_name, c, &md, fin);
+                md.parsing_state = WAIT_OPEN_BRACE;
+                memset(table_name, 0, sizeof size);
+                break;
 
-        switch(md.parsing_state)
-        {
             case TABLE_NAME:
-                memset(table_name, 0, sizeof table_name);
                 c = nameReader(table_name, c, &md, fin);
-                addNode(rules_tree, root_name, table_name);
                 md.parsing_state = WAIT_OPEN_BRACE;
                 break;
 
             case FIELD_NAME:
-                memset(field_name, 0, sizeof field_name);
                 c = nameReader(field_name, c, &md, fin);
-                addNode(rules_tree, table_name, field_name);
                 md.parsing_state = WAIT_COLON;
                 break;
 
             case FUNCTION_NAME:
-                memset(function_name, 0, sizeof function_name);
-                c = nameReader(function_name, c, &md, fin);
-                addNode(rules_tree, field_name, function_name);
+                c = nameReader(func_name, c, &md, fin);
+                set(map, getFullRelName(schema_name, table_name, field_name), func_name);
                 md.parsing_state = WAIT_COMMA;
                 break;
 
             case WAIT_COLON:
                 if (isSpace(c))
                     break;
-                if (c != ':')
-                {
+                if (c != ':') {
                     printParsingError(&md, "Waiting symbol ':'", c);
-                    return EXIT_FAILURE;
+                    exit_status = EXIT_FAILURE;
+                    goto clear_resources;
                 }
                 md.parsing_state = FUNCTION_NAME;
                 c = readNextSymbol(&md, fin);
+                skip_reading = true;
                 break;
 
             case WAIT_OPEN_BRACE:
                 if (isSpace(c))
                     break;
-                if (c != '{')
-                {
-                    printParsingError(&md, "Waiting symbol '{'", c);
-                    return EXIT_FAILURE;
+                if (c == '}' && brace_counter > 0) {
+                    md.parsing_state = WAIT_CLOSE_BRACE;
+                    break;
                 }
-                md.parsing_state = FIELD_NAME;
+                if (c != '{') {
+                    printParsingError(&md, "Waiting symbol '{'", c);
+                    exit_status = EXIT_FAILURE;
+                    goto clear_resources;
+                }
+                if (table_name[0] != '\0') /* we have already read table_name */
+                {
+                    md.parsing_state = FIELD_NAME;
+                } else {
+                    md.parsing_state = TABLE_NAME;
+                }
                 c = readNextSymbol(&md, fin);
+                skip_reading = true;
+                brace_counter++;
                 break;
 
             case WAIT_CLOSE_BRACE:
                 if (isSpace(c))
                     break;
-                if (c != '{')
-                {
+                if (c != '}') {
                     printParsingError(&md, "Waiting symbol '}'", c);
-                    return EXIT_FAILURE;
+                    exit_status = EXIT_FAILURE;
+                    goto clear_resources;
                 }
                 md.parsing_state = TABLE_NAME;
                 c = readNextSymbol(&md, fin);
+                brace_counter--;
                 break;
 
             case WAIT_COMMA:
                 if (isSpace(c))
                     break;
-                if (c == '}')
-                {
-                    md.parsing_state = TABLE_NAME;
+                if (c == '}') {
                     c = readNextSymbol(&md, fin);
+                    skip_reading = true;
+                    close_brace_counter++;
                     break;
                 }
-                if (c != ',')
+                if (c != ',' && !isTerminal(c)) /* Schema_name or Table_name */
                 {
+                    if (close_brace_counter == 1) {
+                        md.parsing_state = TABLE_NAME;
+                    } else if (close_brace_counter == 2) {
+                        md.parsing_state = SCHEMA_NAME;
+                    } else {
+                        printParsingError(&md, "Too many symbols '}'", c);
+                        exit_status = EXIT_FAILURE;
+                        goto clear_resources;
+                    }
+                    skip_reading = true;
+                    close_brace_counter = 0;
+                    break;
+                } else if (c != ',') {
                     printParsingError(&md, "Waiting symbol ','", c);
-                    return EXIT_FAILURE;
+                    exit_status = EXIT_FAILURE;
+                    goto clear_resources;
                 }
                 md.parsing_state = FIELD_NAME;
                 c = readNextSymbol(&md, fin);
-                break;
-
-        }
-    }
-    return EXIT_SUCCESS;
-}
-
-/*
- * Functions for file parsing
- */
-void
-printParsingError(struct MaskingDebugDetails *md, char *message, char current_symbol)
-{
-    printf("Error position (symbol '%c'): line: %d pos: %d. %s\n", current_symbol, md->line_num, md->symbol_num, message);
-}
-
-bool
-isTerminal(char c)
-{
-    return c == ':' || c == ',' || c == '{' || c == '}' || c == EOF;
-};
-
-bool
-isSpace(char c)
-{
-    return c == ' ' || c == '\t' || c == '\n' || c == '\000';
-}
-
-char
-readNextSymbol(struct MaskingDebugDetails *md, FILE *fin)
-{
-    char c = fgetc(fin);
-    if (c == '\n')
-    {
-        md->line_num++;
-        md->symbol_num=1;
-    }
-    else {
-        md->symbol_num++;
-    }
-    return c;
-}
-
-/* Read name of table, function or table field */
-char
-nameReader(char *name, char c, struct MaskingDebugDetails *md, FILE *fin)
-{
-    while(!isTerminal(c)) {
-
-        switch(c)
-        {
-            case ' ':
-            case '\000':
-            case '\t':
-            case '\n':
-                break; /* Skip space symbols */
-
-            default:
-                strncat(name, &c, 1);
+                skip_reading = true;
                 break;
         }
-        c = readNextSymbol(md, fin);
     }
-
-    return c;
-};
-
-/*
- * Functions for work with n-tree
- *                            Root
- *                              |
- *             |--------------------------------|
- *           Table1            ...            TableN
- *       |-------------|                  |-------------|
- *    Field1   ...  FieldN              Field1   ...  FieldN
- *       |             |                  |             |
- *   Function1 ... FunctionN           Function1 ... FunctionN
- *
- */
-MaskingRulesTree *
-reserveMemoryForNode(const char *node_name)
-{
-    MaskingRulesTree *node = malloc(sizeof(MaskingRulesTree));
-
-    if (node != NULL)
-    {
-        node->child = NULL;
-        node->name = malloc(sizeof(node_name));
-        strcpy(node->name, node_name);
-        node->next = NULL;
-    }
-
-    return node;
-}
-
-MaskingRulesTree *
-addSibling(const char *node_name, MaskingRulesTree *node)
-{
-    MaskingRulesTree *new_node = reserveMemoryForNode(node_name);
-
-    if (node == NULL)
-    {
-        node = new_node;
-    }
-    else
-    {
-        MaskingRulesTree *aux = node;
-
-        while (aux->next != NULL)
-        {
-            aux = aux->next;
-        }
-
-        aux->next = new_node;
-    }
-
-    return node;
-}
-
-MaskingRulesTree *
-addNode(MaskingRulesTree *node, const char *name_root, const char *node_name)
-{
-    if (node == NULL || node_name == NULL)
-    {
-        return NULL;
-    }
-
-    if (strcmp(node->name, name_root) == 0) /* Are equal */
-    {
-        node->child = addSibling(node_name, node->child);
-
-        return node;
-    }
-
-    MaskingRulesTree *found;
-    /* Search in Siblings */
-    if ((found = addNode(node->next, name_root, node_name)) != NULL)
-    {
-        return found;
-    }
-
-    if ((found = addNode(node->child, name_root, node_name)) != NULL)
-    {
-        return found;
-    }
-
-    return NULL;
-}
-
-void
-printTabs(int level)
-{
-    for (int i = 0; i < level; i++)
-    {
-        putchar('\t');
-    }
+    clear_resources:
+    free(schema_name);
+    free(table_name);
+    free(field_name);
+    free(func_name);
+    return exit_status;
 }
 
 int
-printTreeRecursive(MaskingRulesTree *node, int level)
-{
-    while (node != NULL)
+addFunctionToColumn(char *schema_name, char *table_name, char *column, MaskingMap *map) {
+    int index=get(map, getFullRelName(schema_name, table_name, column));
+    if (index != -1)
     {
-        printTabs(level);
-        printf("%s\n", node->name);
-
-        if (node->child != NULL)
-        {
-            printTabs(level);
-            printTreeRecursive(node->child, level + 1);
-        }
-
-        node = node->next;
+        char *col_with_func;
+        strcpy(col_with_func, map->data[index]->value);
+        strcat(col_with_func, "(");
+        strcat(col_with_func, column);
+        strcat(col_with_func, ")");
+        *column=*col_with_func;
     }
     return EXIT_SUCCESS;
-}
-
-void
-printTree(MaskingRulesTree *node)
-{
-    printTreeRecursive(node, 0);
 }

@@ -22,6 +22,8 @@
 
 #ifndef PG_BACKUP_H
 #define PG_BACKUP_H
+#ifndef MASKING_H
+#define MASKING_H
 
 #include "fe_utils/simple_list.h"
 #include "libpq-fe.h"
@@ -199,6 +201,7 @@ typedef struct _dumpOptions
 	int			sequence_data;	/* dump sequence data even in schema-only mode */
 	int			do_nothing;
 	bool		cant_be_masked; /* set true if we have options that don't work with masking */
+    struct MaskingMap *masking_map;     /* Map of fields and functions for data masking */
 } DumpOptions;
 
 /*
@@ -326,4 +329,5 @@ extern int	archprintf(Archive *AH, const char *fmt,...) pg_attribute_printf(2, 3
 #define appendStringLiteralAH(buf,str,AH) \
 	appendStringLiteral(buf, str, (AH)->encoding, (AH)->std_strings)
 
+#endif							/* MASKING_H */
 #endif							/* PG_BACKUP_H */

@@ -318,7 +318,7 @@ static void appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 static char *get_synchronized_snapshot(Archive *fout);
 static void setupDumpWorker(Archive *AHX);
 static TableInfo *getRootTableInfo(const TableInfo *tbinfo);
-static MaskingRulesTree *getMaskingPatternFromFile(const char *filename, DumpOptions *dopt);
+static int getMaskingPatternFromFile(const char *filename, DumpOptions *dopt);
 
 int
 main(int argc, char **argv)
@@ -626,6 +626,8 @@ main(int argc, char **argv)
 
             case 13:			/* masking */
                 getMaskingPatternFromFile(optarg, &dopt);
+                if (dopt.dump_inserts == 0)
+                    dopt.dump_inserts = DUMP_DEFAULT_ROWS_PER_INSERT;
                 break;
 
 			default:
@@ -829,7 +831,7 @@ main(int argc, char **argv)
 		dopt.outputBlobs = true;
 
 	/*
-	 * Collect role names so we can map object owner OIDs to names.
+	 * Collect role names, so we can map object owner OIDs to names.
 	 */
 	collectRoleNames(fout);
 
@@ -2020,13 +2022,13 @@ dumpTableData_copy(Archive *fout, const void *dcontext)
 						  fmtQualifiedDumpable(tbinfo),
 						  tdinfo->filtercond ? tdinfo->filtercond : "");
 	}
-	else
-	{
-		appendPQExpBuffer(q, "COPY %s %s TO stdout;",
-						  fmtQualifiedDumpable(tbinfo),
-						  column_list);
-	}
-	res = ExecuteSqlQuery(fout, q->data, PGRES_COPY_OUT);
+    else
+    {
+        appendPQExpBuffer(q, "COPY %s %s TO stdout;",
+                          fmtQualifiedDumpable(tbinfo),
+                          column_list);
+    }
+    res = ExecuteSqlQuery(fout, q->data, PGRES_COPY_OUT);
 	PQclear(res);
 	destroyPQExpBuffer(clistBuf);
 
@@ -2164,7 +2166,13 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 		if (tbinfo->attgenerated[i])
 			appendPQExpBufferStr(q, "NULL");
 		else
-			appendPQExpBufferStr(q, fmtId(tbinfo->attnames[i]));
+        {
+            if (dopt->masking_map)
+            {
+                addFunctionToColumn(tbinfo->dobj.namespace->dobj.name, tbinfo->dobj.name, tbinfo->attnames[i], dopt->masking_map);
+            }
+            appendPQExpBufferStr(q, fmtId(tbinfo->attnames[i]));
+        }
 		attgenerated[nfields] = tbinfo->attgenerated[i];
 		nfields++;
 	}
@@ -2302,7 +2310,7 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 							 * strtod() and friends might accept NaN, so we
 							 * can't use that to test.
 							 *
-							 * In reality we only need to defend against
+							 * In reality, we only need to defend against
 							 * infinity and NaN, so we need not get too crazy
 							 * about pattern matching here.
 							 */
@@ -5988,7 +5996,7 @@ getFuncs(Archive *fout, int *numFuncs)
 	 * otherwise we might not get creation ordering correct.
 	 *
 	 * 3. Otherwise, we normally exclude functions in pg_catalog.  However, if
-	 * they're members of extensions and we are in binary-upgrade mode then
+	 * they're members of extensions, and we are in binary-upgrade mode then
 	 * include them, since we want to dump extension members individually in
 	 * that mode.  Also, if they are used by casts or transforms then we need
 	 * to gather the information about them, though they won't be dumped if
@@ -6717,7 +6725,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	/*
 	 * We want to perform just one query against pg_index.  However, we
 	 * mustn't try to select every row of the catalog and then sort it out on
-	 * the client side, because some of the server-side functions we need
+	 * the client side, because some server-side functions we need
 	 * would be unsafe to apply to tables we don't have lock on.  Hence, we
 	 * build an array of the OIDs of tables we care about (and now have lock
 	 * on!), and use a WHERE clause to constrain which rows are selected.
@@ -7059,7 +7067,7 @@ getExtendedStatistics(Archive *fout)
  *
  * Get info about constraints on dumpable tables.
  *
- * Currently handles foreign keys only.
+ * Currently, handles foreign keys only.
  * Unique and primary key constraints are handled with indexes,
  * while check constraints are processed in getTableAttrs().
  */
@@ -7084,7 +7092,7 @@ getConstraints(Archive *fout, TableInfo tblinfo[], int numTables)
 	/*
 	 * We want to perform just one query against pg_constraint.  However, we
 	 * mustn't try to select every row of the catalog and then sort it out on
-	 * the client side, because some of the server-side functions we need
+	 * the client side, because some server-side functions we need
 	 * would be unsafe to apply to tables we don't have lock on.  Hence, we
 	 * build an array of the OIDs of tables we care about (and now have lock
 	 * on!), and use a WHERE clause to constrain which rows are selected.
@@ -7474,7 +7482,7 @@ getTriggers(Archive *fout, TableInfo tblinfo[], int numTables)
 	/*
 	 * We want to perform just one query against pg_trigger.  However, we
 	 * mustn't try to select every row of the catalog and then sort it out on
-	 * the client side, because some of the server-side functions we need
+	 * the client side, because some server-side functions we need
 	 * would be unsafe to apply to tables we don't have lock on.  Hence, we
 	 * build an array of the OIDs of tables we care about (and now have lock
 	 * on!), and use a WHERE clause to constrain which rows are selected.
@@ -8094,7 +8102,7 @@ getTransforms(Archive *fout, int *numTransforms)
 /*
  * getTableAttrs -
  *	  for each interesting table, read info about its attributes
- *	  (names, types, default values, CHECK constraints, etc)
+ *	  (names, types, default values, CHECK constraints, etc.)
  *
  *	modifies tblinfo
  */
@@ -9436,7 +9444,7 @@ getAdditionalACLs(Archive *fout)
  * If a matching pg_description entry is found, it is dumped.
  *
  * Note: in some cases, such as comments for triggers and rules, the "type"
- * string really looks like, e.g., "TRIGGER name ON".  This is a bit of a hack
+ * string really looks like, e.g., "TRIGGER name ON".  This is a bit of a hack,
  * but it doesn't seem worth complicating the API for all callers to make
  * it cleaner.
  *
@@ -11148,7 +11156,7 @@ dumpCompositeType(Archive *fout, const TypeInfo *tyinfo)
 		else
 		{
 			/*
-			 * This is a dropped attribute and we're in binary_upgrade mode.
+			 * This is a dropped attribute, and we're in binary_upgrade mode.
 			 * Insert a placeholder for it in the CREATE TYPE command, and set
 			 * length and alignment with direct UPDATE to the catalogs
 			 * afterwards. See similar code in dumpTableSchema().
@@ -14898,7 +14906,7 @@ dumpTable(Archive *fout, const TableInfo *tbinfo)
 			if (fout->remoteVersion >= 90600)
 			{
 				/*
-				 * In principle we should call acldefault('c', relowner) to
+				 * In principle, we should call acldefault('c', relowner) to
 				 * get the default ACL for a column.  However, we don't
 				 * currently store the numeric OID of the relowner in
 				 * TableInfo.  We could convert the owner name using regrole,
@@ -15261,7 +15269,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 
 					/*
 					 * Not Null constraint --- suppress if inherited, except
-					 * if partition, or in binary-upgrade case where that
+					 * if partitioned, or in binary-upgrade case where that
 					 * won't work.
 					 */
 					print_notnull = (tbinfo->notnull[j] &&
@@ -15491,7 +15499,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 		 *
 		 * We process foreign and partitioned tables here, even though they
 		 * lack heap storage, because they can participate in inheritance
-		 * relationships and we want this stuff to be consistent across the
+		 * relationships, and we want this stuff to be consistent across the
 		 * inheritance tree.  We can exclude indexes, toast tables, sequences
 		 * and matviews, even though they have storage, because we don't
 		 * support altering or dropping columns in them, nor can they be part
@@ -17494,9 +17502,9 @@ getExtensionMembership(Archive *fout, ExtensionInfo extinfo[],
  *	  Due to the FKs being created at CREATE EXTENSION time and therefore before
  *	  the data is loaded, we have to work out what the best order for reloading
  *	  the data is, to avoid FK violations when the tables are restored.  This is
- *	  not perfect- we can't handle circular dependencies and if any exist they
- *	  will cause an invalid dump to be produced (though at least all of the data
- *	  is included for a user to manually restore).  This is currently documented
+ *	  not perfect - we can't handle circular dependencies and if any exist they
+ *	  will cause an invalid dump to be produced (though at least all the data
+ *	  is included for a user to manually restore).  This is currently documented,
  *	  but perhaps we can provide a better solution in the future.
  */
 void
@@ -18183,8 +18191,7 @@ appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
  * If the filename is "-" then filters will be
  * read from STDIN rather than a file.
  */
-
-static MaskingRulesTree *
+int
 getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
 {
     FILE * fin = fopen(filename, "r");
@@ -18194,12 +18201,11 @@ getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
         exit_nicely(1);
     }
 
-    char root_name[64] = "Root";
-    MaskingRulesTree *rules_tree = reserveMemoryForNode(root_name);
+    MaskingMap *masking_map = newMaskingMap();
 
-    readMaskingPatternFromFile(fin, rules_tree);
-    printTree(rules_tree);
-
+    readMaskingPatternFromFile(fin, masking_map);
+    printMap(masking_map);
     fclose(fin);
-    return rules_tree;
+    dopt->masking_map=masking_map;
+    return EXIT_SUCCESS;
 }

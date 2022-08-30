@@ -12,14 +12,28 @@
  *
  *-------------------------------------------------------------------------
  */
-#include <sys/file.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdbool.h>
 
 
-enum /* States during file parsing */
+
+typedef struct _pair {
+    char *key;
+    char *value;
+} Pair;
+
+typedef struct _maskingMap {
+    Pair **data;
+    int size;
+    int capacity;
+} MaskingMap;
+
+enum
 ParsingState
 {
+    SCHEMA_NAME,
     TABLE_NAME,
     FIELD_NAME,
     FUNCTION_NAME,
@@ -29,7 +43,7 @@ ParsingState
     WAIT_COMMA
 };
 
-struct /* Marks the line with parsing error */
+struct
 MaskingDebugDetails
 {
     int line_num;
@@ -37,48 +51,6 @@ MaskingDebugDetails
     enum ParsingState parsing_state;
 };
 
-/**
-* N-tree definition
-*/
-typedef struct _Tree
-{
-    struct _Tree *child;
-    struct _Tree *next;
-    char *name;
-} MaskingRulesTree;
-
-void
-printParsingError(struct MaskingDebugDetails *md, char *message, char current_symbol);
-
-bool
-isTerminal(char c);
-
-bool
-isSpace(char c);
-
-char
-readNextSymbol(struct MaskingDebugDetails *md, FILE *fin);
-
-char
-nameReader(char * name, char c, struct MaskingDebugDetails * md, FILE * fin);
-
-MaskingRulesTree *
-reserveMemoryForNode(const char *node_name);
-
-MaskingRulesTree *
-addSibling(const char *node_name, MaskingRulesTree *node);
-
-MaskingRulesTree *
-addNode(MaskingRulesTree *node, const char *name_root, const char *node_name);
-
-void
-printTabs(int level);
-
-int
-printTreeRecursive(MaskingRulesTree *node, int level);
-
-void
-printTree(MaskingRulesTree *node);
-
-int
-readMaskingPatternFromFile(FILE * fin, MaskingRulesTree *rules_tree);
+MaskingMap *newMaskingMap();
+void printMap(MaskingMap *map);
+int readMaskingPatternFromFile(FILE * fin, MaskingMap *map);
