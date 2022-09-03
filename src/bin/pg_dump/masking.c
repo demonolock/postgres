@@ -32,7 +32,7 @@ newMaskingMap() {
 }
 
 int
-get(MaskingMap *map, char *key) {
+getMapIndexByKey(MaskingMap *map, char *key) {
     int index = 0;
     while (map->data[index] != NULL) {
         if (strcmp(map->data[index]->key, key) == 0) {
@@ -44,24 +44,24 @@ get(MaskingMap *map, char *key) {
 }
 
 void
-printMap(MaskingMap *map) {
+cleanMap(MaskingMap *map) {
     if (map != NULL && map->data != NULL) {
         for (int i = 0; map->data[i] != NULL; i++) {
-            printf("key: %s, value: %s\n", (char *) map->data[i]->key, (char *) map->data[i]->value);
+            //printf("key: %s, value: %s\n", (char *) map->data[i]->key, (char *) map->data[i]->value);
             free(map->data[i]->key);
             free(map->data[i]->value);
             free(map->data[i]);
 
         }
-        printf("capacity:%d, size:%d\n", map->capacity, map->size);
+        //printf("capacity:%d, size:%d\n", map->capacity, map->size);
         free(map->data);
         free(map);
     }
 }
 
 void
-set(MaskingMap *map, char *key, char *value) {
-    int index = get(map, key);
+setMapValue(MaskingMap *map, char *key, char *value) {
+    int index = getMapIndexByKey(map, key);
     if (index != -1) // Already have key in map
     {
         free(map->data[index]->value);
@@ -196,7 +196,7 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
 
             case FUNCTION_NAME:
                 c = nameReader(func_name, c, &md, fin);
-                set(map, getFullRelName(schema_name, table_name, field_name), func_name);
+                setMapValue(map, getFullRelName(schema_name, table_name, field_name), func_name);
                 md.parsing_state = WAIT_COMMA;
                 break;
 
@@ -291,17 +291,20 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
     return exit_status;
 }
 
-int
+char *
 addFunctionToColumn(char *schema_name, char *table_name, char *column, MaskingMap *map) {
-    int index=get(map, getFullRelName(schema_name, table_name, column));
+    int index=getMapIndexByKey(map, getFullRelName(schema_name, table_name, column));
+    int col_with_func_size = 3 * size + 3; // schema_name.function name + '(' + column_name + ')
+    char *col_with_func= malloc(col_with_func_size + 1);
+    memset(col_with_func, 0, col_with_func_size + 1);
     if (index != -1)
     {
-        char *col_with_func;
-        strcpy(col_with_func, map->data[index]->value);
+        strcpy(col_with_func, schema_name);
+        strcat(col_with_func, ".");
+        strcat(col_with_func, map->data[index]->value);
         strcat(col_with_func, "(");
         strcat(col_with_func, column);
         strcat(col_with_func, ")");
-        *column=*col_with_func;
     }
-    return EXIT_SUCCESS;
+    return col_with_func;
 }

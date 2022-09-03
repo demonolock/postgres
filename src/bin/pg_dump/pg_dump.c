@@ -2169,9 +2169,18 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
         {
             if (dopt->masking_map)
             {
-                addFunctionToColumn(tbinfo->dobj.namespace->dobj.name, tbinfo->dobj.name, tbinfo->attnames[i], dopt->masking_map);
+                char *column_with_fun;
+                column_with_fun=addFunctionToColumn(tbinfo->dobj.namespace->dobj.name, tbinfo->dobj.name, tbinfo->attnames[i], dopt->masking_map);
+                if (column_with_fun[0] != '\0')
+                {
+                    appendPQExpBufferStr(q, column_with_fun);
+                }
+                else
+                {
+                    appendPQExpBufferStr(q, fmtId(tbinfo->attnames[i]));
+                }
+                free(column_with_fun);
             }
-            appendPQExpBufferStr(q, fmtId(tbinfo->attnames[i]));
         }
 		attgenerated[nfields] = tbinfo->attgenerated[i];
 		nfields++;
@@ -18204,8 +18213,8 @@ getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
     MaskingMap *masking_map = newMaskingMap();
 
     readMaskingPatternFromFile(fin, masking_map);
-    printMap(masking_map);
     fclose(fin);
     dopt->masking_map=masking_map;
+    //cleanMap(masking_map);
     return EXIT_SUCCESS;
 }

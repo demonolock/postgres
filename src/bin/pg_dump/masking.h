@@ -24,7 +24,7 @@ typedef struct _pair {
     char *value;
 } Pair;
 
-typedef struct _maskingMap {
+typedef struct MaskingMap {
     Pair **data;
     int size;
     int capacity;
@@ -53,4 +53,7 @@ MaskingDebugDetails
 
 MaskingMap *newMaskingMap();
 void printMap(MaskingMap *map);
-int readMaskingPatternFromFile(FILE * fin, MaskingMap *map);
+int readMaskingPatternFromFile(FILE *fin, MaskingMap *map);
+int getMapIndexByKey(MaskingMap *map, char *key);
+char *addFunctionToColumn(char *schema_name, char *table_name, char *column, MaskingMap *map);
+char *getFullRelName(char *schema_name, char *table_name, char *field_name);
