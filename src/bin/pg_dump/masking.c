@@ -16,9 +16,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include "masking.h"
 
 char REL_SEP = '.'; /* Relation separator */
+char *DEFAULT_NAME="default";
 size_t size = 64 * 8; /* Length of relation name - 64 bytes */
 
 MaskingMap *
@@ -47,13 +49,13 @@ void
 cleanMap(MaskingMap *map) {
     if (map != NULL && map->data != NULL) {
         for (int i = 0; map->data[i] != NULL; i++) {
-            //printf("key: %s, value: %s\n", (char *) map->data[i]->key, (char *) map->data[i]->value);
+            printf("key: %s, value: %s\n", (char *) map->data[i]->key, (char *) map->data[i]->value);
             free(map->data[i]->key);
             free(map->data[i]->value);
             free(map->data[i]);
 
         }
-        //printf("capacity:%d, size:%d\n", map->capacity, map->size);
+        printf("capacity:%d, size:%d\n", map->capacity, map->size);
         free(map->data);
         free(map);
     }
@@ -115,7 +117,7 @@ readNextSymbol(struct MaskingDebugDetails *md, FILE *fin) {
     } else {
         md->symbol_num++;
     }
-    return c;
+    return tolower(c);
 };
 
 /* Read relation name*/
@@ -291,20 +293,39 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
     return exit_status;
 }
 
+// Creating string in format `schema_name.function name(column_name)`
+void
+concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column, char * function_name, MaskingMap *map)
+{
+    strcpy(col_with_func, schema_name);
+    strcat(col_with_func, ".");
+    strcat(col_with_func, function_name);
+    strcat(col_with_func, "(");
+    strcat(col_with_func, column);
+    strcat(col_with_func, ")");
+    return col_with_func;
+}
+
 char *
 addFunctionToColumn(char *schema_name, char *table_name, char *column, MaskingMap *map) {
     int index=getMapIndexByKey(map, getFullRelName(schema_name, table_name, column));
     int col_with_func_size = 3 * size + 3; // schema_name.function name + '(' + column_name + ')
-    char *col_with_func= malloc(col_with_func_size + 1);
+    char *col_with_func = malloc(col_with_func_size + 1);
     memset(col_with_func, 0, col_with_func_size + 1);
     if (index != -1)
     {
-        strcpy(col_with_func, schema_name);
-        strcat(col_with_func, ".");
-        strcat(col_with_func, map->data[index]->value);
-        strcat(col_with_func, "(");
-        strcat(col_with_func, column);
-        strcat(col_with_func, ")");
+        char *function_name=map->data[index]->value;
+        if (strcmp(function_name, DEFAULT_NAME)!=0)
+        {
+            concatFunctionAndColumn(col_with_func, schema_name, column,  function_name, map);
+        }
+        else
+        {
+        }
+    }
+    else
+    {
+
     }
     return col_with_func;
 }

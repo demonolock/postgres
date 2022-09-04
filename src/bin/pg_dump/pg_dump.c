@@ -18210,11 +18210,9 @@ getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
         exit_nicely(1);
     }
 
-    MaskingMap *masking_map = newMaskingMap();
+    dopt->masking_map = newMaskingMap();
 
-    readMaskingPatternFromFile(fin, masking_map);
+    readMaskingPatternFromFile(fin, dopt->masking_map);
     fclose(fin);
-    dopt->masking_map=masking_map;
-    //cleanMap(masking_map);
     return EXIT_SUCCESS;
 }
