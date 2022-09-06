@@ -2170,6 +2170,7 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
             if (dopt->masking_map)
             {
                 char *column_with_fun;
+                getExistFunctions((const FuncInfo *) dopt);
                 column_with_fun=addFunctionToColumn(tbinfo->dobj.namespace->dobj.name, tbinfo->dobj.name, tbinfo->attnames[i], dopt->masking_map);
                 if (column_with_fun[0] != '\0')
                 {
@@ -18203,6 +18204,12 @@ appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 int
 getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
 {
+    if (filename[0]='\0')
+    {
+        pg_log_error("filename shouldn\'t be empty");
+        exit_nicely(1);
+    }
+
     FILE * fin = fopen(filename, "r");
 
     if (fin == NULL)
@@ -18215,4 +18222,10 @@ getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
     readMaskingPatternFromFile(fin, dopt->masking_map);
     fclose(fin);
     return EXIT_SUCCESS;
+}
+
+void
+getExistFunctions(const FuncInfo *dobj)
+{
+    printf("I am here\n");
 }

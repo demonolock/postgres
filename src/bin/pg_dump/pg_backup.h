@@ -22,11 +22,10 @@
 
 #ifndef PG_BACKUP_H
 #define PG_BACKUP_H
-#ifndef MASKING_H
-#define MASKING_H
 
 #include "fe_utils/simple_list.h"
 #include "libpq-fe.h"
+#include "masking.h"
 
 
 typedef enum trivalue
@@ -329,5 +328,4 @@ extern int	archprintf(Archive *AH, const char *fmt,...) pg_attribute_printf(2, 3
 #define appendStringLiteralAH(buf,str,AH) \
 	appendStringLiteral(buf, str, (AH)->encoding, (AH)->std_strings)
 
-#endif							/* MASKING_H */
 #endif							/* PG_BACKUP_H */
