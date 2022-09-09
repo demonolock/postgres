@@ -24,12 +24,6 @@ const char REL_SEP = '.'; /* Relation separator */
 const size_t REL_SIZE = 64 * 8; /* Length of relation name - 64 bytes */
 const int COL_WITH_FUNC_SIZE = 3 * REL_SIZE + 3; // schema_name.function name + '(' + column_name + ')
 
-int exit_status;
-int brace_counter;
-int close_brace_counter;
-bool skip_reading;
-char *col_with_func;
-char c;
 
 MaskingMap *
 newMaskingMap() {
@@ -165,16 +159,26 @@ getFullRelName(char *schema_name, char *table_name, char *field_name) {
 
 int
 readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
+    int exit_status;
+    int brace_counter;
+    int close_brace_counter;
+    char *schema_name;
+    char *table_name;
+    char *field_name;
+    char *func_name;
+    bool skip_reading;
+    char c;
+
     struct MaskingDebugDetails md;
     md.line_num = 1;
     md.symbol_num = 0;
     md.parsing_state = SCHEMA_NAME;
     exit_status = EXIT_SUCCESS;
 
-    md.schema_name = malloc(REL_SIZE);
-    md.table_name = malloc(REL_SIZE);
-    md.field_name = malloc(REL_SIZE);
-    md.func_name = malloc(REL_SIZE);
+    schema_name = malloc(REL_SIZE);
+    table_name = malloc(REL_SIZE);
+    field_name = malloc(REL_SIZE);
+    func_name = malloc(REL_SIZE);
 
     brace_counter = 0;
     close_brace_counter = 0;
@@ -189,24 +193,24 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
         }
         switch (md.parsing_state) {
             case SCHEMA_NAME:
-                c = nameReader(md.schema_name, c, &md, fin);
+                c = nameReader(schema_name, c, &md, fin);
                 md.parsing_state = WAIT_OPEN_BRACE;
-                memset(md.table_name, 0, sizeof REL_SIZE);
+                memset(table_name, 0, sizeof REL_SIZE);
                 break;
 
             case TABLE_NAME:
-                c = nameReader(md.table_name, c, &md, fin);
+                c = nameReader(table_name, c, &md, fin);
                 md.parsing_state = WAIT_OPEN_BRACE;
                 break;
 
             case FIELD_NAME:
-                c = nameReader(md.field_name, c, &md, fin);
+                c = nameReader(field_name, c, &md, fin);
                 md.parsing_state = WAIT_COLON;
                 break;
 
             case FUNCTION_NAME:
-                c = nameReader(md.func_name, c, &md, fin);
-                setMapValue(map, getFullRelName(md.schema_name, md.table_name, md.field_name), md.func_name);
+                c = nameReader(func_name, c, &md, fin);
+                setMapValue(map, getFullRelName(schema_name, table_name, field_name), func_name);
                 md.parsing_state = WAIT_COMMA;
                 break;
 
@@ -235,7 +239,7 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
                     exit_status = EXIT_FAILURE;
                     goto clear_resources;
                 }
-                if (md.table_name[0] != '\0') /* we have already read table_name */
+                if (table_name[0] != '\0') /* we have already read table_name */
                 {
                     md.parsing_state = FIELD_NAME;
                 } else {
@@ -294,22 +298,22 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
         }
     }
     clear_resources:
-    free(md.schema_name);
-    free(md.table_name);
-    free(md.field_name);
-    free(md.func_name);
+    free(schema_name);
+    free(table_name);
+    free(field_name);
+    free(func_name);
     return exit_status;
 }
 
 // Creating string in format `schema_name.function name(column_name)`
 void
-concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column, char *function_name, MaskingMap *map)
+concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name)
 {
     strcpy(col_with_func, schema_name);
     strcat(col_with_func, ".");
     strcat(col_with_func, function_name);
     strcat(col_with_func, "(");
-    strcat(col_with_func, column);
+    strcat(col_with_func, column_name);
     strcat(col_with_func, ")");
 }
 
@@ -317,6 +321,7 @@ concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column, ch
 char *
 addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map)
 {
+    char *col_with_func;
     int index=getMapIndexByKey(map, getFullRelName(schema_name, table_name, column_name));
     if (index == -1)
     {
@@ -340,12 +345,12 @@ addFunctionToColumn(char *schema_name, char *table_name, char *column_name, Mask
         char *function_name=map->data[index]->value;
         if (strcmp(function_name, DEFAULT_NAME)!=0)
         {
-            concatFunctionAndColumn(col_with_func, schema_name, column_name,  function_name, map);
+            concatFunctionAndColumn(col_with_func, schema_name, column_name,  function_name);
         }
         else
         {
             // TODO [USE default function]
-            concatFunctionAndColumn(col_with_func, schema_name, column_name,  "default_function_1", map);
+            concatFunctionAndColumn(col_with_func, schema_name, column_name,  "default_function_1");
         }
     }
 

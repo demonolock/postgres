@@ -52,11 +52,6 @@ MaskingDebugDetails
     int line_num;
     int symbol_num;
     enum ParsingState parsing_state;
-
-    char *schema_name;
-    char *table_name;
-    char *field_name;
-    char *func_name;
 };
 
 MaskingMap *newMaskingMap(void);
@@ -67,10 +62,10 @@ bool isTerminal(char c);
 bool isSpace(char c);
 char readNextSymbol(struct MaskingDebugDetails *md, FILE *fin);
 char nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin);
-int readMaskingPatternFromFile(FILE *fin, MaskingMap *map);
 int getMapIndexByKey(MaskingMap *map, char *key);
+int readMaskingPatternFromFile(FILE *fin, MaskingMap *map);
 char *addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map);
 char *getFullRelName(char *schema_name, char *table_name, char *field_name);
-void concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column, char *function_name, MaskingMap *map);
+void concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name);
 
 #endif							/* MASKING_H */
