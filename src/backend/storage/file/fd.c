@@ -75,6 +75,7 @@
 #include <dirent.h>
 #include <sys/file.h>
 #include <sys/param.h>
+#include <sys/resource.h>		/* for getrlimit */
 #include <sys/stat.h>
 #include <sys/types.h>
 #ifndef WIN32
@@ -83,9 +84,6 @@
 #include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
-#ifdef HAVE_SYS_RESOURCE_H
-#include <sys/resource.h>		/* for getrlimit */
-#endif
 
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -2505,8 +2503,7 @@ OpenPipeStream(const char *command, const char *mode)
 	ReleaseLruFiles();
 
 TryAgain:
-	fflush(stdout);
-	fflush(stderr);
+	fflush(NULL);
 	pqsignal(SIGPIPE, SIG_DFL);
 	errno = 0;
 	file = popen(command, mode);
@@ -3159,17 +3156,11 @@ RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok, bool unlink_all)
 					PG_TEMP_FILE_PREFIX,
 					strlen(PG_TEMP_FILE_PREFIX)) == 0)
 		{
-			struct stat statbuf;
+			PGFileType	type = get_dirent_type(rm_path, temp_de, false, LOG);
 
-			if (lstat(rm_path, &statbuf) < 0)
-			{
-				ereport(LOG,
-						(errcode_for_file_access(),
-						 errmsg("could not stat file \"%s\": %m", rm_path)));
+			if (type == PGFILETYPE_ERROR)
 				continue;
-			}
-
-			if (S_ISDIR(statbuf.st_mode))
+			else if (type == PGFILETYPE_DIR)
 			{
 				/* recursively remove contents, then directory itself */
 				RemovePgTempFilesInDir(rm_path, false, true);

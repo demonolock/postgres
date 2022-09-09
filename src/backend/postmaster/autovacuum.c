@@ -1102,7 +1102,7 @@ rebuild_database_list(Oid newdb)
 		 */
 		for (i = 0; i < nelems; i++)
 		{
-			avl_dbase  *db = &(dbary[i]);
+			db = &(dbary[i]);
 
 			current_time = TimestampTzPlusMilliseconds(current_time,
 													   millis_increment);
@@ -1940,6 +1940,9 @@ get_database_list(void)
 	table_close(rel, AccessShareLock);
 
 	CommitTransactionCommand();
+
+	/* Be sure to restore caller's memory context */
+	MemoryContextSwitchTo(resultcxt);
 
 	return dblist;
 }

@@ -2097,7 +2097,7 @@ ExecuteTruncateGuts(List *explicit_rels,
 	 * Assemble an array of relids so we can write a single WAL record for the
 	 * whole action.
 	 */
-	if (list_length(relids_logged) > 0)
+	if (relids_logged != NIL)
 	{
 		xl_heap_truncate xlrec;
 		int			i = 0;
@@ -10304,16 +10304,6 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 
 		/* No dice.  Set up to create our own constraint */
 		fkconstraint = makeNode(Constraint);
-		if (ConstraintNameIsUsed(CONSTRAINT_RELATION,
-								 RelationGetRelid(partRel),
-								 NameStr(constrForm->conname)))
-			fkconstraint->conname =
-				ChooseConstraintName(RelationGetRelationName(partRel),
-									 ChooseForeignKeyConstraintNameAddition(fkconstraint->fk_attrs),
-									 "fkey",
-									 RelationGetNamespace(partRel), NIL);
-		else
-			fkconstraint->conname = pstrdup(NameStr(constrForm->conname));
 		fkconstraint->fk_upd_action = constrForm->confupdtype;
 		fkconstraint->fk_del_action = constrForm->confdeltype;
 		fkconstraint->deferrable = constrForm->condeferrable;
@@ -10328,6 +10318,16 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 			fkconstraint->fk_attrs = lappend(fkconstraint->fk_attrs,
 											 makeString(NameStr(att->attname)));
 		}
+		if (ConstraintNameIsUsed(CONSTRAINT_RELATION,
+								 RelationGetRelid(partRel),
+								 NameStr(constrForm->conname)))
+			fkconstraint->conname =
+				ChooseConstraintName(RelationGetRelationName(partRel),
+									 ChooseForeignKeyConstraintNameAddition(fkconstraint->fk_attrs),
+									 "fkey",
+									 RelationGetNamespace(partRel), NIL);
+		else
+			fkconstraint->conname = pstrdup(NameStr(constrForm->conname));
 
 		indexOid = constrForm->conindid;
 		constrOid =
@@ -12667,6 +12667,7 @@ ATExecAlterColumnType(AlteredTableInfo *tab, Relation rel,
 			case OCLASS_TSTEMPLATE:
 			case OCLASS_TSCONFIG:
 			case OCLASS_ROLE:
+			case OCLASS_ROLE_MEMBERSHIP:
 			case OCLASS_DATABASE:
 			case OCLASS_TBLSPACE:
 			case OCLASS_FDW:
@@ -16264,11 +16265,11 @@ ATPrepChangePersistence(Relation rel, bool toLogged)
 	}
 
 	/*
-	 * Check that the table is not part any publication when changing to
-	 * UNLOGGED as UNLOGGED tables can't be published.
+	 * Check that the table is not part of any publication when changing to
+	 * UNLOGGED, as UNLOGGED tables can't be published.
 	 */
 	if (!toLogged &&
-		list_length(GetRelationPublications(RelationGetRelid(rel))) > 0)
+		GetRelationPublications(RelationGetRelid(rel)) != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cannot change table \"%s\" to unlogged because it is part of a publication",
@@ -16795,7 +16796,6 @@ PreCommit_on_commit_actions(void)
 	if (oids_to_drop != NIL)
 	{
 		ObjectAddresses *targetObjects = new_object_addresses();
-		ListCell   *l;
 
 		foreach(l, oids_to_drop)
 		{

@@ -30,7 +30,7 @@
  *		2)		bool, true, false
  *		3)		standard system types
  *		4)		IsValid macros for system types
- *		5)		offsetof, lengthof, alignment
+ *		5)		lengthof, alignment
  *		6)		assertions
  *		7)		widely useful macros
  *		8)		random stuff
@@ -332,16 +332,6 @@
 	_51,_52,_53,_54,_55,_56,_57,_58,_59,_60, \
 	_61,_62,_63,  N, ...) \
 	(N)
-
-/*
- * dummyret is used to set return values in macros that use ?: to make
- * assignments.  gcc wants these to be void, other compilers like char
- */
-#ifdef __GNUC__					/* GNU cc */
-#define dummyret	void
-#else
-#define dummyret	char
-#endif
 
 /*
  * Generic function pointer.  This can be used in the rare cases where it's
@@ -713,20 +703,9 @@ typedef NameData *Name;
 
 
 /* ----------------------------------------------------------------
- *				Section 5:	offsetof, lengthof, alignment
+ *				Section 5:	lengthof, alignment
  * ----------------------------------------------------------------
  */
-/*
- * offsetof
- *		Offset of a structure/union field within that structure/union.
- *
- *		XXX This is supposed to be part of stddef.h, but isn't on
- *		some systems (like SunOS 4).
- */
-#ifndef offsetof
-#define offsetof(type, field)	((long) &((type *)0)->field)
-#endif							/* offsetof */
-
 /*
  * lengthof
  *		Number of elements in an array.
@@ -1113,10 +1092,6 @@ extern void ExceptionalCondition(const char *conditionName,
  * ----------------------------------------------------------------
  */
 
-#ifdef HAVE_STRUCT_SOCKADDR_UN
-#define HAVE_UNIX_SOCKETS 1
-#endif
-
 /*
  * Invert the sign of a qsort-style comparison result, ie, exchange negative
  * and positive integer values, being careful not to get the wrong answer
@@ -1351,13 +1326,6 @@ typedef intptr_t sigjmp_buf[5];
 #define siglongjmp longjmp
 #endif							/* __MINGW64__ */
 #endif							/* WIN32 */
-
-/* EXEC_BACKEND defines */
-#ifdef EXEC_BACKEND
-#define NON_EXEC_STATIC
-#else
-#define NON_EXEC_STATIC static
-#endif
 
 /* /port compatibility functions */
 #include "port.h"

@@ -1214,7 +1214,7 @@ LIBS="$LIBS $PTHREAD_LIBS"
 AC_CHECK_HEADER(pthread.h, [], [AC_MSG_ERROR([
 pthread.h not found;  use --disable-thread-safety to disable thread safety])])
 
-AC_CHECK_FUNCS([strerror_r gethostbyname_r])
+AC_CHECK_FUNCS([strerror_r])
 
 # Do test here with the proper thread flags
 PGAC_FUNC_STRERROR_R_INT
@@ -1248,7 +1248,6 @@ AC_SEARCH_LIBS(setproctitle, util)
 # required. Just checking for dlsym() ought to suffice.
 AC_SEARCH_LIBS(dlsym, dl)
 AC_SEARCH_LIBS(socket, [socket ws2_32])
-AC_SEARCH_LIBS(shl_load, dld)
 AC_SEARCH_LIBS(getopt_long, [getopt gnugetopt])
 AC_SEARCH_LIBS(shm_open, rt)
 AC_SEARCH_LIBS(shm_unlink, rt)
@@ -1261,7 +1260,6 @@ AC_SEARCH_LIBS(shmget, cygipc)
 AC_SEARCH_LIBS(backtrace_symbols, execinfo)
 
 if test "$enable_thread_safety" = yes; then
-  AC_SEARCH_LIBS(gethostbyname_r, nsl)
   AC_SEARCH_LIBS(pthread_barrier_wait, pthread)
 fi
 
@@ -1452,23 +1450,13 @@ AC_CHECK_HEADERS(m4_normalize([
 	ifaddrs.h
 	langinfo.h
 	mbarrier.h
-	net/if.h
-	netinet/tcp.h
 	sys/epoll.h
 	sys/event.h
-	sys/ipc.h
 	sys/personality.h
 	sys/prctl.h
 	sys/procctl.h
-	sys/resource.h
-	sys/select.h
-	sys/sem.h
-	sys/shm.h
 	sys/signalfd.h
-	sys/sockio.h
 	sys/ucred.h
-	sys/uio.h
-	sys/un.h
 	termios.h
 	ucred.h
 ]))
@@ -1559,15 +1547,15 @@ fi
 
 if test "$with_ldap" = yes ; then
   if test "$PORTNAME" != "win32"; then
-     AC_CHECK_HEADERS(ldap.h, [],
-                      [AC_MSG_ERROR([header file <ldap.h> is required for LDAP])])
+     AC_CHECK_HEADER(ldap.h, [],
+                     [AC_MSG_ERROR([header file <ldap.h> is required for LDAP])])
      PGAC_LDAP_SAFE
   else
-     AC_CHECK_HEADERS(winldap.h, [],
-                      [AC_MSG_ERROR([header file <winldap.h> is required for LDAP])],
-                      [AC_INCLUDES_DEFAULT
+     AC_CHECK_HEADER(winldap.h, [],
+                     [AC_MSG_ERROR([header file <winldap.h> is required for LDAP])],
+                     [AC_INCLUDES_DEFAULT
 #include <windows.h>
-                      ])
+                     ])
   fi
 fi
 
@@ -1626,10 +1614,7 @@ PGAC_C_COMPUTED_GOTO
 PGAC_STRUCT_TIMEZONE
 PGAC_UNION_SEMUN
 AC_CHECK_TYPES(socklen_t, [], [], [#include <sys/socket.h>])
-PGAC_STRUCT_SOCKADDR_UN
-PGAC_STRUCT_SOCKADDR_STORAGE
-PGAC_STRUCT_SOCKADDR_STORAGE_MEMBERS
-PGAC_STRUCT_ADDRINFO
+PGAC_STRUCT_SOCKADDR_SA_LEN
 
 PGAC_TYPE_LOCALE_T
 
@@ -1687,18 +1672,7 @@ case $host_cpu in
     fi
   ;;
   ppc*|powerpc*)
-    # On PPC, check if assembler supports LWARX instruction's mutex hint bit
-    AC_CACHE_CHECK([whether assembler supports lwarx hint bit],
-                   [pgac_cv_have_ppc_mutex_hint],
-    [AC_COMPILE_IFELSE([AC_LANG_PROGRAM([],
-	[int a = 0; int *p = &a; int r;
-	 __asm__ __volatile__ (" lwarx %0,0,%1,1\n" : "=&r"(r) : "r"(p));])],
-	[pgac_cv_have_ppc_mutex_hint=yes],
-	[pgac_cv_have_ppc_mutex_hint=no])])
-    if test x"$pgac_cv_have_ppc_mutex_hint" = xyes ; then
-	AC_DEFINE(HAVE_PPC_LWARX_MUTEX_HINT, 1, [Define to 1 if the assembler supports PPC's LWARX mutex hint bit.])
-    fi
-    # Check if compiler accepts "i"(x) when __builtin_constant_p(x).
+    # On PPC, check if compiler accepts "i"(x) when __builtin_constant_p(x).
     AC_CACHE_CHECK([whether __builtin_constant_p(x) implies "i"(x) acceptance],
                    [pgac_cv_have_i_constraint__builtin_constant_p],
     [AC_COMPILE_IFELSE([AC_LANG_PROGRAM(
@@ -1827,12 +1801,6 @@ AC_CHECK_DECLS([pwritev], [], [AC_LIBOBJ(pwritev)], [#include <sys/uio.h>])
 # This is probably only present on macOS, but may as well check always
 AC_CHECK_DECLS(F_FULLFSYNC, [], [], [#include <fcntl.h>])
 
-AC_CHECK_TYPE([struct sockaddr_in6],
-        [AC_DEFINE(HAVE_IPV6, 1, [Define to 1 if you have support for IPv6.])],
-        [],
-[$ac_includes_default
-#include <netinet/in.h>])
-
 AC_CACHE_CHECK([for PS_STRINGS], [pgac_cv_var_PS_STRINGS],
 [AC_LINK_IFELSE([AC_LANG_PROGRAM(
 [#include <machine/vmparam.h>
@@ -1870,16 +1838,6 @@ if test "$PORTNAME" = "win32" -o "$PORTNAME" = "cygwin"; then
 	AC_MSG_NOTICE([On $host_os we will use our strtof wrapper.])
 fi
 
-# System's version of getaddrinfo(), if any, may be used only if we found
-# a definition for struct addrinfo; see notes in src/include/getaddrinfo.h.
-# We use only our own getaddrinfo.c on Windows, but it's time to revisit that.
-if test x"$ac_cv_type_struct_addrinfo" = xyes && \
-   test "$PORTNAME" != "win32"; then
-  AC_REPLACE_FUNCS([getaddrinfo])
-else
-  AC_LIBOBJ(getaddrinfo)
-fi
-
 # Similarly, use system's getopt_long() only if system provides struct option.
 if test x"$ac_cv_type_struct_option" = xyes ; then
   AC_REPLACE_FUNCS([getopt_long])
@@ -1904,7 +1862,6 @@ fi
 if test "$PORTNAME" = "win32"; then
   AC_CHECK_FUNCS(_configthreadlocale)
   AC_LIBOBJ(dirmod)
-  AC_LIBOBJ(getrusage)
   AC_LIBOBJ(kill)
   AC_LIBOBJ(open)
   AC_LIBOBJ(system)
@@ -1912,6 +1869,7 @@ if test "$PORTNAME" = "win32"; then
   AC_LIBOBJ(win32env)
   AC_LIBOBJ(win32error)
   AC_LIBOBJ(win32fdatasync)
+  AC_LIBOBJ(win32getrusage)
   AC_LIBOBJ(win32link)
   AC_LIBOBJ(win32ntdll)
   AC_LIBOBJ(win32pread)
@@ -2288,7 +2246,6 @@ if test "$with_tcl" = yes; then
     PGAC_PATH_TCLCONFIGSH([$with_tclconfig])
     PGAC_EVAL_TCLCONFIGSH([$TCL_CONFIG_SH],
                           [TCL_INCLUDE_SPEC,TCL_LIBS,TCL_LIB_SPEC,TCL_SHARED_BUILD])
-    AC_SUBST(TCL_SHLIB_LD_LIBS)dnl don't want to double-evaluate that one
     if test "$TCL_SHARED_BUILD" != 1; then
       AC_MSG_ERROR([cannot build PL/Tcl because Tcl is not a shared library
 Use --without-tcl to disable building PL/Tcl.])

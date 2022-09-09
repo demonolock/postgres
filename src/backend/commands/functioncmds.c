@@ -121,7 +121,6 @@ compute_return_type(TypeName *returnType, Oid languageOid,
 	{
 		char	   *typnam = TypeNameToString(returnType);
 		Oid			namespaceId;
-		AclResult	aclresult;
 		char	   *typname;
 		ObjectAddress address;
 
@@ -419,7 +418,7 @@ interpret_function_parameter_list(ParseState *pstate,
 			 * Make sure no variables are referred to (this is probably dead
 			 * code now that add_missing_from is history).
 			 */
-			if (list_length(pstate->p_rtable) != 0 ||
+			if (pstate->p_rtable != NIL ||
 				contain_var_clause(def))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
@@ -1112,8 +1111,6 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 	if (languageStruct->lanpltrusted)
 	{
 		/* if trusted language, need USAGE privilege */
-		AclResult	aclresult;
-
 		aclresult = pg_language_aclcheck(languageOid, GetUserId(), ACL_USAGE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_LANGUAGE,
@@ -1209,7 +1206,7 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 		returnsSet = false;
 	}
 
-	if (list_length(trftypes_list) > 0)
+	if (trftypes_list != NIL)
 	{
 		ListCell   *lc;
 		Datum	   *arr;

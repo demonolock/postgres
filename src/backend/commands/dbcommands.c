@@ -258,8 +258,8 @@ ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
 	Page		page;
 	List	   *rlocatorlist = NIL;
 	LockRelId	relid;
-	Relation	rel;
 	Snapshot	snapshot;
+	SMgrRelation	smgr;
 	BufferAccessStrategy bstrategy;
 
 	/* Get pg_class relfilenumber. */
@@ -276,16 +276,9 @@ ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
 	rlocator.dbOid = dbid;
 	rlocator.relNumber = relfilenumber;
 
-	/*
-	 * We can't use a real relcache entry for a relation in some other
-	 * database, but since we're only going to access the fields related to
-	 * physical storage, a fake one is good enough. If we didn't do this and
-	 * used the smgr layer directly, we would have to worry about
-	 * invalidations.
-	 */
-	rel = CreateFakeRelcacheEntry(rlocator);
-	nblocks = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
-	FreeFakeRelcacheEntry(rel);
+	smgr = smgropen(rlocator, InvalidBackendId);
+	nblocks = smgrnblocks(smgr, MAIN_FORKNUM);
+	smgrclose(smgr);
 
 	/* Use a buffer access strategy since this is a bulk read operation. */
 	bstrategy = GetAccessStrategy(BAS_BULKREAD);
@@ -919,11 +912,6 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				 errmsg("ICU locale cannot be specified unless locale provider is ICU")));
-	if (dblocprovider == COLLPROVIDER_ICU && !dbiculocale)
-	{
-		if (dlocale && dlocale->arg)
-			dbiculocale = defGetString(dlocale);
-	}
 	if (distemplate && distemplate->arg)
 		dbistemplate = defGetBoolean(distemplate);
 	if (dallowconnections && dallowconnections->arg)
@@ -1019,10 +1007,10 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		dbcollate = src_collate;
 	if (dbctype == NULL)
 		dbctype = src_ctype;
-	if (dbiculocale == NULL)
-		dbiculocale = src_iculocale;
 	if (dblocprovider == '\0')
 		dblocprovider = src_locprovider;
+	if (dbiculocale == NULL && dblocprovider == COLLPROVIDER_ICU)
+		dbiculocale = src_iculocale;
 
 	/* Some encodings are client only */
 	if (!PG_VALID_BE_ENCODING(encoding))

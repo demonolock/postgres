@@ -16,13 +16,12 @@
 #include "postgres.h"
 
 #include <sys/param.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <pwd.h>
 #include <unistd.h>
-#ifdef HAVE_SYS_SELECT_H
-#include <sys/select.h>
-#endif
 
 #include "commands/user.h"
 #include "common/ip.h"
@@ -334,23 +333,23 @@ auth_failed(Port *port, int status, const char *logdetail)
 
 /*
  * Sets the authenticated identity for the current user.  The provided string
- * will be copied into the TopMemoryContext.  The ID will be logged if
- * log_connections is enabled.
+ * will be stored into MyClientConnectionInfo, alongside the current HBA
+ * method in use.  The ID will be logged if log_connections is enabled.
  *
  * Auth methods should call this routine exactly once, as soon as the user is
  * successfully authenticated, even if they have reasons to know that
  * authorization will fail later.
  *
  * The provided string will be copied into TopMemoryContext, to match the
- * lifetime of the Port, so it is safe to pass a string that is managed by an
- * external library.
+ * lifetime of MyClientConnectionInfo, so it is safe to pass a string that is
+ * managed by an external library.
  */
 static void
 set_authn_id(Port *port, const char *id)
 {
 	Assert(id);
 
-	if (port->authn_id)
+	if (MyClientConnectionInfo.authn_id)
 	{
 		/*
 		 * An existing authn_id should never be overwritten; that means two
@@ -361,18 +360,20 @@ set_authn_id(Port *port, const char *id)
 		ereport(FATAL,
 				(errmsg("authentication identifier set more than once"),
 				 errdetail_log("previous identifier: \"%s\"; new identifier: \"%s\"",
-							   port->authn_id, id)));
+							   MyClientConnectionInfo.authn_id, id)));
 	}
 
-	port->authn_id = MemoryContextStrdup(TopMemoryContext, id);
+	MyClientConnectionInfo.authn_id = MemoryContextStrdup(TopMemoryContext, id);
+	MyClientConnectionInfo.auth_method = port->hba->auth_method;
 
 	if (Log_connections)
 	{
 		ereport(LOG,
 				errmsg("connection authenticated: identity=\"%s\" method=%s "
 					   "(%s:%d)",
-					   port->authn_id, hba_authname(port->hba->auth_method), HbaFileName,
-					   port->hba->linenumber));
+					   MyClientConnectionInfo.authn_id,
+					   hba_authname(MyClientConnectionInfo.auth_method),
+					   HbaFileName, port->hba->linenumber));
 	}
 }
 
@@ -1200,10 +1201,7 @@ pg_SSPI_recvauth(Port *port)
 	DWORD		accountnamesize = sizeof(accountname);
 	DWORD		domainnamesize = sizeof(domainname);
 	SID_NAME_USE accountnameuse;
-	HMODULE		secur32;
 	char	   *authn_id;
-
-	QUERY_SECURITY_CONTEXT_TOKEN_FN _QuerySecurityContextToken;
 
 	/*
 	 * Acquire a handle to the server credentials.
@@ -1357,36 +1355,12 @@ pg_SSPI_recvauth(Port *port)
 	 *
 	 * Get the name of the user that authenticated, and compare it to the pg
 	 * username that was specified for the connection.
-	 *
-	 * MingW is missing the export for QuerySecurityContextToken in the
-	 * secur32 library, so we have to load it dynamically.
 	 */
 
-	secur32 = LoadLibrary("SECUR32.DLL");
-	if (secur32 == NULL)
-		ereport(ERROR,
-				(errmsg("could not load library \"%s\": error code %lu",
-						"SECUR32.DLL", GetLastError())));
-
-	_QuerySecurityContextToken = (QUERY_SECURITY_CONTEXT_TOKEN_FN) (pg_funcptr_t)
-		GetProcAddress(secur32, "QuerySecurityContextToken");
-	if (_QuerySecurityContextToken == NULL)
-	{
-		FreeLibrary(secur32);
-		ereport(ERROR,
-				(errmsg_internal("could not locate QuerySecurityContextToken in secur32.dll: error code %lu",
-								 GetLastError())));
-	}
-
-	r = (_QuerySecurityContextToken) (sspictx, &token);
+	r = QuerySecurityContextToken(sspictx, &token);
 	if (r != SEC_E_OK)
-	{
-		FreeLibrary(secur32);
 		pg_SSPI_error(ERROR,
 					  _("could not get token from SSPI security context"), r);
-	}
-
-	FreeLibrary(secur32);
 
 	/*
 	 * No longer need the security context, everything from here on uses the
@@ -1651,8 +1625,6 @@ interpret_ident_response(const char *ident_response,
 						return false;
 					else
 					{
-						int			i;	/* Index into *ident_user */
-
 						cursor++;	/* Go over colon */
 						while (pg_isblank(*cursor))
 							cursor++;	/* skip blanks */
@@ -1908,7 +1880,8 @@ auth_peer(hbaPort *port)
 	 */
 	set_authn_id(port, pw->pw_name);
 
-	ret = check_usermap(port->hba->usermap, port->user_name, port->authn_id, false);
+	ret = check_usermap(port->hba->usermap, port->user_name,
+						MyClientConnectionInfo.authn_id, false);
 
 	return ret;
 #else
@@ -2916,14 +2889,14 @@ CheckRADIUSAuth(Port *port)
 	Assert(offsetof(radius_packet, vector) == 4);
 
 	/* Verify parameters */
-	if (list_length(port->hba->radiusservers) < 1)
+	if (port->hba->radiusservers == NIL)
 	{
 		ereport(LOG,
 				(errmsg("RADIUS server not specified")));
 		return STATUS_ERROR;
 	}
 
-	if (list_length(port->hba->radiussecrets) < 1)
+	if (port->hba->radiussecrets == NIL)
 	{
 		ereport(LOG,
 				(errmsg("RADIUS secret not specified")));
@@ -3015,13 +2988,8 @@ PerformRadiusTransaction(const char *server, const char *secret, const char *por
 	int			packetlength;
 	pgsocket	sock;
 
-#ifdef HAVE_IPV6
 	struct sockaddr_in6 localaddr;
 	struct sockaddr_in6 remoteaddr;
-#else
-	struct sockaddr_in localaddr;
-	struct sockaddr_in remoteaddr;
-#endif
 	struct addrinfo hint;
 	struct addrinfo *serveraddrs;
 	int			port;
@@ -3131,18 +3099,12 @@ PerformRadiusTransaction(const char *server, const char *secret, const char *por
 	}
 
 	memset(&localaddr, 0, sizeof(localaddr));
-#ifdef HAVE_IPV6
 	localaddr.sin6_family = serveraddrs[0].ai_family;
 	localaddr.sin6_addr = in6addr_any;
 	if (localaddr.sin6_family == AF_INET6)
 		addrsize = sizeof(struct sockaddr_in6);
 	else
 		addrsize = sizeof(struct sockaddr_in);
-#else
-	localaddr.sin_family = serveraddrs[0].ai_family;
-	localaddr.sin_addr.s_addr = INADDR_ANY;
-	addrsize = sizeof(struct sockaddr_in);
-#endif
 
 	if (bind(sock, (struct sockaddr *) &localaddr, addrsize))
 	{
@@ -3245,21 +3207,11 @@ PerformRadiusTransaction(const char *server, const char *secret, const char *por
 			return STATUS_ERROR;
 		}
 
-#ifdef HAVE_IPV6
 		if (remoteaddr.sin6_port != pg_hton16(port))
-#else
-		if (remoteaddr.sin_port != pg_hton16(port))
-#endif
 		{
-#ifdef HAVE_IPV6
 			ereport(LOG,
 					(errmsg("RADIUS response from %s was sent from incorrect port: %d",
 							server, pg_ntoh16(remoteaddr.sin6_port))));
-#else
-			ereport(LOG,
-					(errmsg("RADIUS response from %s was sent from incorrect port: %d",
-							server, pg_ntoh16(remoteaddr.sin_port))));
-#endif
 			continue;
 		}
 

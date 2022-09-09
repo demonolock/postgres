@@ -63,6 +63,7 @@
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
+#include "backup/basebackup.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "catalog/pg_database.h"
@@ -77,7 +78,6 @@
 #include "postmaster/bgwriter.h"
 #include "postmaster/startup.h"
 #include "postmaster/walwriter.h"
-#include "replication/basebackup.h"
 #include "replication/logical.h"
 #include "replication/origin.h"
 #include "replication/slot.h"
@@ -657,8 +657,9 @@ static void PreallocXlogFiles(XLogRecPtr endptr, TimeLineID tli);
 static void RemoveTempXlogFiles(void);
 static void RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr lastredoptr,
 							   XLogRecPtr endptr, TimeLineID insertTLI);
-static void RemoveXlogFile(const char *segname, XLogSegNo recycleSegNo,
-						   XLogSegNo *endlogSegNo, TimeLineID insertTLI);
+static void RemoveXlogFile(const struct dirent *segment_de,
+						   XLogSegNo recycleSegNo, XLogSegNo *endlogSegNo,
+						   TimeLineID insertTLI);
 static void UpdateLastRemovedPtr(char *filename);
 static void ValidateXLOGDirectoryStructure(void);
 static void CleanupBackupHistory(void);
@@ -3036,8 +3037,7 @@ XLogFileInitInternal(XLogSegNo logsegno, TimeLineID logtli,
 	pgstat_report_wait_start(WAIT_EVENT_WAL_INIT_SYNC);
 	if (pg_fsync(fd) != 0)
 	{
-		int			save_errno = errno;
-
+		save_errno = errno;
 		close(fd);
 		errno = save_errno;
 		ereport(ERROR,
@@ -3597,8 +3597,7 @@ RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr lastredoptr, XLogRecPtr endptr,
 				/* Update the last removed location in shared memory first */
 				UpdateLastRemovedPtr(xlde->d_name);
 
-				RemoveXlogFile(xlde->d_name, recycleSegNo, &endlogSegNo,
-							   insertTLI);
+				RemoveXlogFile(xlde, recycleSegNo, &endlogSegNo, insertTLI);
 			}
 		}
 	}
@@ -3670,8 +3669,7 @@ RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
 			 * - but seems safer to let them be archived and removed later.
 			 */
 			if (!XLogArchiveIsReady(xlde->d_name))
-				RemoveXlogFile(xlde->d_name, recycleSegNo, &endLogSegNo,
-							   newTLI);
+				RemoveXlogFile(xlde, recycleSegNo, &endLogSegNo, newTLI);
 		}
 	}
 
@@ -3681,9 +3679,9 @@ RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
 /*
  * Recycle or remove a log file that's no longer needed.
  *
- * segname is the name of the segment to recycle or remove.  recycleSegNo
- * is the segment number to recycle up to.  endlogSegNo is the segment
- * number of the current (or recent) end of WAL.
+ * segment_de is the dirent structure of the segment to recycle or remove.
+ * recycleSegNo is the segment number to recycle up to.  endlogSegNo is
+ * the segment number of the current (or recent) end of WAL.
  *
  * endlogSegNo gets incremented if the segment is recycled so as it is not
  * checked again with future callers of this function.
@@ -3692,14 +3690,15 @@ RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
  * should be used for this timeline.
  */
 static void
-RemoveXlogFile(const char *segname, XLogSegNo recycleSegNo,
-			   XLogSegNo *endlogSegNo, TimeLineID insertTLI)
+RemoveXlogFile(const struct dirent *segment_de,
+			   XLogSegNo recycleSegNo, XLogSegNo *endlogSegNo,
+			   TimeLineID insertTLI)
 {
 	char		path[MAXPGPATH];
 #ifdef WIN32
 	char		newpath[MAXPGPATH];
 #endif
-	struct stat statbuf;
+	const char *segname = segment_de->d_name;
 
 	snprintf(path, MAXPGPATH, XLOGDIR "/%s", segname);
 
@@ -3711,7 +3710,7 @@ RemoveXlogFile(const char *segname, XLogSegNo recycleSegNo,
 	if (wal_recycle &&
 		*endlogSegNo <= recycleSegNo &&
 		XLogCtl->InstallXLogFileSegmentActive &&	/* callee rechecks this */
-		lstat(path, &statbuf) == 0 && S_ISREG(statbuf.st_mode) &&
+		get_dirent_type(path, segment_de, false, DEBUG2) == PGFILETYPE_REG &&
 		InstallXLogFileSegment(endlogSegNo, path,
 							   true, recycleSegNo, insertTLI))
 	{
@@ -4501,9 +4500,7 @@ BootStrapXLOG(void)
 	pg_crc32c	crc;
 
 	/* allow ordinary WAL segment creation, like StartupXLOG() would */
-	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-	XLogCtl->InstallXLogFileSegmentActive = true;
-	LWLockRelease(ControlFileLock);
+	SetInstallXLogFileSegmentActive();
 
 	/*
 	 * Select a hopefully-unique system identifier code for this installation.
@@ -4723,7 +4720,6 @@ XLogInitNewTimeline(TimeLineID endTLI, XLogRecPtr endOfLog, TimeLineID newTLI)
 
 		if (close(fd) != 0)
 		{
-			char		xlogfname[MAXFNAMELEN];
 			int			save_errno = errno;
 
 			XLogFileName(xlogfname, newTLI, startLogSegNo, wal_segment_size);
@@ -5368,9 +5364,7 @@ StartupXLOG(void)
 	 * Allow ordinary WAL segment creation before possibly switching to a new
 	 * timeline, which creates a new segment, and after the last ReadRecord().
 	 */
-	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-	XLogCtl->InstallXLogFileSegmentActive = true;
-	LWLockRelease(ControlFileLock);
+	SetInstallXLogFileSegmentActive();
 
 	/*
 	 * Consider whether we need to assign a new timeline ID.
@@ -5439,6 +5433,14 @@ StartupXLOG(void)
 	 */
 	if (!XLogRecPtrIsInvalid(missingContrecPtr))
 	{
+		/*
+		 * We should only have a missingContrecPtr if we're not switching to
+		 * a new timeline. When a timeline switch occurs, WAL is copied from
+		 * the old timeline to the new only up to the end of the last complete
+		 * record, so there can't be an incomplete WAL record that we need to
+		 * disregard.
+		 */
+		Assert(newTLI == endOfRecoveryInfo->lastRecTLI);
 		Assert(!XLogRecPtrIsInvalid(abortedRecPtr));
 		EndOfLog = missingContrecPtr;
 	}

@@ -56,7 +56,7 @@ AggregateInstrumentation
 AlenState
 Alias
 AllocBlock
-AllocChunk
+AllocFreeListLink
 AllocPointer
 AllocSet
 AllocSetContext
@@ -373,6 +373,7 @@ CkptTsStatus
 ClientAuthentication_hook_type
 ClientCertMode
 ClientCertName
+ClientConnectionInfo
 ClientData
 ClonePtrType
 ClosePortalStmt
@@ -946,7 +947,6 @@ GatherState
 Gene
 GeneratePruningStepsContext
 GenerationBlock
-GenerationChunk
 GenerationContext
 GenerationPointer
 GenericCosts
@@ -1237,12 +1237,10 @@ JsonBehaviorType
 JsonCoercion
 JsonCommon
 JsonConstructorExpr
-JsonConstructorExprState
 JsonConstructorType
 JsonEncoding
 JsonExpr
 JsonExprOp
-JsonExprState
 JsonFormat
 JsonFormatType
 JsonFunc
@@ -1291,18 +1289,6 @@ JsonQuotes
 JsonReturning
 JsonScalarExpr
 JsonSemAction
-JsonSerializeExpr
-JsonTable
-JsonTableColumn
-JsonTableColumnType
-JsonTableContext
-JsonTableJoinState
-JsonTableParent
-JsonTablePlan
-JsonTablePlanJoinType
-JsonTablePlanType
-JsonTableScanState
-JsonTableSibling
 JsonTokenType
 JsonTransformStringValuesAction
 JsonTypeCategory
@@ -1521,12 +1507,14 @@ MemoizeKey
 MemoizePath
 MemoizeState
 MemoizeTuple
+MemoryChunk
 MemoryContext
 MemoryContextCallback
 MemoryContextCallbackFunction
 MemoryContextCounters
 MemoryContextData
 MemoryContextMethods
+MemoryContextMethodID
 MemoryStatsPrintFunc
 MergeAction
 MergeActionState
@@ -2455,6 +2443,7 @@ SerCommitSeqNo
 SerialControl
 SerializableXactHandle
 SerializedActiveRelMaps
+SerializedClientConnectionInfo
 SerializedRanges
 SerializedReindexState
 SerializedSnapshotData
@@ -2528,7 +2517,6 @@ SingleBoundSortItem
 Size
 SkipPages
 SlabBlock
-SlabChunk
 SlabContext
 SlabSlot
 SlotNumber
@@ -2722,7 +2710,6 @@ TableFunc
 TableFuncRoutine
 TableFuncScan
 TableFuncScanState
-TableFuncType
 TableInfo
 TableLikeClause
 TableSampleClause

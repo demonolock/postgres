@@ -1957,7 +1957,7 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 	List	   *cache_varinfos = NIL;
 
 	/* fallback if pathkeys is unknown */
-	if (list_length(pathkeys) == 0)
+	if (pathkeys == NIL)
 	{
 		/*
 		 * If we'll use a bounded heap-sort keeping just K tuples in memory,
@@ -2447,7 +2447,6 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 	int			arrlen;
 	ListCell   *l;
 	ListCell   *cell;
-	int			i;
 	int			path_index;
 	int			min_index;
 	int			max_index;
@@ -2486,7 +2485,6 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 	for_each_cell(l, subpaths, cell)
 	{
 		Path	   *subpath = (Path *) lfirst(l);
-		int			i;
 
 		/* Consider only the non-partial paths */
 		if (path_index++ == numpaths)
@@ -2495,7 +2493,8 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 		costarr[min_index] += subpath->total_cost;
 
 		/* Update the new min cost array index */
-		for (min_index = i = 0; i < arrlen; i++)
+		min_index = 0;
+		for (int i = 0; i < arrlen; i++)
 		{
 			if (costarr[i] < costarr[min_index])
 				min_index = i;
@@ -2503,7 +2502,8 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 	}
 
 	/* Return the highest cost from the array */
-	for (max_index = i = 0; i < arrlen; i++)
+	max_index = 0;
+	for (int i = 0; i < arrlen; i++)
 	{
 		if (costarr[i] > costarr[max_index])
 			max_index = i;
@@ -4923,8 +4923,7 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 			 IsA(node, SQLValueFunction) ||
 			 IsA(node, XmlExpr) ||
 			 IsA(node, CoerceToDomain) ||
-			 IsA(node, NextValueExpr) ||
-			 IsA(node, JsonExpr))
+			 IsA(node, NextValueExpr))
 	{
 		/* Treat all these as having cost 1 */
 		context->total.per_tuple += cpu_operator_cost;
@@ -6245,7 +6244,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 			 * scanning this rel, so be sure to include it in reltarget->cost.
 			 */
 			PlaceHolderVar *phv = (PlaceHolderVar *) node;
-			PlaceHolderInfo *phinfo = find_placeholder_info(root, phv, false);
+			PlaceHolderInfo *phinfo = find_placeholder_info(root, phv);
 			QualCost	cost;
 
 			tuple_width += phinfo->ph_width;

@@ -565,7 +565,6 @@ DefineIndex(Oid relationId,
 	Oid			root_save_userid;
 	int			root_save_sec_context;
 	int			root_save_nestlevel;
-	int			i;
 
 	root_save_nestlevel = NewGUCNestLevel();
 
@@ -1047,7 +1046,7 @@ DefineIndex(Oid relationId,
 	 * We disallow indexes on system columns.  They would not necessarily get
 	 * updated correctly, and they don't seem useful anyway.
 	 */
-	for (i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
+	for (int i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
 	{
 		AttrNumber	attno = indexInfo->ii_IndexAttrNumbers[i];
 
@@ -1067,7 +1066,7 @@ DefineIndex(Oid relationId,
 		pull_varattnos((Node *) indexInfo->ii_Expressions, 1, &indexattrs);
 		pull_varattnos((Node *) indexInfo->ii_Predicate, 1, &indexattrs);
 
-		for (i = FirstLowInvalidHeapAttributeNumber + 1; i < 0; i++)
+		for (int i = FirstLowInvalidHeapAttributeNumber + 1; i < 0; i++)
 		{
 			if (bms_is_member(i - FirstLowInvalidHeapAttributeNumber,
 							  indexattrs))
@@ -1213,18 +1212,27 @@ DefineIndex(Oid relationId,
 			int			nparts = partdesc->nparts;
 			Oid		   *part_oids = palloc(sizeof(Oid) * nparts);
 			bool		invalidate_parent = false;
+			Relation	parentIndex;
 			TupleDesc	parentDesc;
-			Oid		   *opfamOids;
 
 			pgstat_progress_update_param(PROGRESS_CREATEIDX_PARTITIONS_TOTAL,
 										 nparts);
 
+			/* Make a local copy of partdesc->oids[], just for safety */
 			memcpy(part_oids, partdesc->oids, sizeof(Oid) * nparts);
 
+			/*
+			 * We'll need an IndexInfo describing the parent index.  The one
+			 * built above is almost good enough, but not quite, because (for
+			 * example) its predicate expression if any hasn't been through
+			 * expression preprocessing.  The most reliable way to get an
+			 * IndexInfo that will match those for child indexes is to build
+			 * it the same way, using BuildIndexInfo().
+			 */
+			parentIndex = index_open(indexRelationId, lockmode);
+			indexInfo = BuildIndexInfo(parentIndex);
+
 			parentDesc = RelationGetDescr(rel);
-			opfamOids = palloc(sizeof(Oid) * numberOfKeyAttributes);
-			for (i = 0; i < numberOfKeyAttributes; i++)
-				opfamOids[i] = get_opclass_family(classObjectId[i]);
 
 			/*
 			 * For each partition, scan all existing indexes; if one matches
@@ -1234,7 +1242,7 @@ DefineIndex(Oid relationId,
 			 * If none matches, build a new index by calling ourselves
 			 * recursively with the same options (except for the index name).
 			 */
-			for (i = 0; i < nparts; i++)
+			for (int i = 0; i < nparts; i++)
 			{
 				Oid			childRelid = part_oids[i];
 				Relation	childrel;
@@ -1295,9 +1303,9 @@ DefineIndex(Oid relationId,
 					cldIdxInfo = BuildIndexInfo(cldidx);
 					if (CompareIndexInfo(cldIdxInfo, indexInfo,
 										 cldidx->rd_indcollation,
-										 collationObjectId,
+										 parentIndex->rd_indcollation,
 										 cldidx->rd_opfamily,
-										 opfamOids,
+										 parentIndex->rd_opfamily,
 										 attmap))
 					{
 						Oid			cldConstrOid = InvalidOid;
@@ -1423,6 +1431,8 @@ DefineIndex(Oid relationId,
 											 i + 1);
 				free_attrmap(attmap);
 			}
+
+			index_close(parentIndex, lockmode);
 
 			/*
 			 * The pg_index row we inserted for this index was marked

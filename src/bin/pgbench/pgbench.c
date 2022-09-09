@@ -40,9 +40,7 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/time.h>
-#ifdef HAVE_SYS_RESOURCE_H
 #include <sys/resource.h>		/* for getrlimit */
-#endif
 
 /* For testing, PGBENCH_USE_SELECT can be defined to force use of that code */
 #if defined(HAVE_PPOLL) && !defined(PGBENCH_USE_SELECT)
@@ -52,9 +50,7 @@
 #endif
 #else							/* no ppoll(), so use select() */
 #define POLL_USING_SELECT
-#ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
-#endif
 #endif
 
 #include "common/int.h"
@@ -2977,6 +2973,8 @@ runShellCommand(Variables *variables, char *variable, char **argv, int argc)
 
 	command[len] = '\0';
 
+	fflush(NULL);				/* needed before either system() or popen() */
+
 	/* Fast path for non-assignment case */
 	if (variable == NULL)
 	{
@@ -3113,7 +3111,6 @@ sendCommand(CState *st, Command *command)
 			for (j = 0; commands[j] != NULL; j++)
 			{
 				PGresult   *res;
-				char		name[MAX_PREPARE_NAME];
 
 				if (commands[j]->type != SQL_COMMAND)
 					continue;
@@ -3515,10 +3512,9 @@ printVerboseErrorMessages(CState *st, pg_time_usec_t *now, bool is_retry)
 		resetPQExpBuffer(buf);
 
 	printfPQExpBuffer(buf, "client %d ", st->id);
-	appendPQExpBuffer(buf, "%s",
-					  (is_retry ?
-					   "repeats the transaction after the error" :
-					   "ends the failed transaction"));
+	appendPQExpBufferStr(buf, (is_retry ?
+							   "repeats the transaction after the error" :
+							   "ends the failed transaction"));
 	appendPQExpBuffer(buf, " (try %u", st->tries);
 
 	/* Print max_tries if it is not unlimitted. */
@@ -3535,7 +3531,7 @@ printVerboseErrorMessages(CState *st, pg_time_usec_t *now, bool is_retry)
 		appendPQExpBuffer(buf, ", %.3f%% of the maximum time of tries was used",
 						  (100.0 * (*now - st->txn_scheduled) / latency_limit));
 	}
-	appendPQExpBuffer(buf, ")\n");
+	appendPQExpBufferStr(buf, ")\n");
 
 	pg_log_info("%s", buf->data);
 }
@@ -3807,8 +3803,6 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				/* quickly skip commands until something to do... */
 				while (true)
 				{
-					Command    *command;
-
 					command = sql_script[st->use_file].commands[st->command];
 
 					/* cannot reach end of script in that state */
@@ -3963,8 +3957,6 @@ advanceConnectionState(TState *thread, CState *st, StatsData *agg)
 				 */
 				if (report_per_command)
 				{
-					Command    *command;
-
 					pg_time_now_lazy(&now);
 
 					command = sql_script[st->use_file].commands[st->command];

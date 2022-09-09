@@ -9,13 +9,13 @@
  * Portions Copyright (c) 2010-2022, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  src/backend/replication/basebackup_target.c
+ *	  src/backend/backup/basebackup_target.c
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "replication/basebackup_target.h"
+#include "backup/basebackup_target.h"
 #include "utils/memutils.h"
 
 typedef struct BaseBackupTargetType
@@ -62,7 +62,7 @@ BaseBackupAddTarget(char *name,
 					void *(*check_detail) (char *, char *),
 					bbsink *(*get_sink) (bbsink *, void *))
 {
-	BaseBackupTargetType *ttype;
+	BaseBackupTargetType *newtype;
 	MemoryContext oldcontext;
 	ListCell   *lc;
 
@@ -96,11 +96,11 @@ BaseBackupAddTarget(char *name,
 	 * name into a newly-allocated chunk of memory.
 	 */
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-	ttype = palloc(sizeof(BaseBackupTargetType));
-	ttype->name = pstrdup(name);
-	ttype->check_detail = check_detail;
-	ttype->get_sink = get_sink;
-	BaseBackupTargetTypeList = lappend(BaseBackupTargetTypeList, ttype);
+	newtype = palloc(sizeof(BaseBackupTargetType));
+	newtype->name = pstrdup(name);
+	newtype->check_detail = check_detail;
+	newtype->get_sink = get_sink;
+	BaseBackupTargetTypeList = lappend(BaseBackupTargetTypeList, newtype);
 	MemoryContextSwitchTo(oldcontext);
 }
 
