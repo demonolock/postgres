@@ -18240,7 +18240,7 @@ getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
     FILE *fin;
     if (filename[0]=='\0')
     {
-        pg_log_error("filename shouldn\'t be empty");
+        pg_log_error("--masking filename shouldn't be empty");
         exit_nicely(1);
     }
 
