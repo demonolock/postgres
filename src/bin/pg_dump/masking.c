@@ -319,7 +319,7 @@ concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_nam
 
 
 char *
-addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map)
+addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map, FunctionList *function_list)
 {
     char *col_with_func;
     int index=getMapIndexByKey(map, getFullRelName(schema_name, table_name, column_name));
@@ -345,7 +345,14 @@ addFunctionToColumn(char *schema_name, char *table_name, char *column_name, Mask
         char *function_name=map->data[index]->value;
         if (strcmp(function_name, DEFAULT_NAME)!=0)
         {
-            concatFunctionAndColumn(col_with_func, schema_name, column_name,  function_name);
+            if (findFunction(function_list, function_name) != -1)
+            {
+                concatFunctionAndColumn(col_with_func, schema_name, column_name,  function_name);
+            }
+            else
+            {
+                return strcat(" ", function_name);
+            }
         }
         else
         {
@@ -355,4 +362,64 @@ addFunctionToColumn(char *schema_name, char *table_name, char *column_name, Mask
     }
 
     return col_with_func;
+}
+
+FunctionList *
+initFunctionList()
+{
+    FunctionList *func_list = malloc(sizeof(FunctionList));
+    func_list->func_name = malloc(sizeof(func_list->func_name));
+    func_list->next=NULL;
+    return func_list;
+}
+
+FunctionList *
+addFunctionToList(FunctionList *tail, char *schema_name, char *function_name)
+{
+    int func_name_size = REL_SIZE * 2 + 1; // schema_name.func_name
+    FunctionList *cur = (FunctionList *) malloc(sizeof(FunctionList));
+    cur->func_name = malloc(func_name_size);
+    memset(cur->func_name, 0, func_name_size);
+    strcpy(cur->func_name, schema_name);
+    strncat(cur->func_name, &REL_SEP, 1);
+    strcat(cur->func_name, function_name);
+    cur->next=tail;
+    return cur;
+}
+
+void
+freeFunctionList(FunctionList *func_list)
+{
+    FunctionList *q;
+    while (func_list != NULL)
+    {
+        printf("%s\n", func_list->func_name);
+        q = func_list;
+        func_list=func_list->next;
+        free(q);
+    }
+}
+
+int
+findFunction(FunctionList *func_list, char *func_name)
+{
+    while (func_list != NULL)
+    {
+        if (strcmp(func_list->func_name, func_name) == 0)
+        {
+            return 0;
+        }
+        func_list=func_list->next;
+    }
+    return -1;
+}
+
+void
+printFunctionList(FunctionList *func_list)
+{
+    while (func_list != NULL)
+    {
+        printf("'%s'\n", func_list->func_name);
+        func_list=func_list->next;
+    }
 }

@@ -344,6 +344,7 @@ main(int argc, char **argv)
 	int			plainText = 0;
 	ArchiveFormat archiveFormat = archUnknown;
 	ArchiveMode archiveMode;
+    struct FunctionList *function_list;
 
 	static DumpOptions dopt;
 
@@ -626,6 +627,7 @@ main(int argc, char **argv)
 
             case 13:			/* masking */
                 getMaskingPatternFromFile(optarg, &dopt);
+                function_list = initFunctionList();
                 if (dopt.dump_inserts == 0)
                     dopt.dump_inserts = DUMP_DEFAULT_ROWS_PER_INSERT;
                 break;
@@ -2170,8 +2172,11 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
             if (dopt->masking_map)
             {
                 char *column_with_fun;
-                //getExistFunctions((const FuncInfo *) dopt);
                 column_with_fun=addFunctionToColumn(tbinfo->dobj.namespace->dobj.name, tbinfo->dobj.name, tbinfo->attnames[i], dopt->masking_map);
+                if (column_with_fun[0] == ' ')
+                {
+                    pg_log_warning("Function\"%s\" is not found", column_with_fun);
+                }
                 if (column_with_fun[0] != '\0')
                 {
                     appendPQExpBufferStr(q, column_with_fun);
@@ -11774,6 +11779,11 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 	qual_funcsig = psprintf("%s.%s",
 							fmtId(finfo->dobj.namespace->dobj.name),
 							funcsig);
+
+    if (dopt->masking_map)
+    {
+        function_list = addFunctionToList(function_list, finfo->dobj.namespace->dobj.name, funcsig_tag);
+    }
 
 	if (prokind[0] == PROKIND_PROCEDURE)
 		keyword = "PROCEDURE";
