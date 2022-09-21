@@ -18,12 +18,13 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include "masking.h"
+#include "fe_utils/simple_list.h"
 
-char *DEFAULT_NAME="default";
-const char REL_SEP = '.'; /* Relation separator */
-const size_t REL_SIZE = 64 * 8; /* Length of relation name - 64 bytes */
-const int COL_WITH_FUNC_SIZE = 3 * REL_SIZE + 3; // schema_name.function name + '(' + column_name + ')
-
+#define REL_SEP '.' /* Relation separator */
+#define REL_SIZE 64 * 8 /* Length of relation name - 64 bytes */
+#define DEFAULT_NAME "default"
+#define COL_WITH_FUNC_SIZE 3 * REL_SIZE + 3 // schema_name.function name + '(' + column_name + ')
+#define PATH_SIZE 255 * 8 + 2 // length of the path + 2 quotes
 
 MaskingMap *
 newMaskingMap() {
@@ -65,31 +66,34 @@ cleanMap(MaskingMap *map) {
 
 void
 setMapValue(MaskingMap *map, char *key, char *value) {
-    int index = getMapIndexByKey(map, key);
-    if (index != -1) // Already have key in map
+    if key != NULL
     {
-        free(map->data[index]->value);
-        map->data[index]->value = malloc(strlen(value) + 1);
-        strcpy(map->data[index]->value, value);
+        int index = getMapIndexByKey(map, key);
+        if (index != -1) // Already have key in map
+        {
+            free(map->data[index]->value);
+            map->data[index]->value = malloc(strlen(value) + 1);
+            strcpy(map->data[index]->value, value);
 
-    } else {
+        } else {
 
-        Pair *pair = malloc(sizeof(Pair));
-        pair->key = malloc(strlen(key) + 1);
-        pair->value = malloc(strlen(value) + 1);
-        memset(pair->key, 0, strlen(key));
-        memset(pair->value, 0, strlen(value));
-        strcpy(pair->key, key);
-        strcpy(pair->value, value);
+            Pair *pair = malloc(sizeof(Pair));
+            pair->key = malloc(strlen(key) + 1);
+            pair->value = malloc(strlen(value) + 1);
+            memset(pair->key, 0, strlen(key));
+            memset(pair->value, 0, strlen(value));
+            strcpy(pair->key, key);
+            strcpy(pair->value, value);
 
-        map->data[map->size] = malloc(sizeof(Pair));
-        *map->data[map->size] = *pair;
-        map->size++;
-        free(pair);
-    }
-    if (map->size == map->capacity) { /* Increase capacity */
-        map->capacity *= 1.5;
-        map->data = realloc(map->data, sizeof(Pair) * map->capacity);
+            map->data[map->size] = malloc(sizeof(Pair));
+            *map->data[map->size] = *pair;
+            map->size++;
+            free(pair);
+        }
+        if (map->size == map->capacity) { /* Increase capacity */
+            map->capacity *= 1.5;
+            map->data = realloc(map->data, sizeof(Pair) * map->capacity);
+        }
     }
     free(key);
 }
@@ -125,7 +129,7 @@ readNextSymbol(struct MaskingDebugDetails *md, FILE *fin) {
 /* Read relation name*/
 char
 nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin) {
-    memset(rel_name, 0, REL_SIZE);
+    memset(rel_name, 0, PATH_SIZE);
     while (!isTerminal(c)) {
 
         switch (c) {
@@ -175,10 +179,10 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
     md.parsing_state = SCHEMA_NAME;
     exit_status = EXIT_SUCCESS;
 
-    schema_name = malloc(REL_SIZE);
-    table_name = malloc(REL_SIZE);
-    field_name = malloc(REL_SIZE);
-    func_name = malloc(REL_SIZE);
+    schema_name = malloc(REL_SIZE + 1);
+    table_name = malloc(REL_SIZE + 1);
+    field_name = malloc(REL_SIZE + 1);
+    func_name = malloc(PATH_SIZE + 1); // We can get function name or path to file with a creating function query
 
     brace_counter = 0;
     close_brace_counter = 0;
@@ -210,6 +214,7 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
 
             case FUNCTION_NAME:
                 c = nameReader(func_name, c, &md, fin);
+                extractFuncNameIfPath(func_name, map->funcQueryPath);
                 setMapValue(map, getFullRelName(schema_name, table_name, field_name), func_name);
                 md.parsing_state = WAIT_COMMA;
                 break;
@@ -307,8 +312,7 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
 
 // Creating string in format `schema_name.function name(column_name)`
 void
-concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name)
-{
+concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name) {
     strcpy(col_with_func, schema_name);
     strcat(col_with_func, ".");
     strcat(col_with_func, function_name);
@@ -319,20 +323,16 @@ concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_nam
 
 
 char *
-addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map, FunctionList *function_list)
-{
+addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map) {
     char *col_with_func;
-    int index=getMapIndexByKey(map, getFullRelName(schema_name, table_name, column_name));
-    if (index == -1)
-    {
+    int index = getMapIndexByKey(map, getFullRelName(schema_name, table_name, column_name));
+    if (index == -1) {
         // For all schemas [default.table.field]
         index = getMapIndexByKey(map, getFullRelName(DEFAULT_NAME, table_name, column_name));
-        if (index == -1)
-        {
+        if (index == -1) {
             // For all tables and schemas [default.default.field]
             index = getMapIndexByKey(map, getFullRelName(DEFAULT_NAME, DEFAULT_NAME, column_name));
-            if (index == -1)
-            {
+            if (index == -1) {
                 // For all fields in all schemas and tables [default.default.default]
                 index = getMapIndexByKey(map, getFullRelName(DEFAULT_NAME, DEFAULT_NAME, DEFAULT_NAME));
             }
@@ -340,86 +340,133 @@ addFunctionToColumn(char *schema_name, char *table_name, char *column_name, Mask
     }
     col_with_func = malloc(COL_WITH_FUNC_SIZE + 1);
     memset(col_with_func, 0, COL_WITH_FUNC_SIZE + 1);
-    if (index != -1)
-    {
-        char *function_name=map->data[index]->value;
-        if (strcmp(function_name, DEFAULT_NAME)!=0)
-        {
-            if (findFunction(function_list, function_name) != -1)
-            {
-                concatFunctionAndColumn(col_with_func, schema_name, column_name,  function_name);
-            }
-            else
-            {
-                return strcat(" ", function_name);
-            }
-        }
-        else
-        {
+    if (index != -1) {
+        char *function_name = map->data[index]->value;
+        if (strcmp(function_name, DEFAULT_NAME) != 0) {
+            // We can get an error if function is not available
+            concatFunctionAndColumn(col_with_func, schema_name, column_name, function_name);
+        } else {
             // TODO [USE default function]
-            concatFunctionAndColumn(col_with_func, schema_name, column_name,  "default_function_1");
+            concatFunctionAndColumn(col_with_func, schema_name, column_name, "default_function_1");
         }
     }
 
     return col_with_func;
 }
 
-FunctionList *
-initFunctionList()
-{
-    FunctionList *func_list = malloc(sizeof(FunctionList));
-    func_list->func_name = malloc(sizeof(func_list->func_name));
-    func_list->next=NULL;
-    return func_list;
-}
-
-FunctionList *
-addFunctionToList(FunctionList *tail, char *schema_name, char *function_name)
-{
-    int func_name_size = REL_SIZE * 2 + 1; // schema_name.func_name
-    FunctionList *cur = (FunctionList *) malloc(sizeof(FunctionList));
-    cur->func_name = malloc(func_name_size);
-    memset(cur->func_name, 0, func_name_size);
-    strcpy(cur->func_name, schema_name);
-    strncat(cur->func_name, &REL_SEP, 1);
-    strcat(cur->func_name, function_name);
-    cur->next=tail;
-    return cur;
-}
-
 void
-freeFunctionList(FunctionList *func_list)
-{
-    FunctionList *q;
-    while (func_list != NULL)
-    {
-        printf("%s\n", func_list->func_name);
-        q = func_list;
-        func_list=func_list->next;
-        free(q);
+removeQuotes(char *func_name) {
+    char *new_func_name = malloc(PATH_SIZE + 1);
+    strncpy(new_func_name, func_name + 1, strlen(func_name) - 2);
+    memset(func_name, 0, PATH_SIZE);
+    strcpy(func_name, new_func_name);
+}
+
+
+/**
+ * Read a word from a query, that creating a custom function
+ */
+char *
+readWord(FILE fin, char *word) {
+    memset(word, 0, strlen(word));
+    while (c != EOF) {
+        c = getc(fin);
+        if (isSpace(c) || c == '(') // Space or open brace before function arguments
+        {
+            if (word[0] == '\0') // Spaces before the word
+                continue;
+            else
+                break; // Spaces after the word
+        } else {
+            strncat(word, &tolower(c), 1);
+        }
     }
+    return word;
 }
 
 int
-findFunction(FunctionList *func_list, char *func_name)
-{
-    while (func_list != NULL)
-    {
-        if (strcmp(func_list->func_name, func_name) == 0)
-        {
-            return 0;
+extractFunctionNameFromQueryFile(char *filename, char *func_name) {
+    FILE *fin;
+    char *word;
+    char c;
+
+    memset(func_name, 0, REL_SIZE);
+
+    fin = fopen(filename, "r");
+    if (fin != NULL) {
+        word = malloc(REL_SIZE + 1);
+        memset(word, 0, REL_SIZE);
+        if (strcmp(readWord(fin, word), "create") == 0) {
+            if (strcmp(readWord(fin, word), "or") == 0) // read 'or' | 'function'
+            {
+                if (strcmp(readWord(fin, word), "replace") != 0) {
+                    printf("Keyword 'replace' was expected, but found '%s'. Check query for creating a function '%s'.\n",
+                           word, filename);
+                    goto free_resources;
+                } else {
+                    readWord(fin, word); // read 'function'
+                }
+            }
+        } else {
+            printf("Keyword 'create' was expected, but found '%s'. Check query for creating a function '%s'.\n", word,
+                   filename);
+            goto free_resources;
         }
-        func_list=func_list->next;
+        read_func:
+        if (strcmp(word, "function")) {
+            strcpy(func_name, readWord(fin, word));
+        } else {
+            printf("Keyword 'function' was expected, but found '%s'. Check query for creating a function '%s'.\n", word,
+                   filename);
+            goto free_resources;
+        }
+        free_resources:
+        free(word);
     }
-    return -1;
+    return func_name[0] != '\0'; // If we got a function name, then - return 0, else - return 1
 }
 
+/**
+ * If there is a path (the first symbol is a quote '"'), then store this path in maskingMap->funcQueryPath
+ * and write to the first argument (func_path) name of the function from the query in the file
+ * If there is not a path - do nothing
+*/
 void
-printFunctionList(FunctionList *func_list)
-{
-    while (func_list != NULL)
-    {
-        printf("'%s'\n", func_list->func_name);
-        func_list=func_list->next;
+extractFuncNameIfPath(char *func_path, SimpleStringList *funcQueryPath) {
+    char *func_name;
+    if (func_path[0] == '"') {
+        func_name = malloc(REL_SIZE + 1);
+        removeQuotes(func_path);
+        if (extractFunctionNameFromQueryFile(func_path, func_name) ==
+            0) // Read function name from query and store in func_name
+        {
+            if (!simple_string_list_member(&funcQueryPath, func_path)) {
+                simple_string_list_append(&funcQueryPath, func_path);
+            }
+            strcpy(func_path, func_name); // Store func_name in func_path to throw it to upper function
+        }
+        free(func_name);
     }
+}
+
+char *
+readQueryForCreatingFunction(char *filename) {
+    FILE *fin;
+    char *query;
+    long fsize;
+
+    query = "\0";
+    fin = fopen(filename, "r");
+    if (fin == NULL)
+    {
+        fseek(textfile, 0L, SEEK_END);
+        numbytes = ftell(textfile);
+        fseek(textfile, 0L, SEEK_SET);
+
+        query = (char *) calloc(fsize, sizeof(char));
+
+        fread(query, sizeof(char), fsize, textfile);
+        fclose(textfile);
+    }
+    return query;
 }

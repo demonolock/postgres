@@ -21,7 +21,6 @@
 #include <stdbool.h>
 
 
-
 typedef struct _pair {
     char *key;
     char *value;
@@ -29,14 +28,10 @@ typedef struct _pair {
 
 typedef struct MaskingMap {
     Pair **data;
+    SimpleStringList funcQueryPath; // list of path to query with masking functions, that must be created before starting dump
     int size;
     int capacity;
 } MaskingMap;
-
-typedef struct FunctionList {
-    char *func_name;
-    struct FunctionList *next;
-} FunctionList;
 
 enum
 ParsingState
@@ -72,10 +67,5 @@ int readMaskingPatternFromFile(FILE *fin, MaskingMap *map);
 char *addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map);
 char *getFullRelName(char *schema_name, char *table_name, char *field_name);
 void concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name);
-FunctionList *initFunctionList(void);
-FunctionList *addFunctionToList(struct FunctionList *func_list, char *schema_name, char *function_name);
-void freeFunctionList(struct FunctionList *func_list);
-void printFunctionList(FunctionList *func_list);
-int findFunction(FunctionList *func_list, char *func_name);
 
 #endif							/* MASKING_H */

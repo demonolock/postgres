@@ -58,6 +58,8 @@
 #include "dumputils.h"
 #include "fe_utils/option_utils.h"
 #include "fe_utils/string_utils.h"
+#include "fe_utils/query_utils.h"
+#include "fe_utils/simple_list.h"
 #include "getopt_long.h"
 #include "libpq/libpq-fs.h"
 #include "masking.h"
@@ -344,7 +346,6 @@ main(int argc, char **argv)
 	int			plainText = 0;
 	ArchiveFormat archiveFormat = archUnknown;
 	ArchiveMode archiveMode;
-    struct FunctionList *function_list;
 
 	static DumpOptions dopt;
 
@@ -627,7 +628,6 @@ main(int argc, char **argv)
 
             case 13:			/* masking */
                 getMaskingPatternFromFile(optarg, &dopt);
-                function_list = initFunctionList();
                 if (dopt.dump_inserts == 0)
                     dopt.dump_inserts = DUMP_DEFAULT_ROWS_PER_INSERT;
                 break;
@@ -682,6 +682,7 @@ main(int argc, char **argv)
 	if (dopt.if_exists && !dopt.outputClean)
 		pg_fatal("option --if-exists requires option -c/--clean");
 
+    // TODO check which options can't work with masking
     if (dopt.cant_be_masked)
         pg_fatal("option --masking doesn't work with options: --section");
 
@@ -756,7 +757,9 @@ main(int argc, char **argv)
 	 * death.
 	 */
 	ConnectDatabase(fout, &dopt.cparams, false);
+    create_masking_functions(fout, dopt->map);
 	setup_connection(fout, dumpencoding, dumpsnapshot, use_role);
+
 
 	/*
 	 * On hot standbys, never try to dump unlogged table data, since it will
@@ -2172,7 +2175,8 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
             if (dopt->masking_map)
             {
                 char *column_with_fun;
-                column_with_fun=addFunctionToColumn(tbinfo->dobj.namespace->dobj.name, tbinfo->dobj.name, tbinfo->attnames[i], dopt->masking_map);
+                column_with_fun=addFunctionToColumn(tbinfo->dobj.namespace->dobj.name, tbinfo->dobj.name,
+                                                    tbinfo->attnames[i], dopt->masking_map);
                 if (column_with_fun[0] == ' ')
                 {
                     pg_log_warning("Function\"%s\" is not found", column_with_fun);
@@ -11780,10 +11784,6 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 							fmtId(finfo->dobj.namespace->dobj.name),
 							funcsig);
 
-    if (dopt->masking_map)
-    {
-        function_list = addFunctionToList(function_list, finfo->dobj.namespace->dobj.name, funcsig_tag);
-    }
 
 	if (prokind[0] == PROKIND_PROCEDURE)
 		keyword = "PROCEDURE";
@@ -18248,6 +18248,7 @@ int
 getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
 {
     FILE *fin;
+    int exit_result;
     if (filename[0]=='\0')
     {
         pg_log_error("--masking filename shouldn't be empty");
@@ -18263,7 +18264,42 @@ getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
 
     dopt->masking_map = newMaskingMap();
 
-    readMaskingPatternFromFile(fin, dopt->masking_map);
+    exit_result = readMaskingPatternFromFile(fin, dopt->masking_map);
     fclose(fin);
-    return EXIT_SUCCESS;
+    return exit_result;
+}
+
+char *
+create_masking_functions(Archive *AH, MaskingMap map)
+{
+    int exit_result;
+    PGconn *conn = GetConnection(AH);
+    char *filename;
+    char *query;
+    bool result;
+
+    result = false;
+    query = malloc(sizeof char);
+    memset(query, 0, sizeof char);
+    // Read all custom function and create them
+    for (SimpleStringListCell *cell = map->funcQueryPath->head; cell; cell = cell->next)
+    {
+        filename=cell->val;
+        printf("%s", filename);
+        query = readQueryForCreatingFunction(filename);
+        if (query[0]=='\0')
+        {
+            printf("Query is empty. Check file `%s`", filename);
+        } else {
+            result = executeMaintenanceCommand(conn, query, true);
+        }
+        printf("%s", query);
+
+        if (!result)
+        {
+            printf("Failed execution of query from file `%s`", filename)
+        }
+    }
+    free(query);
+    return 0;
 }
