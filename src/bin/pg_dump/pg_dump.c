@@ -18281,7 +18281,7 @@ create_masking_functions(Archive *AH, MaskingMap map)
     result = false;
     query = malloc(sizeof char);
     memset(query, 0, sizeof char);
-    // Read all custom function and create them
+    // Read all custom masking functions and create them
     for (SimpleStringListCell *cell = map->funcQueryPath->head; cell; cell = cell->next)
     {
         filename=cell->val;
@@ -18299,6 +18299,14 @@ create_masking_functions(Archive *AH, MaskingMap map)
         {
             printf("Failed execution of query from file `%s`", filename)
         }
+    }
+    // Read all default functions and create them
+    filename = "./masking_functions/default_functions.sql";
+    query = readQueryForCreatingFunction(filename);
+    result = executeMaintenanceCommand(conn, query, true);
+    if (!result)
+    {
+        printf("Problem with default functions query from file `%s`", filename)
     }
     free(query);
     return 0;

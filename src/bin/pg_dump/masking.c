@@ -423,7 +423,7 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name) {
         free_resources:
         free(word);
     }
-    return func_name[0] != '\0'; // If we got a function name, then - return 0, else - return 1
+    return func_name[0] != '\0'; /* If we got a function name, then - return 0, else - return 1 */
 }
 
 /**
@@ -432,13 +432,13 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name) {
  * If there is not a path - do nothing
 */
 void
-extractFuncNameIfPath(char *func_path, SimpleStringList *funcQueryPath) {
+extractFuncNameIfPath(char *func_path, SimpleStringList *funcQueryPath)
+{
     char *func_name;
     if (func_path[0] == '"') {
         func_name = malloc(REL_SIZE + 1);
         removeQuotes(func_path);
-        if (extractFunctionNameFromQueryFile(func_path, func_name) ==
-            0) // Read function name from query and store in func_name
+        if (extractFunctionNameFromQueryFile(func_path, func_name) == 0) // Read function name from query and store in func_name
         {
             if (!simple_string_list_member(&funcQueryPath, func_path)) {
                 simple_string_list_append(&funcQueryPath, func_path);
