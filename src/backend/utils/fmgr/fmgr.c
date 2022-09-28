@@ -619,7 +619,7 @@ fmgr_internal_function(const char *proname)
 /*
  * Support for security-definer and proconfig-using functions.  We support
  * both of these features using the same call handler, because they are
- * often used together, and it would be inefficient (as well as notationally
+ * often used together and it would be inefficient (as well as notationally
  * messy) to have two levels of call handler involved.
  */
 struct fmgr_security_definer_cache

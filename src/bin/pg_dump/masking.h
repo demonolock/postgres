@@ -21,37 +21,38 @@
 #include <stdbool.h>
 #include "fe_utils/simple_list.h"
 
-
-typedef struct _pair {
-    char *key;
-    char *value;
+typedef struct _pair
+{
+  char *key;
+  char *value;
 } Pair;
 
-typedef struct MaskingMap {
-    Pair **data;
-    int size;
-    int capacity;
+typedef struct MaskingMap
+{
+  Pair **data;
+  int size;
+  int capacity;
 } MaskingMap;
 
 enum
 ParsingState
 {
-    SCHEMA_NAME,
-    TABLE_NAME,
-    FIELD_NAME,
-    FUNCTION_NAME,
-    WAIT_COLON,
-    WAIT_OPEN_BRACE,
-    WAIT_CLOSE_BRACE,
-    WAIT_COMMA
+  SCHEMA_NAME,
+  TABLE_NAME,
+  FIELD_NAME,
+  FUNCTION_NAME,
+  WAIT_COLON,
+  WAIT_OPEN_BRACE,
+  WAIT_CLOSE_BRACE,
+  WAIT_COMMA
 };
 
 struct
 MaskingDebugDetails
 {
-    int line_num;
-    int symbol_num;
-    enum ParsingState parsing_state;
+  int line_num;
+  int symbol_num;
+  enum ParsingState parsing_state;
 };
 
 MaskingMap *newMaskingMap(void);
@@ -73,4 +74,4 @@ void removeQuotes(char *func_name);
 char *readWord(FILE *fin, char *word);
 int extractFunctionNameFromQueryFile(char *filename, char *func_name);
 
-#endif							/* MASKING_H */
+#endif                            /* MASKING_H */
