@@ -198,7 +198,7 @@ parent.  This maintains the invariant that child transactions have XIDs later
 than their parents, which is assumed in a number of places.
 
 The subsidiary actions of obtaining a lock on the XID and entering it into
-pg_subtrans and PG_PROC are done at the time it is assigned.
+pg_subtrans and PGPROC are done at the time it is assigned.
 
 A transaction that has no XID still needs to be identified for various
 purposes, notably holding locks.  For this purpose we assign a "virtual
@@ -692,8 +692,9 @@ by having database restart search for files that don't have any committed
 entry in pg_class, but that currently isn't done because of the possibility
 of deleting data that is useful for forensic analysis of the crash.
 Orphan files are harmless --- at worst they waste a bit of disk space ---
-because we check for on-disk collisions when allocating new relfilenumber
-OIDs.  So cleaning up isn't really necessary.
+because the relfilenumber counter is monotonically increasing.  The maximum
+value is 2^56-1, and there is no provision for wraparound.  Thus, on-disk
+collisions aren't possible.
 
 3. Deleting a table, which requires an unlink() that could fail.
 

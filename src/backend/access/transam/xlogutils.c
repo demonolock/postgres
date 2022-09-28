@@ -619,17 +619,17 @@ CreateFakeRelcacheEntry(RelFileLocator rlocator)
 	rel->rd_rel->relpersistence = RELPERSISTENCE_PERMANENT;
 
 	/* We don't know the name of the relation; use relfilenumber instead */
-	sprintf(RelationGetRelationName(rel), "%u", rlocator.relNumber);
+	sprintf(RelationGetRelationName(rel), UINT64_FORMAT, rlocator.relNumber);
 
 	/*
 	 * We set up the lockRelId in case anything tries to lock the dummy
-	 * relation.  Note that this is fairly bogus since relNumber may be
+	 * relation.  Note that this is fairly bogus since relNumber are completely
 	 * different from the relation's OID.  It shouldn't really matter though.
 	 * In recovery, we are running by ourselves and can't have any lock
 	 * conflicts.  While syncing, we already hold AccessExclusiveLock.
 	 */
 	rel->rd_lockInfo.lockRelId.dbId = rlocator.dbOid;
-	rel->rd_lockInfo.lockRelId.relId = rlocator.relNumber;
+	rel->rd_lockInfo.lockRelId.relId = (Oid) rlocator.relNumber;
 
 	rel->rd_smgr = NULL;
 
@@ -1051,14 +1051,14 @@ WALReadRaiseError(WALReadError *errinfo)
 		errno = errinfo->wre_errno;
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read from log segment %s, offset %d: %m",
+				 errmsg("could not read from WAL segment %s, offset %d: %m",
 						fname, errinfo->wre_off)));
 	}
 	else if (errinfo->wre_read == 0)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("could not read from log segment %s, offset %d: read %d of %d",
+				 errmsg("could not read from WAL segment %s, offset %d: read %d of %d",
 						fname, errinfo->wre_off, errinfo->wre_read,
 						errinfo->wre_req)));
 	}

@@ -592,6 +592,11 @@ elif test "$PORTNAME" = "aix"; then
   PGAC_PROG_CC_VAR_OPT(CFLAGS_SL_MODULE, [-qvisibility=hidden])
   PGAC_PROG_VARCXX_VARFLAGS_OPT(CXX, CXXFLAGS_SL_MODULE, [-qvisibility=hidden])
   have_visibility_attribute=$pgac_cv_prog_CC_cflags__qvisibility_hidden
+  # Old xlc versions (<13.1) don't have support for -qvisibility. Use expfull to force
+  # all extension module symbols to be exported.
+  if test "$pgac_cv_prog_CC_cflags__qvisibility_hidden" != "yes"; then
+    CFLAGS_SL_MODULE="$CFLAGS_SL_MODULE -Wl,-b,expfull"
+  fi
 fi
 
 if test "$have_visibility_attribute" = "yes"; then
@@ -1128,8 +1133,6 @@ AC_PROG_RANLIB
 PGAC_CHECK_STRIP
 AC_CHECK_TOOL(AR, ar, ar)
 if test "$PORTNAME" = "win32"; then
-  AC_CHECK_TOOL(DLLTOOL, dlltool, dlltool)
-  AC_CHECK_TOOL(DLLWRAP, dllwrap, dllwrap)
   AC_CHECK_TOOL(WINDRES, windres, windres)
 fi
 
@@ -2469,3 +2472,9 @@ AC_CONFIG_HEADERS([src/interfaces/ecpg/include/ecpg_config.h],
                   [echo >src/interfaces/ecpg/include/stamp-h])
 
 AC_OUTPUT
+
+# Ensure that any meson build directories would reconfigure and see that
+# there's a conflicting in-tree build and can error out.
+if test "$vpath_build"="no"; then
+  touch meson.build
+fi

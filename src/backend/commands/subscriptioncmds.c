@@ -437,7 +437,7 @@ get_publications_str(List *publications, StringInfo dest, bool quote_literal)
 }
 
 /*
- * Check the specified publication(s) is(are) present in the publisher.
+ * Check that the specified publications are present on the publisher.
  */
 static void
 check_publications(WalReceiverConn *wrconn, List *publications)
@@ -461,10 +461,8 @@ check_publications(WalReceiverConn *wrconn, List *publications)
 
 	if (res->status != WALRCV_OK_TUPLES)
 		ereport(ERROR,
-				errmsg_plural("could not receive publication from the publisher: %s",
-							  "could not receive list of publications from the publisher: %s",
-							  list_length(publications),
-							  res->err));
+				errmsg("could not receive list of publications from the publisher: %s",
+					   res->err));
 
 	publicationsCopy = list_copy(publications);
 
@@ -495,8 +493,8 @@ check_publications(WalReceiverConn *wrconn, List *publications)
 		get_publications_str(publicationsCopy, pubnames, false);
 		ereport(WARNING,
 				errcode(ERRCODE_UNDEFINED_OBJECT),
-				errmsg_plural("publication %s does not exist in the publisher",
-							  "publications %s do not exist in the publisher",
+				errmsg_plural("publication %s does not exist on the publisher",
+							  "publications %s do not exist on the publisher",
 							  list_length(publicationsCopy),
 							  pubnames->data));
 	}
@@ -1187,7 +1185,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 						ereport(ERROR,
 								(errcode(ERRCODE_SYNTAX_ERROR),
 								 errmsg("ALTER SUBSCRIPTION with refresh and copy_data is not allowed when two_phase is enabled"),
-								 errhint("Use ALTER SUBSCRIPTION ...SET PUBLICATION with refresh = false, or with copy_data = false"
+								 errhint("Use ALTER SUBSCRIPTION ... SET PUBLICATION with refresh = false, or with copy_data = false"
 										 ", or use DROP/CREATE SUBSCRIPTION.")));
 
 					PreventInTransactionBlock(isTopLevel, "ALTER SUBSCRIPTION with refresh");
@@ -1239,7 +1237,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 						ereport(ERROR,
 								(errcode(ERRCODE_SYNTAX_ERROR),
 								 errmsg("ALTER SUBSCRIPTION with refresh and copy_data is not allowed when two_phase is enabled"),
-								 errhint("Use ALTER SUBSCRIPTION ...SET PUBLICATION with refresh = false, or with copy_data = false"
+								 errhint("Use ALTER SUBSCRIPTION ... SET PUBLICATION with refresh = false, or with copy_data = false"
 										 ", or use DROP/CREATE SUBSCRIPTION.")));
 
 					PreventInTransactionBlock(isTopLevel, "ALTER SUBSCRIPTION with refresh");

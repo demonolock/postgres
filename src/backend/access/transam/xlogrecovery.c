@@ -2228,14 +2228,14 @@ xlog_block_info(StringInfo buf, XLogReaderState *record)
 			continue;
 
 		if (forknum != MAIN_FORKNUM)
-			appendStringInfo(buf, "; blkref #%d: rel %u/%u/%u, fork %u, blk %u",
+			appendStringInfo(buf, "; blkref #%d: rel %u/%u/" UINT64_FORMAT ", fork %u, blk %u",
 							 block_id,
 							 rlocator.spcOid, rlocator.dbOid,
 							 rlocator.relNumber,
 							 forknum,
 							 blk);
 		else
-			appendStringInfo(buf, "; blkref #%d: rel %u/%u/%u, blk %u",
+			appendStringInfo(buf, "; blkref #%d: rel %u/%u/" UINT64_FORMAT ", blk %u",
 							 block_id,
 							 rlocator.spcOid, rlocator.dbOid,
 							 rlocator.relNumber,
@@ -2433,7 +2433,7 @@ verifyBackupPageConsistency(XLogReaderState *record)
 		if (memcmp(replay_image_masked, primary_image_masked, BLCKSZ) != 0)
 		{
 			elog(FATAL,
-				 "inconsistent page found, rel %u/%u/%u, forknum %u, blkno %u",
+				 "inconsistent page found, rel %u/%u/" UINT64_FORMAT ", forknum %u, blkno %u",
 				 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
 				 forknum, blkno);
 		}
@@ -3079,7 +3079,7 @@ ReadRecord(XLogPrefetcher *xlogprefetcher, int emode,
 			XLogFileName(fname, xlogreader->seg.ws_tli, segno,
 						 wal_segment_size);
 			ereport(emode_for_corrupt_record(emode, xlogreader->EndRecPtr),
-					(errmsg("unexpected timeline ID %u in log segment %s, offset %u",
+					(errmsg("unexpected timeline ID %u in WAL segment %s, offset %u",
 							xlogreader->latestPageTLI,
 							fname,
 							offset)));
@@ -3284,13 +3284,13 @@ retry:
 			errno = save_errno;
 			ereport(emode_for_corrupt_record(emode, targetPagePtr + reqLen),
 					(errcode_for_file_access(),
-					 errmsg("could not read from log segment %s, offset %u: %m",
+					 errmsg("could not read from WAL segment %s, offset %u: %m",
 							fname, readOff)));
 		}
 		else
 			ereport(emode_for_corrupt_record(emode, targetPagePtr + reqLen),
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("could not read from log segment %s, offset %u: read %d of %zu",
+					 errmsg("could not read from WAL segment %s, offset %u: read %d of %zu",
 							fname, readOff, r, (Size) XLOG_BLCKSZ)));
 		goto next_record_is_invalid;
 	}
@@ -3535,8 +3535,7 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 					 * walreceiver is not active, so that it won't overwrite
 					 * WAL that we restore from archive.
 					 */
-					if (WalRcvStreaming())
-						XLogShutdownWalRcv();
+					XLogShutdownWalRcv();
 
 					/*
 					 * Before we sleep, re-scan for possible new timelines if

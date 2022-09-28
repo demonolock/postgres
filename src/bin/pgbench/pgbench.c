@@ -908,7 +908,7 @@ usage(void)
 		   "                           protocol for submitting queries (default: simple)\n"
 		   "  -n, --no-vacuum          do not run VACUUM before tests\n"
 		   "  -P, --progress=NUM       show thread progress report every NUM seconds\n"
-		   "  -r, --report-per-command report latencies, failures and retries per command\n"
+		   "  -r, --report-per-command report latencies, failures, and retries per command\n"
 		   "  -R, --rate=NUM           target rate in transactions per second\n"
 		   "  -s, --scale=NUM          report this scale factor in output\n"
 		   "  -t, --transactions=NUM   number of transactions each client runs (default: 10)\n"
@@ -4415,7 +4415,7 @@ executeMetaCommand(CState *st, pg_time_usec_t *now)
 }
 
 /*
- * Return the number fo failed transactions.
+ * Return the number of failed transactions.
  */
 static int64
 getFailures(const StatsData *stats)

@@ -47,7 +47,7 @@ static bool allocate_recordbuf(XLogReaderState *state, uint32 reclength);
 static int	ReadPageInternal(XLogReaderState *state, XLogRecPtr pageptr,
 							 int reqLen);
 static void XLogReaderInvalReadState(XLogReaderState *state);
-static XLogPageReadResult XLogDecodeNextRecord(XLogReaderState *state, bool non_blocking);
+static XLogPageReadResult XLogDecodeNextRecord(XLogReaderState *state, bool nonblocking);
 static bool ValidXLogRecordHeader(XLogReaderState *state, XLogRecPtr RecPtr,
 								  XLogRecPtr PrevRecPtr, XLogRecord *record, bool randAccess);
 static bool ValidXLogRecord(XLogReaderState *state, XLogRecord *record,
@@ -1229,7 +1229,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 		XLogFileName(fname, state->seg.ws_tli, segno, state->segcxt.ws_segsize);
 
 		report_invalid_record(state,
-							  "invalid magic number %04X in log segment %s, offset %u",
+							  "invalid magic number %04X in WAL segment %s, offset %u",
 							  hdr->xlp_magic,
 							  fname,
 							  offset);
@@ -1243,7 +1243,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 		XLogFileName(fname, state->seg.ws_tli, segno, state->segcxt.ws_segsize);
 
 		report_invalid_record(state,
-							  "invalid info bits %04X in log segment %s, offset %u",
+							  "invalid info bits %04X in WAL segment %s, offset %u",
 							  hdr->xlp_info,
 							  fname,
 							  offset);
@@ -1284,7 +1284,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 
 		/* hmm, first page of file doesn't have a long header? */
 		report_invalid_record(state,
-							  "invalid info bits %04X in log segment %s, offset %u",
+							  "invalid info bits %04X in WAL segment %s, offset %u",
 							  hdr->xlp_info,
 							  fname,
 							  offset);
@@ -1303,7 +1303,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 		XLogFileName(fname, state->seg.ws_tli, segno, state->segcxt.ws_segsize);
 
 		report_invalid_record(state,
-							  "unexpected pageaddr %X/%X in log segment %s, offset %u",
+							  "unexpected pageaddr %X/%X in WAL segment %s, offset %u",
 							  LSN_FORMAT_ARGS(hdr->xlp_pageaddr),
 							  fname,
 							  offset);
@@ -1328,7 +1328,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 			XLogFileName(fname, state->seg.ws_tli, segno, state->segcxt.ws_segsize);
 
 			report_invalid_record(state,
-								  "out-of-sequence timeline ID %u (after %u) in log segment %s, offset %u",
+								  "out-of-sequence timeline ID %u (after %u) in WAL segment %s, offset %u",
 								  hdr->xlp_tli,
 								  state->latestPageTLI,
 								  fname,
@@ -1963,10 +1963,10 @@ XLogRecGetBlockTag(XLogReaderState *record, uint8 block_id,
 									blknum, NULL))
 	{
 #ifndef FRONTEND
-		elog(ERROR, "failed to locate backup block with ID %d in WAL record",
+		elog(ERROR, "could not locate backup block with ID %d in WAL record",
 			 block_id);
 #else
-		pg_fatal("failed to locate backup block with ID %d in WAL record",
+		pg_fatal("could not locate backup block with ID %d in WAL record",
 				 block_id);
 #endif
 	}
