@@ -18238,8 +18238,8 @@ appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 		pg_log_warning("could not parse %s array", "reloptions");
 }
 
-/*
- * getMaskingPatternFromFile - get ...
+/**
+ * getMaskingPatternFromFile
  *
  * Parse the specified masking file with description of what we need to mask
  * If the filename is "-" then filters will be
@@ -18290,7 +18290,7 @@ create_masking_functions(Archive *AH, MaskingMap map)
         query = readQueryForCreatingFunction(filename);
         if (query[0]=='\0')
         {
-            printf("Query is empty. Check file `%s`", filename);
+            pg_log_warning("Query is empty. Check file `%s`", filename);
         } else {
             result = executeMaintenanceCommand(conn, query, true);
         }
@@ -18298,7 +18298,7 @@ create_masking_functions(Archive *AH, MaskingMap map)
 
         if (!result)
         {
-            printf("Failed execution of query from file `%s`", filename)
+            pg_log_warning("Failed execution of query from file \"%s\"", filename)
         }
     }
     // Read all default functions and create them
@@ -18307,7 +18307,7 @@ create_masking_functions(Archive *AH, MaskingMap map)
     result = executeMaintenanceCommand(conn, query, true);
     if (!result)
     {
-        printf("Problem with default functions query from file `%s`", filename)
+        pg_log_warning("Problem with default functions query from file \"%s\"", filename)
     }
     free(query);
     return 0;

@@ -67,5 +67,6 @@ int readMaskingPatternFromFile(FILE *fin, MaskingMap *map);
 char *addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map);
 char *getFullRelName(char *schema_name, char *table_name, char *field_name);
 void concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name);
+char *readQueryForCreatingFunction(char *filename);
 
 #endif							/* MASKING_H */
