@@ -18,13 +18,13 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include "masking.h"
-#include "fe_utils/simple_list.h"
 
-#define REL_SEP '.' /* Relation separator */
 #define REL_SIZE 64 * 8 /* Length of relation name - 64 bytes */
 #define DEFAULT_NAME "default"
-#define COL_WITH_FUNC_SIZE 3 * REL_SIZE + 3 // schema_name.function name + '(' + column_name + ')
-#define PATH_SIZE 255 * 8 + 2 // length of the path + 2 quotes
+#define COL_WITH_FUNC_SIZE 3 * REL_SIZE + 3 /* schema_name.function name + '(' + column_name + ') */
+#define PATH_SIZE 255 * 8 + 2 /* length of the path + 2 quotes */
+
+char REL_SEP='.'; /* Relation separator */
 
 MaskingMap *
 newMaskingMap() {
@@ -66,7 +66,7 @@ cleanMap(MaskingMap *map) {
 
 void
 setMapValue(MaskingMap *map, char *key, char *value) {
-    if key != NULL
+    if (key != NULL)
     {
         int index = getMapIndexByKey(map, key);
         if (index != -1) // Already have key in map
@@ -162,7 +162,7 @@ getFullRelName(char *schema_name, char *table_name, char *field_name) {
 }
 
 int
-readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
+readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *func_query_path) {
     int exit_status;
     int brace_counter;
     int close_brace_counter;
@@ -214,7 +214,7 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map) {
 
             case FUNCTION_NAME:
                 c = nameReader(func_name, c, &md, fin);
-                extractFuncNameIfPath(func_name, map->funcQueryPath);
+                extractFuncNameIfPath(func_name, func_query_path);
                 setMapValue(map, getFullRelName(schema_name, table_name, field_name), func_name);
                 md.parsing_state = WAIT_COMMA;
                 break;
@@ -367,10 +367,11 @@ removeQuotes(char *func_name) {
  * Read a word from a query, that creating a custom function
  */
 char *
-readWord(FILE fin, char *word) {
+readWord(FILE *fin, char *word) {
+    char c;
     memset(word, 0, strlen(word));
-    while (c != EOF) {
-        c = getc(fin);
+    do {
+        c = tolower(getc(fin));
         if (isSpace(c) || c == '(') // Space or open brace before function arguments
         {
             if (word[0] == '\0') // Spaces before the word
@@ -378,9 +379,9 @@ readWord(FILE fin, char *word) {
             else
                 break; // Spaces after the word
         } else {
-            strncat(word, &tolower(c), 1);
+            strncat(word, &c, 1);
         }
-    }
+    } while (c != EOF);
     return word;
 }
 
@@ -388,7 +389,6 @@ int
 extractFunctionNameFromQueryFile(char *filename, char *func_name) {
     FILE *fin;
     char *word;
-    char c;
 
     memset(func_name, 0, REL_SIZE);
 
@@ -412,7 +412,6 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name) {
                    filename);
             goto free_resources;
         }
-        read_func:
         if (strcmp(word, "function")) {
             strcpy(func_name, readWord(fin, word));
         } else {
@@ -432,7 +431,7 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name) {
  * If there is not a path - do nothing
 */
 void
-extractFuncNameIfPath(char *func_path, SimpleStringList *funcQueryPath)
+extractFuncNameIfPath(char *func_path, SimpleStringList *func_query_path)
 {
     char *func_name;
     if (func_path[0] == '"') {
@@ -440,8 +439,8 @@ extractFuncNameIfPath(char *func_path, SimpleStringList *funcQueryPath)
         removeQuotes(func_path);
         if (extractFunctionNameFromQueryFile(func_path, func_name) == 0) // Read function name from query and store in func_name
         {
-            if (!simple_string_list_member(&funcQueryPath, func_path)) {
-                simple_string_list_append(&funcQueryPath, func_path);
+            if (!simple_string_list_member(func_query_path, func_path)) {
+                simple_string_list_append(func_query_path, func_path);
             }
             strcpy(func_path, func_name); // Store func_name in func_path to throw it to upper function
         }
@@ -455,18 +454,20 @@ readQueryForCreatingFunction(char *filename) {
     char *query;
     long fsize;
 
-    query = "\0";
+    query = malloc(sizeof(char));
+    memset(query, 0, sizeof(char ));
     fin = fopen(filename, "r");
     if (fin == NULL)
     {
-        fseek(textfile, 0L, SEEK_END);
-        numbytes = ftell(textfile);
-        fseek(textfile, 0L, SEEK_SET);
+        fseek(fin, 0L, SEEK_END);
+        fsize = ftell(fin);
+        fseek(fin, 0L, SEEK_SET);
 
         query = (char *) calloc(fsize, sizeof(char));
 
-        fread(query, sizeof(char), fsize, textfile);
-        fclose(textfile);
+        fread(query, sizeof(char), fsize, fin);
+
+        fclose(fin);
     }
     return query;
 }

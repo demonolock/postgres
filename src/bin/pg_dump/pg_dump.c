@@ -322,6 +322,7 @@ static char *get_synchronized_snapshot(Archive *fout);
 static void setupDumpWorker(Archive *AH);
 static TableInfo *getRootTableInfo(const TableInfo *tbinfo);
 static int getMaskingPatternFromFile(const char *filename, DumpOptions *dopt);
+static int createMaskingFunctions(Archive *AH, SimpleStringList *func_query_path);
 
 int
 main(int argc, char **argv)
@@ -758,7 +759,7 @@ main(int argc, char **argv)
 	 * death.
 	 */
 	ConnectDatabase(fout, &dopt.cparams, false);
-    create_masking_functions(fout, dopt->map);
+    createMaskingFunctions(fout, dopt.func_query_path);
 	setup_connection(fout, dumpencoding, dumpsnapshot, use_role);
 
 
@@ -3222,15 +3223,15 @@ dumpDatabase(Archive *fout)
 							  atooid(PQgetvalue(lo_res, i, ii_oid)));
 
 			oid = atooid(PQgetvalue(lo_res, i, ii_oid));
-			relfilenumber = atorelnumber(PQgetvalue(lo_res, i, ii_relfilenode));
+			relfilenumber = atooid(PQgetvalue(lo_res, i, ii_relfilenode));
 
 			if (oid == LargeObjectRelationId)
 				appendPQExpBuffer(loOutQry,
-								  "SELECT pg_catalog.binary_upgrade_set_next_heap_relfilenode('" UINT64_FORMAT "'::pg_catalog.int8);\n",
+								  "SELECT pg_catalog.binary_upgrade_set_next_heap_relfilenode('%u'::pg_catalog.oid);\n",
 								  relfilenumber);
 			else if (oid == LargeObjectLOidPNIndexId)
 				appendPQExpBuffer(loOutQry,
-								  "SELECT pg_catalog.binary_upgrade_set_next_index_relfilenode('" UINT64_FORMAT "'::pg_catalog.int8);\n",
+								  "SELECT pg_catalog.binary_upgrade_set_next_index_relfilenode('%u'::pg_catalog.oid);\n",
 								  relfilenumber);
 		}
 
@@ -4915,16 +4916,16 @@ binary_upgrade_set_pg_class_oids(Archive *fout,
 
 	relkind = *PQgetvalue(upgrade_res, 0, PQfnumber(upgrade_res, "relkind"));
 
-	relfilenumber = atorelnumber(PQgetvalue(upgrade_res, 0,
-											PQfnumber(upgrade_res, "relfilenode")));
+	relfilenumber = atooid(PQgetvalue(upgrade_res, 0,
+									  PQfnumber(upgrade_res, "relfilenode")));
 	toast_oid = atooid(PQgetvalue(upgrade_res, 0,
 								  PQfnumber(upgrade_res, "reltoastrelid")));
-	toast_relfilenumber = atorelnumber(PQgetvalue(upgrade_res, 0,
-												  PQfnumber(upgrade_res, "toast_relfilenode")));
+	toast_relfilenumber = atooid(PQgetvalue(upgrade_res, 0,
+											PQfnumber(upgrade_res, "toast_relfilenode")));
 	toast_index_oid = atooid(PQgetvalue(upgrade_res, 0,
 										PQfnumber(upgrade_res, "indexrelid")));
-	toast_index_relfilenumber = atorelnumber(PQgetvalue(upgrade_res, 0,
-														PQfnumber(upgrade_res, "toast_index_relfilenode")));
+	toast_index_relfilenumber = atooid(PQgetvalue(upgrade_res, 0,
+												  PQfnumber(upgrade_res, "toast_index_relfilenode")));
 
 	appendPQExpBufferStr(upgrade_buffer,
 						 "\n-- For binary upgrade, must preserve pg_class oids and relfilenodes\n");
@@ -4942,7 +4943,7 @@ binary_upgrade_set_pg_class_oids(Archive *fout,
 		 */
 		if (RelFileNumberIsValid(relfilenumber) && relkind != RELKIND_PARTITIONED_TABLE)
 			appendPQExpBuffer(upgrade_buffer,
-							  "SELECT pg_catalog.binary_upgrade_set_next_heap_relfilenode('" UINT64_FORMAT "'::pg_catalog.int8);\n",
+							  "SELECT pg_catalog.binary_upgrade_set_next_heap_relfilenode('%u'::pg_catalog.oid);\n",
 							  relfilenumber);
 
 		/*
@@ -4956,7 +4957,7 @@ binary_upgrade_set_pg_class_oids(Archive *fout,
 							  "SELECT pg_catalog.binary_upgrade_set_next_toast_pg_class_oid('%u'::pg_catalog.oid);\n",
 							  toast_oid);
 			appendPQExpBuffer(upgrade_buffer,
-							  "SELECT pg_catalog.binary_upgrade_set_next_toast_relfilenode('" UINT64_FORMAT "'::pg_catalog.int8);\n",
+							  "SELECT pg_catalog.binary_upgrade_set_next_toast_relfilenode('%u'::pg_catalog.oid);\n",
 							  toast_relfilenumber);
 
 			/* every toast table has an index */
@@ -4964,7 +4965,7 @@ binary_upgrade_set_pg_class_oids(Archive *fout,
 							  "SELECT pg_catalog.binary_upgrade_set_next_index_pg_class_oid('%u'::pg_catalog.oid);\n",
 							  toast_index_oid);
 			appendPQExpBuffer(upgrade_buffer,
-							  "SELECT pg_catalog.binary_upgrade_set_next_index_relfilenode('" UINT64_FORMAT "'::pg_catalog.int8);\n",
+							  "SELECT pg_catalog.binary_upgrade_set_next_index_relfilenode('%u'::pg_catalog.oid);\n",
 							  toast_index_relfilenumber);
 		}
 
@@ -4977,7 +4978,7 @@ binary_upgrade_set_pg_class_oids(Archive *fout,
 						  "SELECT pg_catalog.binary_upgrade_set_next_index_pg_class_oid('%u'::pg_catalog.oid);\n",
 						  pg_class_oid);
 		appendPQExpBuffer(upgrade_buffer,
-						  "SELECT pg_catalog.binary_upgrade_set_next_index_relfilenode('" UINT64_FORMAT "'::pg_catalog.int8);\n",
+						  "SELECT pg_catalog.binary_upgrade_set_next_index_relfilenode('%u'::pg_catalog.oid);\n",
 						  relfilenumber);
 	}
 
@@ -18265,13 +18266,13 @@ getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
 
     dopt->masking_map = newMaskingMap();
 
-    exit_result = readMaskingPatternFromFile(fin, dopt->masking_map);
+    exit_result = readMaskingPatternFromFile(fin, dopt->masking_map, dopt->func_query_path);
     fclose(fin);
     return exit_result;
 }
 
-char *
-create_masking_functions(Archive *AH, MaskingMap map)
+int
+createMaskingFunctions(Archive *AH, SimpleStringList *func_query_path)
 {
     int exit_result;
     PGconn *conn = GetConnection(AH);
@@ -18279,11 +18280,10 @@ create_masking_functions(Archive *AH, MaskingMap map)
     char *query;
     bool result;
 
+    exit_result=0;
     result = false;
-    query = malloc(sizeof char);
-    memset(query, 0, sizeof char);
     // Read all custom masking functions and create them
-    for (SimpleStringListCell *cell = map->funcQueryPath->head; cell; cell = cell->next)
+    for (SimpleStringListCell *cell = func_query_path->head; cell; cell = cell->next)
     {
         filename=cell->val;
         printf("%s", filename);
@@ -18291,6 +18291,7 @@ create_masking_functions(Archive *AH, MaskingMap map)
         if (query[0]=='\0')
         {
             pg_log_warning("Query is empty. Check file `%s`", filename);
+            exit_result++;
         } else {
             result = executeMaintenanceCommand(conn, query, true);
         }
@@ -18298,7 +18299,8 @@ create_masking_functions(Archive *AH, MaskingMap map)
 
         if (!result)
         {
-            pg_log_warning("Failed execution of query from file \"%s\"", filename)
+            pg_log_warning("Failed execution of query from file \"%s\"", filename);
+            exit_result++;
         }
     }
     // Read all default functions and create them
@@ -18307,8 +18309,9 @@ create_masking_functions(Archive *AH, MaskingMap map)
     result = executeMaintenanceCommand(conn, query, true);
     if (!result)
     {
-        pg_log_warning("Problem with default functions query from file \"%s\"", filename)
+        pg_log_warning("Problem with default functions query from file \"%s\"", filename);
+        exit_result++;
     }
     free(query);
-    return 0;
+    return exit_result;
 }

@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include "fe_utils/simple_list.h"
 
 
 typedef struct _pair {
@@ -28,7 +29,6 @@ typedef struct _pair {
 
 typedef struct MaskingMap {
     Pair **data;
-    SimpleStringList funcQueryPath; // list of path to query with masking functions, that must be created before starting dump
     int size;
     int capacity;
 } MaskingMap;
@@ -63,10 +63,14 @@ bool isSpace(char c);
 char readNextSymbol(struct MaskingDebugDetails *md, FILE *fin);
 char nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin);
 int getMapIndexByKey(MaskingMap *map, char *key);
-int readMaskingPatternFromFile(FILE *fin, MaskingMap *map);
+extern int readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *func_query_path);
 char *addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map);
 char *getFullRelName(char *schema_name, char *table_name, char *field_name);
 void concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name);
 char *readQueryForCreatingFunction(char *filename);
+extern void extractFuncNameIfPath(char *func_path, SimpleStringList *func_query_path);
+void removeQuotes(char *func_name);
+char *readWord(FILE *fin, char *word);
+int extractFunctionNameFromQueryFile(char *filename, char *func_name);
 
 #endif							/* MASKING_H */
