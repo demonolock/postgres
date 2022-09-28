@@ -898,12 +898,7 @@ index_create(Relation heapRelation,
 											collationObjectId,
 											classObjectId);
 
-	/*
-	 * Allocate an OID for the index, unless we were told what to use.
-	 *
-	 * The OID will be the relfilenumber as well, so make sure it doesn't
-	 * collide with either pg_class OIDs or existing physical files.
-	 */
+	/* Allocate an OID for the index, unless we were told what to use. */
 	if (!OidIsValid(indexRelationId))
 	{
 		/* Use binary-upgrade override for pg_class.oid and relfilenumber */
@@ -935,8 +930,8 @@ index_create(Relation heapRelation,
 		}
 		else
 		{
-			indexRelationId =
-				GetNewRelFileNumber(tableSpaceId, pg_class, relpersistence);
+			indexRelationId = GetNewOidWithIndex(pg_class, ClassOidIndexId,
+												 Anum_pg_class_oid);
 		}
 	}
 
@@ -2324,6 +2319,9 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	 */
 	if (RELKIND_HAS_STORAGE(userIndexRelation->rd_rel->relkind))
 		RelationDropStorage(userIndexRelation);
+
+	/* ensure that stats are dropped if transaction commits */
+	pgstat_drop_relation(userIndexRelation);
 
 	/*
 	 * Close and flush the index's relcache entry, to ensure relcache doesn't

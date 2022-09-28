@@ -2717,7 +2717,7 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
          <listitem>
           <para>
            If set to true, the backup will wait until the last required WAL
-           segment has been archived, or emit a warning if log archiving is
+           segment has been archived, or emit a warning if WAL archiving is
            not enabled. If false, the backup will neither wait nor warn,
            leaving the client responsible for ensuring the required log is
            available. The default is true.
@@ -2757,8 +2757,10 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
            <literal>-1</literal>), for <literal>lz4</literal> an integer
            between 1 and 12 (default <literal>0</literal> for fast compression
            mode), and for <literal>zstd</literal> an integer between
-           <literal>1</literal> and <literal>22</literal> (default
-           <literal>ZSTD_CLEVEL_DEFAULT</literal> or <literal>3</literal>).
+           <literal>ZSTD_minCLevel()</literal> (usually <literal>-131072</literal>)
+           and <literal>ZSTD_maxCLevel()</literal> (usually <literal>22</literal>),
+           (default <literal>ZSTD_CLEVEL_DEFAULT</literal> or
+           <literal>3</literal>).
           </para>
 
           <para>

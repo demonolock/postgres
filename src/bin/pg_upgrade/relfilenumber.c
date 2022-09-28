@@ -16,7 +16,7 @@
 #include "pg_upgrade.h"
 
 static void transfer_single_new_db(FileNameMap *maps, int size, char *old_tablespace);
-static void transfer_relfile(FileNameMap *map, const char *suffix, bool vm_must_add_frozenbit);
+static void transfer_relfile(FileNameMap *map, const char *type_suffix, bool vm_must_add_frozenbit);
 
 
 /*
@@ -190,14 +190,14 @@ transfer_relfile(FileNameMap *map, const char *type_suffix, bool vm_must_add_fro
 		else
 			snprintf(extent_suffix, sizeof(extent_suffix), ".%d", segno);
 
-		snprintf(old_file, sizeof(old_file), "%s%s/%u/%u%s%s",
+		snprintf(old_file, sizeof(old_file), "%s%s/%u/" UINT64_FORMAT "%s%s",
 				 map->old_tablespace,
 				 map->old_tablespace_suffix,
 				 map->db_oid,
 				 map->relfilenumber,
 				 type_suffix,
 				 extent_suffix);
-		snprintf(new_file, sizeof(new_file), "%s%s/%u/%u%s%s",
+		snprintf(new_file, sizeof(new_file), "%s%s/%u/" UINT64_FORMAT "%s%s",
 				 map->new_tablespace,
 				 map->new_tablespace_suffix,
 				 map->db_oid,
