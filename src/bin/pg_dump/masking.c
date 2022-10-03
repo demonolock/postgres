@@ -14,6 +14,7 @@
  */
 #include <ctype.h>
 #include "masking.h"
+#include "common/logging.h"
 
 #define REL_SIZE 64 * 8 /* Length of relation name - 64 bytes */
 #define DEFAULT_NAME "default"
@@ -21,6 +22,7 @@
 
 char REL_SEP = '.'; /* Relation separator */
 
+/* Initialise masking map */
 MaskingMap *
 newMaskingMap()
 {
@@ -54,17 +56,18 @@ cleanMap(MaskingMap *map)
     {
         for (int i = 0; map->data[i] != NULL; i++)
         {
-            printf("key: %s, value: %s\n", (char *) map->data[i]->key, (char *) map->data[i]->value);
             free(map->data[i]->key);
             free(map->data[i]->value);
             free(map->data[i]);
         }
-        printf("capacity:%d, size:%d\n", map->capacity, map->size);
         free(map->data);
         free(map);
     }
 }
 
+/*
+ * Add value to map or rewrite, if key already exists
+ */
 void
 setMapValue(MaskingMap *map, char *key, char *value)
 {
@@ -104,7 +107,7 @@ setMapValue(MaskingMap *map, char *key, char *value)
 void
 printParsingError(struct MaskingDebugDetails *md, char *message, char current_symbol)
 {
-    printf("Error position (symbol '%c'): line: %d pos: %d. %s\n", current_symbol, md->line_num, md->symbol_num,
+    pg_log_error("Error position (symbol '%c'): line: %d pos: %d. %s\n", current_symbol, md->line_num, md->symbol_num,
            message);
 }
 
@@ -120,6 +123,12 @@ isSpace(char c)
     return c == ' ' || c == '\t' || c == '\n' || c == EOF;
 }
 
+/*
+ * Read symbol and change place of cursor in MaskingDebugDetails
+ * md->line_num - increasing when we meet '\n'
+ * md->symbol_num - increasing after reading any symbol and reset
+ * when we meet '\n'
+ */
 char
 readNextSymbol(struct MaskingDebugDetails *md, FILE *fin)
 {
@@ -136,7 +145,7 @@ readNextSymbol(struct MaskingDebugDetails *md, FILE *fin)
     return c;
 }
 
-/* Read relation name*/
+/* Read relation name */
 char
 nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, int size)
 {
@@ -150,7 +159,7 @@ nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, in
             case '\n':
                 break; /* Skip space symbols */
             case EOF:
-                return c;
+                return c; /* Handling `EOF` outside the function */
 
             default:
                 strncat(rel_name, &c, 1);
@@ -161,8 +170,9 @@ nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, in
     return c;
 }
 
+/* Concat schema name, table name and column name */
 char *
-getFullRelName(char *schema_name, char *table_name, char *field_name)
+getFullRelName(char *schema_name, char *table_name, char *column_name)
 {
     char *full_name = malloc(REL_SIZE * 3); /* Schema.Table.Field */
     memset(full_name, 0, REL_SIZE * 3);
@@ -170,10 +180,51 @@ getFullRelName(char *schema_name, char *table_name, char *field_name)
     strncat(full_name, &REL_SEP, 1);
     strcat(full_name, table_name);
     strncat(full_name, &REL_SEP, 1);
-    strcat(full_name, field_name);
+    strcat(full_name, column_name);
     return full_name;
 }
 
+/**
+ * Parsing file with masking pattern
+ * ------------------------------------
+ * Schema1
+ * {
+ *      Table1
+ *      {
+ *            field11 : function_name11
+ *          , field12 : function_name12
+ *          , field13 : function_name13
+ *      }
+ *
+ *      Table2
+ *      {
+ *            field21 : function_name21
+ *          , field22 : function_name22
+ *      --This function will be stored in `masking_func_query_path` list, and these functions will be
+ *      --created by script from the path 'path_to_file_with_function' - `pg_dump.c:createMaskingFunctions`
+ *      --and used for 'field23' - `masking.c:addFunctionToColumn`
+ *          , field23 : "path_to_file_with_function"
+ *      }
+ *  }
+ *
+ *  --Functions inside this block will be used for all schemes
+ * default
+ * {
+ *      --Functions inside this block will be used for all tables
+ *      default
+ *      {
+ *          --Function 'for_all_fields' will be used for all fields did not covered by exact functions
+ *          default: for_all_fields,
+ *          field1: value1,
+ *          field2: value2
+ *      }
+ *      --Functions inside this block will be used for tables with name 'Table' in the all schemes
+ *      Table
+ *      {
+ *          field : function_name
+ *      }
+ * }
+ */
 int
 readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking_func_query_path)
 {
@@ -182,7 +233,7 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking
     int close_brace_counter;
     char *schema_name;
     char *table_name;
-    char *field_name;
+    char *column_name;
     char *func_name;
     bool skip_reading;
     char c;
@@ -195,7 +246,7 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking
 
     schema_name = malloc(REL_SIZE + 1);
     table_name = malloc(REL_SIZE + 1);
-    field_name = malloc(REL_SIZE + 1);
+    column_name = malloc(REL_SIZE + 1);
     func_name = malloc(PATH_MAX + 1); /* We can get function name or path to file with a creating function query */
 
     brace_counter = 0;
@@ -226,15 +277,15 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking
                 md.parsing_state = WAIT_OPEN_BRACE;
                 break;
 
-            case FIELD_NAME:
-                c = nameReader(field_name, c, &md, fin, REL_SIZE);
+            case COLUMN_NAME:
+                c = nameReader(column_name, c, &md, fin, REL_SIZE);
                 md.parsing_state = WAIT_COLON;
                 break;
 
             case FUNCTION_NAME:
                 c = nameReader(func_name, c, &md, fin, PATH_MAX);
                 extractFuncNameIfPath(func_name, masking_func_query_path);
-                setMapValue(map, getFullRelName(schema_name, table_name, field_name), func_name);
+                setMapValue(map, getFullRelName(schema_name, table_name, column_name), func_name);
                 md.parsing_state = WAIT_COMMA;
                 break;
 
@@ -268,7 +319,7 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking
                 }
                 if (table_name[0] != '\0') /* we have already read table_name */
                 {
-                    md.parsing_state = FIELD_NAME;
+                    md.parsing_state = COLUMN_NAME;
                 }
                 else
                 {
@@ -329,7 +380,7 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking
                     exit_status = EXIT_FAILURE;
                     goto clear_resources;
                 }
-                md.parsing_state = FIELD_NAME;
+                md.parsing_state = COLUMN_NAME;
                 c = readNextSymbol(&md, fin);
                 skip_reading = true;
                 break;
@@ -338,7 +389,7 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking
     clear_resources:
     free(schema_name);
     free(table_name);
-    free(field_name);
+    free(column_name);
     free(func_name);
     return exit_status;
 }
@@ -363,23 +414,28 @@ concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_nam
     strcat(col_with_func, ")");
 }
 
-
+/*
+ * Wrapping columns with functions
+ * schema_name.function_name(schema_name.table_name.column_name)
+ * return ' ' - if
+ */
 char *
 addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map)
 {
     char *col_with_func;
+    /* Try to find for exact schema, table and column */
     int index = getMapIndexByKey(map, getFullRelName(schema_name, table_name, column_name));
-    if (index == -1)
+    if (index == -1) /* If didn't find, try to find function, that used for all schemas */
     {
-        /* For all schemas [default.table.field] */
+        /* Try to find for exact table and column [default.table.field] */
         index = getMapIndexByKey(map, getFullRelName(DEFAULT_NAME, table_name, column_name));
-        if (index == -1)
+        if (index == -1) /* If didn't find, try to find function, that used for all schemas and all tables */
         {
-            /* For all tables and schemas [default.default.field] */
+            /* Try to find for exact column [default.default.field] */
             index = getMapIndexByKey(map, getFullRelName(DEFAULT_NAME, DEFAULT_NAME, column_name));
-            if (index == -1)
+            if (index == -1) /* If didn't find, try to find function, that used for all schemas and all tables and all columns */
             {
-                /* For all fields in all schemas and tables [default.default.default] */
+                /* Try to find function that used for all fields in all schemas and tables [default.default.default] */
                 index = getMapIndexByKey(map, getFullRelName(DEFAULT_NAME, DEFAULT_NAME, DEFAULT_NAME));
             }
         }
@@ -389,19 +445,12 @@ addFunctionToColumn(char *schema_name, char *table_name, char *column_name, Mask
     if (index != -1)
     {
         char *function_name = map->data[index]->value;
-        if (strcmp(function_name, DEFAULT_NAME) != 0)
-        {
-            /* We can get an error if function is not available */
-            concatFunctionAndColumn(col_with_func, schema_name, column_name, function_name);
-        }
-        else
-        {
-            concatFunctionAndColumn(col_with_func, schema_name, column_name, "default");
-        }
+        concatFunctionAndColumn(col_with_func, schema_name, column_name, function_name);
     }
     return col_with_func;
 }
 
+/* Remove the first and the last symbol in func_name */
 void
 removeQuotes(char *func_name)
 {
@@ -409,12 +458,11 @@ removeQuotes(char *func_name)
     strncpy(new_func_name, func_name + 1, strlen(func_name) - 2);
     memset(func_name, 0, PATH_MAX);
     strcpy(func_name, new_func_name);
+    free(new_func_name);
 }
 
 
-/**
- * Read a word from a query, that creating a custom function
- */
+/* Read a word from a query */
 char *
 readWord(FILE *fin, char *word)
 {
@@ -438,6 +486,13 @@ readWord(FILE *fin, char *word)
     return word;
 }
 
+/**
+ * Extract function name from query. During extracting we also check
+ * the query, but only the start of it. We expecting the pattern:
+ * `create [or replace] function {func_name}`
+ * If something is wrong we will not use function and leave
+ * the field without transforming.
+ */
 int
 extractFunctionNameFromQueryFile(char *filename, char *func_name)
 {
@@ -452,31 +507,31 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name)
     }
     if (fin == NULL)
     {
-        printf("Problem with file \'%s\"", filename);
+        pg_log_warning("Problem with file \'%s\"", filename);
     }
     else
     {
         word = malloc(REL_SIZE + 1);
         memset(word, 0, REL_SIZE);
-        if (strcmp(readWord(fin, word), "create") == 0)
+        if (strcmp(readWord(fin, word), "create") == 0) /* reading 'create' */
         {
-            if (strcmp(readWord(fin, word), "or") == 0) /* read 'or' | 'function' */
+            if (strcmp(readWord(fin, word), "or") == 0) /* reading 'or' | 'function' */
             {
-                if (strcmp(readWord(fin, word), "replace") != 0)
+                if (strcmp(readWord(fin, word), "replace") != 0) /* reading 'replace' */
                 {
-                    printf("Keyword 'replace' was expected, but found '%s'. Check query for creating a function '%s'.\n",
+                    pg_log_warning("Keyword 'replace' was expected, but found '%s'. Check query for creating a function '%s'.\n",
                            word, filename);
                     goto free_resources;
                 }
                 else
                 {
-                    readWord(fin, word); /* read 'function' */
+                    readWord(fin, word); /* reading 'function' */
                 }
             }
         }
         else
         {
-            printf("Keyword 'create' was expected, but found '%s'. Check query for creating a function '%s'.\n", word,
+            pg_log_warning("Keyword 'create' was expected, but found '%s'. Check query for creating a function '%s'.\n", word,
                    filename);
             goto free_resources;
         }
@@ -486,7 +541,7 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name)
         }
         else
         {
-            printf("Keyword 'function' was expected, but found '%s'. Check query for creating a function '%s'.\n", word,
+            pg_log_warning("Keyword 'function' was expected, but found '%s'. Check query for creating a function '%s'.\n", word,
                    filename);
             goto free_resources;
         }
@@ -498,7 +553,7 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name)
 }
 
 /**
- * If there is a path (the first symbol is a quote '"'), then store this path in maskingMap->funcQueryPath
+ * If there is a path (the first symbol is a quote '"'), then store this path in masking_func_query_path
  * and write to the first argument (func_path) name of the function from the query in the file
  * If there is not a path - do nothing
 */
@@ -522,6 +577,7 @@ extractFuncNameIfPath(char *func_path, SimpleStringList *masking_func_query_path
     }
 }
 
+/* Read whole script from the file `filename` */
 char *
 readQueryForCreatingFunction(char *filename)
 {
@@ -539,8 +595,11 @@ readQueryForCreatingFunction(char *filename)
 
         query = (char *) calloc(fsize + 1, sizeof(char));
 
-        fread(query, sizeof(char), fsize, fin);
-
+        fsize = (int) fread(query, sizeof(char), fsize, fin);
+        if (fsize==0)
+        {
+            pg_log_error("File is empty `%s`", filename);
+        }
         fclose(fin);
     }
     return query;

@@ -40,7 +40,7 @@ ParsingState
 {
   SCHEMA_NAME,
   TABLE_NAME,
-  FIELD_NAME,
+  COLUMN_NAME,
   FUNCTION_NAME,
   WAIT_COLON,
   WAIT_OPEN_BRACE,
@@ -67,7 +67,7 @@ char nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fi
 int getMapIndexByKey(MaskingMap *map, char *key);
 extern int readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking_func_query_path);
 char *addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map);
-char *getFullRelName(char *schema_name, char *table_name, char *field_name);
+char *getFullRelName(char *schema_name, char *table_name, char *column_name);
 void concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name);
 char *readQueryForCreatingFunction(char *filename);
 extern void extractFuncNameIfPath(char *func_path, SimpleStringList *masking_func_query_path);

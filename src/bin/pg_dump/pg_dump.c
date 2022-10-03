@@ -762,7 +762,10 @@ main(int argc, char **argv)
 	 * death.
 	 */
 	ConnectDatabase(fout, &dopt.cparams, false);
-    createMaskingFunctions(fout, &masking_func_query_path);
+    if (dopt.masking_map)
+    {
+        createMaskingFunctions(fout, &masking_func_query_path);
+    }
 	setup_connection(fout, dumpencoding, dumpsnapshot, use_role);
 
 
@@ -2177,14 +2180,14 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 			appendPQExpBufferStr(q, "NULL");
 		else
         {
-            if (dopt->masking_map)
+            if (dopt->masking_map) /* If we read masking options successfully, we can use masking functions */
             {
                 char *column_with_fun;
                 column_with_fun=addFunctionToColumn(tbinfo->dobj.namespace->dobj.name, tbinfo->dobj.name,
                                                     tbinfo->attnames[i], dopt->masking_map);
                 if (column_with_fun[0] == ' ')
                 {
-                    pg_log_warning("Function\"%s\" is not found", column_with_fun);
+                    pg_log_warning("Function\"%s\" was not found", column_with_fun);
                 }
                 if (column_with_fun[0] != '\0')
                 {
@@ -18274,6 +18277,13 @@ getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
     return exit_result;
 }
 
+/**
+ * Read paths to functions from `masking_func_query_path`,
+ * read query inside the files and run them. We checked them
+ * in function masking.c:extractFunctionNameFromQueryFile.
+ *
+ *
+ */
 int
 createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path)
 {
@@ -18282,10 +18292,12 @@ createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path)
     char *filename;
     char *query;
     bool result;
+    char *full_path;
+    char *pg_root;
 
     exit_result=0;
     result = false;
-    // Read all custom masking functions and create them
+    /* Read all custom masking functions and create them */
     for (SimpleStringListCell *cell = masking_func_query_path->head; cell; cell = cell->next)
     {
         filename=cell->val;
@@ -18307,8 +18319,6 @@ createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path)
         }
     }
     /* Read all default functions and create them */
-    char *full_path;
-    char *pg_root;
     full_path = malloc(PATH_MAX);
 
     pg_root = "{$libdir}"; // path to postgres project (Dynamic_library_path)
@@ -18316,7 +18326,7 @@ createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path)
 
     strcpy(full_path, pg_root);
     strcat(full_path, filename);
-    query = readQueryForCreatingFunction(filename);
+    query = readQueryForCreatingFunction(full_path);
     result = executeMaintenanceCommand(conn, query, true);
     if (!result)
     {
@@ -18324,5 +18334,6 @@ createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path)
         exit_result++;
     }
     free(query);
+    free(full_path);
     return exit_result;
 }
