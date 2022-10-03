@@ -12,17 +12,12 @@
  *
  *-------------------------------------------------------------------------
  */
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdbool.h>
 #include <ctype.h>
 #include "masking.h"
 
 #define REL_SIZE 64 * 8 /* Length of relation name - 64 bytes */
 #define DEFAULT_NAME "default"
 #define COL_WITH_FUNC_SIZE 3 * REL_SIZE + 3 /* schema_name.function name + '(' + column_name + ') */
-#define PATH_SIZE 255 * 8 + 2 /* length of the path + 2 quotes */
 
 char REL_SEP = '.'; /* Relation separator */
 
@@ -138,14 +133,14 @@ readNextSymbol(struct MaskingDebugDetails *md, FILE *fin)
     {
         md->symbol_num++;
     }
-    return tolower(c);
+    return c;
 }
 
 /* Read relation name*/
 char
-nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin)
+nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, int size)
 {
-    memset(rel_name, 0, PATH_SIZE);
+    memset(rel_name, 0,  size);
     while (!isTerminal(c))
     {
         switch (c)
@@ -180,7 +175,7 @@ getFullRelName(char *schema_name, char *table_name, char *field_name)
 }
 
 int
-readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *func_query_path)
+readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking_func_query_path)
 {
     int exit_status;
     int brace_counter;
@@ -201,7 +196,7 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *func_qu
     schema_name = malloc(REL_SIZE + 1);
     table_name = malloc(REL_SIZE + 1);
     field_name = malloc(REL_SIZE + 1);
-    func_name = malloc(PATH_SIZE + 1); /* We can get function name or path to file with a creating function query */
+    func_name = malloc(PATH_MAX + 1); /* We can get function name or path to file with a creating function query */
 
     brace_counter = 0;
     close_brace_counter = 0;
@@ -221,24 +216,24 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *func_qu
         switch (md.parsing_state)
         {
             case SCHEMA_NAME:
-                c = nameReader(schema_name, c, &md, fin);
+                c = nameReader(schema_name, c, &md, fin, REL_SIZE);
                 md.parsing_state = WAIT_OPEN_BRACE;
                 memset(table_name, 0, sizeof REL_SIZE);
                 break;
 
             case TABLE_NAME:
-                c = nameReader(table_name, c, &md, fin);
+                c = nameReader(table_name, c, &md, fin, REL_SIZE);
                 md.parsing_state = WAIT_OPEN_BRACE;
                 break;
 
             case FIELD_NAME:
-                c = nameReader(field_name, c, &md, fin);
+                c = nameReader(field_name, c, &md, fin, REL_SIZE);
                 md.parsing_state = WAIT_COLON;
                 break;
 
             case FUNCTION_NAME:
-                c = nameReader(func_name, c, &md, fin);
-                extractFuncNameIfPath(func_name, func_query_path);
+                c = nameReader(func_name, c, &md, fin, PATH_MAX);
+                extractFuncNameIfPath(func_name, masking_func_query_path);
                 setMapValue(map, getFullRelName(schema_name, table_name, field_name), func_name);
                 md.parsing_state = WAIT_COMMA;
                 break;
@@ -352,9 +347,17 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *func_qu
 void
 concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name)
 {
-    strcpy(col_with_func, schema_name);
-    strcat(col_with_func, ".");
-    strcat(col_with_func, function_name);
+    /* Function name already contains schema name. If not, then add the same scheme*/
+    if (strrchr(function_name, '.') != NULL)
+    {
+        strcpy(col_with_func, function_name);
+    }
+    else
+    {
+        strcpy(col_with_func, schema_name);
+        strcat(col_with_func, ".");
+        strcat(col_with_func, function_name);
+    }
     strcat(col_with_func, "(");
     strcat(col_with_func, column_name);
     strcat(col_with_func, ")");
@@ -402,9 +405,9 @@ addFunctionToColumn(char *schema_name, char *table_name, char *column_name, Mask
 void
 removeQuotes(char *func_name)
 {
-    char *new_func_name = malloc(PATH_SIZE + 1);
+    char *new_func_name = malloc(PATH_MAX + 1);
     strncpy(new_func_name, func_name + 1, strlen(func_name) - 2);
-    memset(func_name, 0, PATH_SIZE);
+    memset(func_name, 0, PATH_MAX);
     strcpy(func_name, new_func_name);
 }
 
@@ -477,7 +480,7 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name)
                    filename);
             goto free_resources;
         }
-        if (strcmp(word, "function"))
+        if (strcmp(word, "function") == 0)
         {
             strcpy(func_name, readWord(fin, word));
         }
@@ -500,19 +503,18 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name)
  * If there is not a path - do nothing
 */
 void
-extractFuncNameIfPath(char *func_path, SimpleStringList *func_query_path)
+extractFuncNameIfPath(char *func_path, SimpleStringList *masking_func_query_path)
 {
     char *func_name;
     if (func_path[0] == '"')
     {
         func_name = malloc(REL_SIZE + 1);
         removeQuotes(func_path);
-        if (extractFunctionNameFromQueryFile(func_path, func_name) ==
-            0) /* Read function name from query and store in func_name */
+        if (extractFunctionNameFromQueryFile(func_path, func_name) != 0) /* Read function name from query and store in func_name */
         {
-            if (!simple_string_list_member(func_query_path, func_path))
+            if (!simple_string_list_member(masking_func_query_path, func_path))
             {
-                simple_string_list_append(func_query_path, func_path);
+                simple_string_list_append(masking_func_query_path, func_path);
             }
             strcpy(func_path, func_name); /* Store func_name in func_path to throw it to upper function */
         }
@@ -526,17 +528,16 @@ readQueryForCreatingFunction(char *filename)
     FILE *fin;
     char *query;
     long fsize;
-
     query = malloc(sizeof(char));
     memset(query, 0, sizeof(char));
     fin = fopen(filename, "r");
-    if (fin == NULL)
+    if (fin != NULL)
     {
         fseek(fin, 0L, SEEK_END);
         fsize = ftell(fin);
         fseek(fin, 0L, SEEK_SET);
 
-        query = (char *) calloc(fsize, sizeof(char));
+        query = (char *) calloc(fsize + 1, sizeof(char));
 
         fread(query, sizeof(char), fsize, fin);
 

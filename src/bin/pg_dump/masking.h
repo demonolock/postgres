@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <limits.h>
 #include "fe_utils/simple_list.h"
 
 typedef struct _pair
@@ -62,14 +63,14 @@ void printParsingError(struct MaskingDebugDetails *md, char *message, char curre
 bool isTerminal(char c);
 bool isSpace(char c);
 char readNextSymbol(struct MaskingDebugDetails *md, FILE *fin);
-char nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin);
+char nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, int size);
 int getMapIndexByKey(MaskingMap *map, char *key);
-extern int readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *func_query_path);
+extern int readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking_func_query_path);
 char *addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map);
 char *getFullRelName(char *schema_name, char *table_name, char *field_name);
 void concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name);
 char *readQueryForCreatingFunction(char *filename);
-extern void extractFuncNameIfPath(char *func_path, SimpleStringList *func_query_path);
+extern void extractFuncNameIfPath(char *func_path, SimpleStringList *masking_func_query_path);
 void removeQuotes(char *func_name);
 char *readWord(FILE *fin, char *word);
 int extractFunctionNameFromQueryFile(char *filename, char *func_name);

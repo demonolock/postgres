@@ -69,6 +69,8 @@
 #include "pg_backup_utils.h"
 #include "pg_dump.h"
 #include "storage/block.h"
+#include "postgres.h"
+#include "fmgr.h"
 
 typedef struct
 {
@@ -130,6 +132,7 @@ static SimpleOidList foreign_servers_include_oids = {NULL, NULL};
 
 static SimpleStringList extension_include_patterns = {NULL, NULL};
 static SimpleOidList extension_include_oids = {NULL, NULL};
+static SimpleStringList masking_func_query_path = {NULL, NULL}; /* List of path to query with masking functions, that must be created before starting dump */
 
 static const CatalogId nilCatalogId = {0, 0};
 
@@ -322,7 +325,7 @@ static char *get_synchronized_snapshot(Archive *fout);
 static void setupDumpWorker(Archive *AH);
 static TableInfo *getRootTableInfo(const TableInfo *tbinfo);
 static int getMaskingPatternFromFile(const char *filename, DumpOptions *dopt);
-static int createMaskingFunctions(Archive *AH, SimpleStringList *func_query_path);
+static int createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path);
 
 int
 main(int argc, char **argv)
@@ -630,7 +633,7 @@ main(int argc, char **argv)
 
             case 13:			/* masking */
                 getMaskingPatternFromFile(optarg, &dopt);
-                if (dopt.dump_inserts == 0)
+                if (dopt.dump_inserts == 0) /* Masking works only with inserts */
                     dopt.dump_inserts = DUMP_DEFAULT_ROWS_PER_INSERT;
                 break;
 
@@ -759,7 +762,7 @@ main(int argc, char **argv)
 	 * death.
 	 */
 	ConnectDatabase(fout, &dopt.cparams, false);
-    createMaskingFunctions(fout, dopt.func_query_path);
+    createMaskingFunctions(fout, &masking_func_query_path);
 	setup_connection(fout, dumpencoding, dumpsnapshot, use_role);
 
 
@@ -18266,13 +18269,13 @@ getMaskingPatternFromFile(const char *filename, DumpOptions *dopt)
 
     dopt->masking_map = newMaskingMap();
 
-    exit_result = readMaskingPatternFromFile(fin, dopt->masking_map, dopt->func_query_path);
+    exit_result = readMaskingPatternFromFile(fin, dopt->masking_map, &masking_func_query_path);
     fclose(fin);
     return exit_result;
 }
 
 int
-createMaskingFunctions(Archive *AH, SimpleStringList *func_query_path)
+createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path)
 {
     int exit_result;
     PGconn *conn = GetConnection(AH);
@@ -18283,19 +18286,19 @@ createMaskingFunctions(Archive *AH, SimpleStringList *func_query_path)
     exit_result=0;
     result = false;
     // Read all custom masking functions and create them
-    for (SimpleStringListCell *cell = func_query_path->head; cell; cell = cell->next)
+    for (SimpleStringListCell *cell = masking_func_query_path->head; cell; cell = cell->next)
     {
         filename=cell->val;
-        printf("%s", filename);
         query = readQueryForCreatingFunction(filename);
         if (query[0]=='\0')
         {
             pg_log_warning("Query is empty. Check file `%s`", filename);
             exit_result++;
-        } else {
+        }
+        else
+        {
             result = executeMaintenanceCommand(conn, query, true);
         }
-        printf("%s", query);
 
         if (!result)
         {
@@ -18303,13 +18306,21 @@ createMaskingFunctions(Archive *AH, SimpleStringList *func_query_path)
             exit_result++;
         }
     }
-    // Read all default functions and create them
-    filename = "./masking_functions/default_functions.sql";
+    /* Read all default functions and create them */
+    char *full_path;
+    char *pg_root;
+    full_path = malloc(PATH_MAX);
+
+    pg_root = "{$libdir}"; // path to postgres project (Dynamic_library_path)
+    filename = "postgres/src/bin/pg_dump/masking_functions/default_functions.sql";
+
+    strcpy(full_path, pg_root);
+    strcat(full_path, filename);
     query = readQueryForCreatingFunction(filename);
     result = executeMaintenanceCommand(conn, query, true);
     if (!result)
     {
-        pg_log_warning("Problem with default functions query from file \"%s\"", filename);
+        pg_log_warning("Problem during creating default functions query from file \"%s\"", filename);
         exit_result++;
     }
     free(query);

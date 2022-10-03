@@ -201,7 +201,6 @@ typedef struct _dumpOptions
 	int			do_nothing;
 	bool		cant_be_masked; /* set true if we have options that don't work with masking */
     MaskingMap *masking_map;     /* Map of fields and functions for data masking */
-    SimpleStringList *func_query_path; /* List of path to query with masking functions, that must be created before starting dump */
 } DumpOptions;
 
 /*
