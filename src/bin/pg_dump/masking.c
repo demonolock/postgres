@@ -16,11 +16,22 @@
 #include "masking.h"
 #include "common/logging.h"
 
-#define REL_SIZE 64 * 8 /* Length of relation name - 64 bytes */
+#define REL_SIZE 64 /* Length of relation name - 63 bytes (symbols) */
 #define DEFAULT_NAME "default"
 #define COL_WITH_FUNC_SIZE 3 * REL_SIZE + 3 /* schema_name.function name + '(' + column_name + ') */
 
 char REL_SEP = '.'; /* Relation separator */
+
+MaskingMap *newMaskingMap(void);
+void setMapValue(MaskingMap *map, char *key, char *value);
+void printParsingError(struct MaskingDebugDetails *md, char *message, char current_symbol);
+bool isTerminal(char c);
+bool isSpace(char c);
+char readNextSymbol(struct MaskingDebugDetails *md, FILE *fin);
+char readName(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, int size);
+int getMapIndexByKey(MaskingMap *map, char *key);
+char skipOneLineComment(char c, struct MaskingDebugDetails *md, FILE *fin);
+char skipMultiLineComment(char c, struct MaskingDebugDetails *md, FILE *fin);
 
 /* Initialise masking map */
 MaskingMap *
@@ -47,22 +58,6 @@ getMapIndexByKey(MaskingMap *map, char *key)
         index++;
     }
     return -1;
-}
-
-void
-cleanMap(MaskingMap *map)
-{
-    if (map != NULL && map->data != NULL)
-    {
-        for (int i = 0; map->data[i] != NULL; i++)
-        {
-            free(map->data[i]->key);
-            free(map->data[i]->value);
-            free(map->data[i]);
-        }
-        free(map->data);
-        free(map);
-    }
 }
 
 /*
@@ -123,6 +118,55 @@ isSpace(char c)
     return c == ' ' || c == '\t' || c == '\n' || c == EOF;
 }
 
+/* Read to the end of a comment */
+char
+skipOneLineComment(char c, struct MaskingDebugDetails *md, FILE *fin)
+{
+  while (md->is_comment)
+  {
+	c = readNextSymbol(md, fin);
+	switch (c)
+	{
+	  case '\n':
+		md->is_comment = false; /* End of a one line comment */
+		c = readNextSymbol(md, fin);
+		break;
+	  case EOF:
+		return c; /* Handling `EOF` outside the function */
+	  default:
+		continue;
+	}
+  }
+  return c;
+}
+
+/* Read to the end of a comment */
+char
+skipMultiLineComment(char c, struct MaskingDebugDetails *md, FILE *fin)
+{
+  while (md->is_comment)
+  {
+	c = readNextSymbol(md, fin);
+	switch (c)
+	{
+	  case '*':
+		c = readNextSymbol(md, fin);
+		if (c == '/')
+		{
+		  md->is_comment = false; /* End of a multi line comment */
+		  c = readNextSymbol(md, fin);
+		  break;
+		}
+		continue;
+	  case EOF:
+		return c; /* Handling `EOF` outside the function */
+	  default:
+		continue;
+	}
+  }
+  return c;
+}
+
 /*
  * Read symbol and change place of cursor in MaskingDebugDetails
  * md->line_num - increasing when we meet '\n'
@@ -133,6 +177,7 @@ char
 readNextSymbol(struct MaskingDebugDetails *md, FILE *fin)
 {
     char c = fgetc(fin);
+  	/* Count lines and columns */
     if (c == '\n')
     {
         md->line_num++;
@@ -142,13 +187,31 @@ readNextSymbol(struct MaskingDebugDetails *md, FILE *fin)
     {
         md->symbol_num++;
     }
+  	/* Skip comment */
+  	if (c == '/' && !md->is_comment) /* First slash */
+	{
+	  char next_c = fgetc(fin);
+	  fseek(fin, -1, SEEK_CUR); /* Returning on 1 symbol back for correct line counting */
+	  if (next_c == '/')
+	  {
+		md->is_comment = true;
+		c = skipOneLineComment(c, md, fin);
+	  }
+	  else if (next_c == '*')
+	  {
+		md->is_comment = true;
+		c = skipMultiLineComment(c, md, fin);
+	  }
+	}
     return c;
 }
 
 /* Read relation name */
 char
-nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, int size)
+readName(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, int size)
 {
+  	bool word_started = false;
+  	bool word_finished = false;
     memset(rel_name, 0,  size);
     while (!isTerminal(c))
     {
@@ -157,13 +220,23 @@ nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, in
             case ' ':
             case '\t':
             case '\n':
-                break; /* Skip space symbols */
+			  if (word_started && !word_finished)
+			  {
+				word_finished = true;
+			  }
+			  break; /* Skip space symbols */
             case EOF:
                 return c; /* Handling `EOF` outside the function */
 
             default:
-                strncat(rel_name, &c, 1);
-                break;
+			  if (word_finished)
+			  {
+				printParsingError(md, "Syntax error. Relation name can't contain space symbols.", c);
+				return c;
+			  }
+			  word_started = true;
+			  strncat(rel_name, &c, 1);
+			  break;
         }
         c = readNextSymbol(md, fin);
     }
@@ -241,12 +314,13 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking
     struct MaskingDebugDetails md;
     md.line_num = 1;
     md.symbol_num = 0;
+  	md.is_comment = false;
     md.parsing_state = SCHEMA_NAME;
     exit_status = EXIT_SUCCESS;
 
-    schema_name = malloc(REL_SIZE + 1);
-    table_name = malloc(REL_SIZE + 1);
-    column_name = malloc(REL_SIZE + 1);
+    schema_name = malloc(REL_SIZE);
+    table_name = malloc(REL_SIZE);
+    column_name = malloc(REL_SIZE);
     func_name = malloc(PATH_MAX + 1); /* We can get function name or path to file with a creating function query */
 
     brace_counter = 0;
@@ -267,23 +341,23 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking
         switch (md.parsing_state)
         {
             case SCHEMA_NAME:
-                c = nameReader(schema_name, c, &md, fin, REL_SIZE);
+                c = readName(schema_name, c, &md, fin, REL_SIZE);
                 md.parsing_state = WAIT_OPEN_BRACE;
-                memset(table_name, 0, sizeof REL_SIZE);
+                memset(table_name, 0, REL_SIZE);
                 break;
 
             case TABLE_NAME:
-                c = nameReader(table_name, c, &md, fin, REL_SIZE);
+                c = readName(table_name, c, &md, fin, REL_SIZE);
                 md.parsing_state = WAIT_OPEN_BRACE;
                 break;
 
             case COLUMN_NAME:
-                c = nameReader(column_name, c, &md, fin, REL_SIZE);
+                c = readName(column_name, c, &md, fin, REL_SIZE);
                 md.parsing_state = WAIT_COLON;
                 break;
 
             case FUNCTION_NAME:
-                c = nameReader(func_name, c, &md, fin, PATH_MAX);
+                c = readName(func_name, c, &md, fin, PATH_MAX);
                 extractFuncNameIfPath(func_name, masking_func_query_path);
                 setMapValue(map, getFullRelName(schema_name, table_name, column_name), func_name);
                 md.parsing_state = WAIT_COMMA;
@@ -446,8 +520,8 @@ addFunctionToColumn(char *schema_name, char *table_name, char *column_name, Mask
             }
         }
     }
-    col_with_func = malloc(COL_WITH_FUNC_SIZE + 1);
-    memset(col_with_func, 0, COL_WITH_FUNC_SIZE + 1);
+    col_with_func = malloc(COL_WITH_FUNC_SIZE);
+    memset(col_with_func, 0, COL_WITH_FUNC_SIZE);
     if (index != -1)
     {
         char *function_name = map->data[index]->value;
@@ -466,7 +540,6 @@ removeQuotes(char *func_name)
     strcpy(func_name, new_func_name);
     free(new_func_name);
 }
-
 
 /* Read a word from a query */
 char *
@@ -517,7 +590,7 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name)
     }
     else
     {
-        word = malloc(REL_SIZE + 1);
+        word = malloc(REL_SIZE);
         memset(word, 0, REL_SIZE);
         if (strcmp(readWord(fin, word), "create") == 0) /* reading 'create' */
         {
@@ -569,7 +642,7 @@ extractFuncNameIfPath(char *func_path, SimpleStringList *masking_func_query_path
     char *func_name;
     if (func_path[0] == '"')
     {
-        func_name = malloc(REL_SIZE + 1);
+        func_name = malloc(REL_SIZE);
         removeQuotes(func_path);
         if (extractFunctionNameFromQueryFile(func_path, func_name) != 0) /* Read function name from query and store in func_name */
         {
@@ -609,6 +682,38 @@ readQueryForCreatingFunction(char *filename)
         fclose(fin);
     }
     return query;
+}
+
+/**
+ * getMaskingPatternFromFile
+ *
+ * Parse the specified masking file with description of what we need to mask
+ * If the filename is "-" then filters will be
+ * read from STDIN rather than a file.
+ */
+int
+getMaskingPatternFromFile(const char *filename, MaskingMap *map, SimpleStringList *masking_func_query_path)
+{
+  FILE *fin;
+  int exit_result;
+  if (filename[0]=='\0')
+  {
+	pg_log_error("--masking filename shouldn't be empty");
+	exit_nicely(1);
+  }
+
+  fin = fopen(filename, "r");
+
+  if (fin == NULL)
+  {
+	exit_nicely(1);
+  }
+
+  map = newMaskingMap();
+
+  exit_result = readMaskingPatternFromFile(fin, map, &masking_func_query_path);
+  fclose(fin);
+  return exit_result;
 }
 
 /**

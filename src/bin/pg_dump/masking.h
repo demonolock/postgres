@@ -53,18 +53,11 @@ MaskingDebugDetails
 {
   int line_num;
   int symbol_num;
+  bool is_comment;
   enum ParsingState parsing_state;
 };
 
-MaskingMap *newMaskingMap(void);
-void cleanMap(MaskingMap *map);
-void setMapValue(MaskingMap *map, char *key, char *value);
-void printParsingError(struct MaskingDebugDetails *md, char *message, char current_symbol);
-bool isTerminal(char c);
-bool isSpace(char c);
-char readNextSymbol(struct MaskingDebugDetails *md, FILE *fin);
-char nameReader(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, int size);
-int getMapIndexByKey(MaskingMap *map, char *key);
+int getMaskingPatternFromFile(const char *filename, MaskingMap *map, SimpleStringList *masking_func_query_path);
 extern int readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking_func_query_path);
 char *addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map);
 char *getFullRelName(char *schema_name, char *table_name, char *column_name);

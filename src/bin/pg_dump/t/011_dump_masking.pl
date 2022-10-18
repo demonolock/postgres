@@ -5,7 +5,7 @@ use warnings;
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
-use Test::More tests => 65;
+use Test::More tests => 68;
 
 my $tempdir = PostgreSQL::Test::Utils::tempdir;
 my $inputfile;
@@ -31,28 +31,31 @@ $node->safe_psql('postgres', "CREATE SCHEMA schema4;");
 $node->safe_psql('postgres', "CREATE SCHEMA schema5;");
 $node->safe_psql('postgres', "CREATE SCHEMA schema6;");
 $node->safe_psql('postgres', "CREATE SCHEMA schema7;");
+$node->safe_psql('postgres', "CREATE SCHEMA large_schema_name1234567890123456789012345678901234567890123456;");
 
-$node->safe_psql('postgres', "CREATE TABLE schema1.table1(field1 varchar)");
-$node->safe_psql('postgres', "CREATE TABLE schema2.table2(field2 varchar)");
-$node->safe_psql('postgres', "CREATE TABLE schema3.table3(field3 varchar)");
-$node->safe_psql('postgres', "CREATE TABLE schema4.table4(field41 varchar, field42 varchar)");
-$node->safe_psql('postgres', "CREATE TABLE schema5.table51(field511 varchar, email varchar)");
-$node->safe_psql('postgres', "CREATE TABLE schema5.table52(email varchar, field522 varchar)");
-$node->safe_psql('postgres', "CREATE TABLE schema6.table61(email varchar, field612 varchar)");
-$node->safe_psql('postgres', "CREATE TABLE schema6.table62(field621 varchar, email varchar)");
-$node->safe_psql('postgres', "CREATE TABLE schema7.table7(field71 varchar, phone varchar)");
-$node->safe_psql('postgres', "CREATE TABLE schema7.table8(phone varchar, field82 varchar)");
+$node->safe_psql('postgres', "CREATE TABLE schema1.table1(field1 varchar);");
+$node->safe_psql('postgres', "CREATE TABLE schema2.table2(field2 varchar);");
+$node->safe_psql('postgres', "CREATE TABLE schema3.table3(field3 varchar);");
+$node->safe_psql('postgres', "CREATE TABLE schema4.table4(field41 varchar, field42 varchar);");
+$node->safe_psql('postgres', "CREATE TABLE schema5.table51(field511 varchar, email varchar);");
+$node->safe_psql('postgres', "CREATE TABLE schema5.table52(email varchar, field522 varchar);");
+$node->safe_psql('postgres', "CREATE TABLE schema6.table61(email varchar, field612 varchar);");
+$node->safe_psql('postgres', "CREATE TABLE schema6.table62(field621 varchar, email varchar);");
+$node->safe_psql('postgres', "CREATE TABLE schema7.table7(field71 varchar, phone varchar);");
+$node->safe_psql('postgres', "CREATE TABLE schema7.table8(phone varchar, field82 varchar);");
+$node->safe_psql('postgres', "CREATE TABLE large_schema_name1234567890123456789012345678901234567890123456.large_table_name12345678901234567890123456789012345678901234567(large_field_1_1234567890123456789012345678901234567890123456789 varchar, large_field_2_1234567890123456789012345678901234567890123456789 varchar);");
 
-$node->safe_psql('postgres', "INSERT INTO schema1.table1 VALUES('value1')");
-$node->safe_psql('postgres', "INSERT INTO schema2.table2 VALUES('value2')");
-$node->safe_psql('postgres', "INSERT INTO schema3.table3 VALUES('value3')");
-$node->safe_psql('postgres', "INSERT INTO schema4.table4 VALUES('value41', 'value42')");
-$node->safe_psql('postgres', "INSERT INTO schema5.table51 VALUES('value511', 'value512')");
-$node->safe_psql('postgres', "INSERT INTO schema5.table52 VALUES('value521', 'value522')");
-$node->safe_psql('postgres', "INSERT INTO schema6.table61 VALUES('value611', 'value612')");
-$node->safe_psql('postgres', "INSERT INTO schema6.table62 VALUES('value621', 'value622')");
-$node->safe_psql('postgres', "INSERT INTO schema7.table7 VALUES('value71', 'value72')");
-$node->safe_psql('postgres', "INSERT INTO schema7.table8 VALUES('value81', 'value82')");
+$node->safe_psql('postgres', "INSERT INTO schema1.table1 VALUES('value1');");
+$node->safe_psql('postgres', "INSERT INTO schema2.table2 VALUES('value2');");
+$node->safe_psql('postgres', "INSERT INTO schema3.table3 VALUES('value3');");
+$node->safe_psql('postgres', "INSERT INTO schema4.table4 VALUES('value41', 'value42');");
+$node->safe_psql('postgres', "INSERT INTO schema5.table51 VALUES('value511', 'value512');");
+$node->safe_psql('postgres', "INSERT INTO schema5.table52 VALUES('value521', 'value522');");
+$node->safe_psql('postgres', "INSERT INTO schema6.table61 VALUES('value611', 'value612');");
+$node->safe_psql('postgres', "INSERT INTO schema6.table62 VALUES('value621', 'value622');");
+$node->safe_psql('postgres', "INSERT INTO schema7.table7 VALUES('value71', 'value72');");
+$node->safe_psql('postgres', "INSERT INTO schema7.table8 VALUES('value81', 'value82');");
+$node->safe_psql('postgres', "INSERT INTO large_schema_name1234567890123456789012345678901234567890123456.large_table_name12345678901234567890123456789012345678901234567 VALUES('large_value_1_1234567890123456789012345678901234567890123456789', 'large_value_2');");
 
 
 #########################################
@@ -86,24 +89,32 @@ close $inputfile;
 
 open $inputfile, '>>', "$tempdir/masking_file.txt"
   or die "unable to open masking file for writing";
-print $inputfile "schema1
+print $inputfile "// First comment
+                  schema1
                   {
-                    table1
+                    table1  // Second comment
                     {
                         field1: default
                     }
                   }
+
+                  /*
+                  Third comment
+                  */
                   schema2
                   {
                     table2 {
                         not_exist_field: default
                     }
                   }
-                  schema3
+                  /**
+                  * Fourth multi line comment
+                  */
+                  schema3 /* Fifth multi line comment */
                   {
                     table3
                     {
-                        field3:  \"$tempdir/custom_function_file.txt\"
+                        field3:  \"$tempdir/custom_function_file.txt\"//Sixth comment
                     }
                   }
                   schema4
@@ -123,6 +134,14 @@ print $inputfile "schema1
                     table7
                     {
                         phone: \"$tempdir/mask_phone.sql\"
+                    }
+                  }
+                  large_schema_name1234567890123456789012345678901234567890123456
+                  {
+                    large_table_name12345678901234567890123456789012345678901234567
+                    {
+                        large_field_1_1234567890123456789012345678901234567890123456789: default,
+                        large_field_2_1234567890123456789012345678901234567890123456789: schema3.custom_function
                     }
                   }
                   ";
@@ -149,6 +168,7 @@ ok($dump =~ qr/^INSERT INTO schema6\.table61 VALUES \(\'value611 email\'\, \'val
 ok($dump =~ qr/^INSERT INTO schema6\.table62 VALUES \(\'value621\'\, \'value622 email\'\)/m, "11. [Default schema and table] Masked only field with name `email`");
 ok($dump =~ qr/^INSERT INTO schema7\.table7 VALUES \(\'value71\'\, \'value72 phone\'\)/m, "12. [Default schema] Masked only field with name `phone` from table7");
 ok($dump =~ qr/^INSERT INTO schema7\.table8 VALUES \(\'value81\'\, \'value82\'\)/m, "13. [Default schema] Masked only field with name `phone` from table7");
+ok($dump =~ qr/^INSERT INTO large_schema_name1234567890123456789012345678901234567890123456\.large_table_name12345678901234567890123456789012345678901234567 VALUES \(\'XXXX\'\, \'large_value_2 custom\'\)/m, "14. [Large values] Limit of relation name size is 63 symbols");
 
 #########################################
 # Run masking with other options
@@ -160,8 +180,8 @@ command_ok(
 		"--masking=$tempdir/masking_file.txt",
 		'--data-only'
 	],
-	"14. Run masking with option --data-only");
-ok(slurp_file($dumpfile) =~ qr/^INSERT INTO schema7\.table7 VALUES \(\'value71\'\, \'value72 phone\'\)/m, "15. Check dump after running masking with option --data-only");
+	"15. Run masking with option --data-only");
+ok(slurp_file($dumpfile) =~ qr/^INSERT INTO schema7\.table7 VALUES \(\'value71\'\, \'value72 phone\'\)/m, "16. Check dump after running masking with option --data-only");
 
 command_ok(
 	[
@@ -169,8 +189,8 @@ command_ok(
 		"--masking=$tempdir/masking_file.txt",
 		'--clean'
 	],
-	"16. Run masking with option --clean");
-ok(slurp_file($dumpfile) =~ qr/^INSERT INTO schema7\.table7 VALUES \(\'value71\'\, \'value72 phone\'\)/m, "17. Check dump after running masking with option --clean");
+	"17. Run masking with option --clean");
+ok(slurp_file($dumpfile) =~ qr/^INSERT INTO schema7\.table7 VALUES \(\'value71\'\, \'value72 phone\'\)/m, "18. Check dump after running masking with option --clean");
 
 command_ok(
 	[
@@ -178,8 +198,8 @@ command_ok(
 		"--masking=$tempdir/masking_file.txt",
 		'--create'
 	],
-	"18. Run masking with option --create");
-ok(slurp_file($dumpfile) =~ qr/^INSERT INTO schema7\.table7 VALUES \(\'value71\'\, \'value72 phone\'\)/m, "19. Check dump after running masking with option --create");
+	"19. Run masking with option --create");
+ok(slurp_file($dumpfile) =~ qr/^INSERT INTO schema7\.table7 VALUES \(\'value71\'\, \'value72 phone\'\)/m, "20. Check dump after running masking with option --create");
 
 command_ok(
 	[
@@ -187,17 +207,8 @@ command_ok(
 		"--masking=$tempdir/masking_file.txt",
 		"--encoding=UTF-8"
 	],
-	"20. Run masking with option --encoding");
-ok(slurp_file($dumpfile) =~ qr/^INSERT INTO schema7\.table7 VALUES \(\'value71\'\, \'value72 phone\'\)/m, "21. Check dump after running masking with option --encoding");
-
-command_ok(
-	[
-		'pg_dump', '-p', $port, '-f', $dumpdir,
-		"--masking=$tempdir/masking_file.txt",
-		"--format=directory",
-		"--jobs=2"
-	],
-	"22. Run masking with option --jobs");
+	"21. Run masking with option --encoding");
+ok(slurp_file($dumpfile) =~ qr/^INSERT INTO schema7\.table7 VALUES \(\'value71\'\, \'value72 phone\'\)/m, "22. Check dump after running masking with option --encoding");
 
 command_ok(
 	[
@@ -406,6 +417,15 @@ command_ok(
 	],
 	"61. Run masking with option --compress");
 
+command_ok(
+	[
+		'pg_dump', '-p', $port, '-f', $dumpdir,
+		"--masking=$tempdir/masking_file.txt",
+		"--format=directory",
+		"--jobs=2"
+	],
+	"62. Run masking with option --jobs");
+
 open $inputfile, '>>', "$tempdir/drop_table_script.sql"
   or die "unable to open mask_phone.sql for writing";
 print $inputfile "DROP TABLE schema1.table1;";
@@ -430,7 +450,7 @@ command_fails_like(
 		"--masking=$tempdir/masking_file_2.txt"
 	],
 	qr/pg_dump: warning: Keyword 'create' was expected, but found 'drop'. Check query for creating a function/,
-	"62, 63. Run masking with wrong query");
+	"63, 64. Run masking with wrong query");
 
 open $inputfile, '>>', "$tempdir/masking_file_2.txt"
   or die "unable to open masking file for writing";
@@ -450,7 +470,28 @@ command_fails_like(
 		"--masking=$tempdir/masking_file_2.txt"
 	],
 	qr/\Qpg_dump: error: Error position (symbol ','): line: 12 pos: 31. Waiting symbol ':'\E/,
-	"64, 65. Run masking with wrong masking file");
+	"65, 66. Run masking with wrong masking file. Unexpected terminal symbol.");
+
+open $inputfile, '>>', "$tempdir/masking_file_3.txt"
+  or die "unable to open masking file for writing";
+print $inputfile
+"schema1
+{
+table1
+    {
+        field1: function     ,
+        field2: wrong function
+    }
+}";
+
+command_fails_like(
+	[
+		'pg_dump', '-p', $port, '-f', $plainfile,
+		"--masking=$tempdir/masking_file_3.txt"
+	],
+	qr/\Qpg_dump: error: Error position (symbol 'f'): line: 6 pos: 24. Syntax error. Relation name can't contain space symbols.\E/,
+	"67, 68. Run masking with wrong masking file. Function name with space.");
+close $inputfile;
 
 done_testing();
 

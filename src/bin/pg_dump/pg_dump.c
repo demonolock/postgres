@@ -323,7 +323,6 @@ static void appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 static char *get_synchronized_snapshot(Archive *fout);
 static void setupDumpWorker(Archive *AH);
 static TableInfo *getRootTableInfo(const TableInfo *tbinfo);
-static int getMaskingPatternFromFile(const char *filename);
 static int createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path);
 
 int
@@ -631,7 +630,7 @@ main(int argc, char **argv)
 				break;
 
             case 13:			/* masking */
-                getMaskingPatternFromFile(optarg);
+                getMaskingPatternFromFile(optarg, masking_map, &masking_func_query_path);
                 if (dopt.dump_inserts == 0) /* Masking works only with inserts */
                     dopt.dump_inserts = DUMP_DEFAULT_ROWS_PER_INSERT;
                 break;
@@ -18236,38 +18235,6 @@ appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 								fout->std_strings);
 	if (!res)
 		pg_log_warning("could not parse %s array", "reloptions");
-}
-
-/**
- * getMaskingPatternFromFile
- *
- * Parse the specified masking file with description of what we need to mask
- * If the filename is "-" then filters will be
- * read from STDIN rather than a file.
- */
-int
-getMaskingPatternFromFile(const char *filename)
-{
-    FILE *fin;
-    int exit_result;
-    if (filename[0]=='\0')
-    {
-        pg_log_error("--masking filename shouldn't be empty");
-        exit_nicely(1);
-    }
-
-    fin = fopen(filename, "r");
-
-    if (fin == NULL)
-    {
-        exit_nicely(1);
-    }
-
-    masking_map = newMaskingMap();
-
-    exit_result = readMaskingPatternFromFile(fin, masking_map, &masking_func_query_path);
-    fclose(fin);
-    return exit_result;
 }
 
 /**
