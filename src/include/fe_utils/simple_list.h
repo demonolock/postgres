@@ -16,8 +16,6 @@
  */
 #ifndef SIMPLE_LIST_H
 #define SIMPLE_LIST_H
-#include "postgres_ext.h"
-#include "c.h"
 
 typedef struct SimpleOidListCell
 {

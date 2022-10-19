@@ -933,9 +933,6 @@ PostgreSQL documentation
             }
         }
         </programlisting>
-
-        Masking using only with <command>INSERT</command> command. You can't use it with
-        <command>COPY</command> command.
        </para>
       </listitem>
      </varlistentry>

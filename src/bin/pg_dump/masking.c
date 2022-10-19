@@ -16,22 +16,27 @@
 #include "masking.h"
 #include "common/logging.h"
 
-#define REL_SIZE 64 /* Length of relation name - 63 bytes (symbols) */
+#define REL_SIZE 65 /* Length of relation name - 63 bytes (symbols) + addition symbol for correct work with option --quote-all-identifiers*/
 #define DEFAULT_NAME "default"
 #define COL_WITH_FUNC_SIZE 3 * REL_SIZE + 3 /* schema_name.function name + '(' + column_name + ') */
 
 char REL_SEP = '.'; /* Relation separator */
 
-MaskingMap *newMaskingMap(void);
-void setMapValue(MaskingMap *map, char *key, char *value);
-void printParsingError(struct MaskingDebugDetails *md, char *message, char current_symbol);
+void concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name);
+extern void extractFuncNameIfPath(char *func_path, SimpleStringList *masking_func_query_path);
+int extractFunctionNameFromQueryFile(char *filename, char *func_name);
+char *getFullRelName(char *schema_name, char *table_name, char *column_name);
+int getMapIndexByKey(MaskingMap *map, char *key);
 bool isTerminal(char c);
 bool isSpace(char c);
-char readNextSymbol(struct MaskingDebugDetails *md, FILE *fin);
+void printParsingError(struct MaskingDebugDetails *md, char *message, char current_symbol);
 char readName(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, int size);
-int getMapIndexByKey(MaskingMap *map, char *key);
-char skipOneLineComment(char c, struct MaskingDebugDetails *md, FILE *fin);
+char readNextSymbol(struct MaskingDebugDetails *md, FILE *fin);
+void removeQuotes(char *func_name);
+char *readWord(FILE *fin, char *word);
+void setMapValue(MaskingMap *map, char *key, char *value);
 char skipMultiLineComment(char c, struct MaskingDebugDetails *md, FILE *fin);
+char skipOneLineComment(char c, struct MaskingDebugDetails *md, FILE *fin);
 
 /* Initialise masking map */
 MaskingMap *
@@ -122,48 +127,48 @@ isSpace(char c)
 char
 skipOneLineComment(char c, struct MaskingDebugDetails *md, FILE *fin)
 {
-  while (md->is_comment)
-  {
-	c = readNextSymbol(md, fin);
-	switch (c)
+	while (md->is_comment)
 	{
-	  case '\n':
-		md->is_comment = false; /* End of a one line comment */
 		c = readNextSymbol(md, fin);
-		break;
-	  case EOF:
-		return c; /* Handling `EOF` outside the function */
-	  default:
-		continue;
+		switch (c)
+		{
+			case '\n':
+				md->is_comment = false; /* End of a one line comment */
+				c = readNextSymbol(md, fin);
+				break;
+			case EOF:
+			  	return c; /* Handling `EOF` outside the function */
+			default:
+			  	continue;
+		}
 	}
-  }
-  return c;
+	return c;
 }
 
 /* Read to the end of a comment */
 char
 skipMultiLineComment(char c, struct MaskingDebugDetails *md, FILE *fin)
 {
-  while (md->is_comment)
-  {
-	c = readNextSymbol(md, fin);
-	switch (c)
+	while (md->is_comment)
 	{
-	  case '*':
 		c = readNextSymbol(md, fin);
-		if (c == '/')
+		switch (c)
 		{
-		  md->is_comment = false; /* End of a multi line comment */
-		  c = readNextSymbol(md, fin);
-		  break;
+			case '*':
+				c = readNextSymbol(md, fin);
+				if (c == '/')
+				{
+					md->is_comment = false; /* End of a multi line comment */
+					c = readNextSymbol(md, fin);
+					break;
+				}
+				continue;
+			case EOF:
+			  return c; /* Handling `EOF` outside the function */
+			default:
+			  continue;
 		}
-		continue;
-	  case EOF:
-		return c; /* Handling `EOF` outside the function */
-	  default:
-		continue;
 	}
-  }
   return c;
 }
 
@@ -190,18 +195,18 @@ readNextSymbol(struct MaskingDebugDetails *md, FILE *fin)
   	/* Skip comment */
   	if (c == '/' && !md->is_comment) /* First slash */
 	{
-	  char next_c = fgetc(fin);
-	  fseek(fin, -1, SEEK_CUR); /* Returning on 1 symbol back for correct line counting */
-	  if (next_c == '/')
-	  {
-		md->is_comment = true;
-		c = skipOneLineComment(c, md, fin);
-	  }
-	  else if (next_c == '*')
-	  {
-		md->is_comment = true;
-		c = skipMultiLineComment(c, md, fin);
-	  }
+		char next_c = fgetc(fin);
+		fseek(fin, -1, SEEK_CUR); /* Returning on 1 symbol back for correct line counting */
+		if (next_c == '/')
+		{
+			md->is_comment = true;
+			c = skipOneLineComment(c, md, fin);
+		}
+		else if (next_c == '*')
+		{
+			md->is_comment = true;
+			c = skipMultiLineComment(c, md, fin);
+		}
 	}
     return c;
 }
@@ -220,23 +225,23 @@ readName(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, int 
             case ' ':
             case '\t':
             case '\n':
-			  if (word_started && !word_finished)
-			  {
-				word_finished = true;
-			  }
-			  break; /* Skip space symbols */
+				if (word_started && !word_finished)
+				{
+				  	word_finished = true;
+				}
+				break; /* Skip space symbols */
             case EOF:
                 return c; /* Handling `EOF` outside the function */
 
             default:
-			  if (word_finished)
-			  {
-				printParsingError(md, "Syntax error. Relation name can't contain space symbols.", c);
-				return c;
-			  }
-			  word_started = true;
-			  strncat(rel_name, &c, 1);
-			  break;
+				if (word_finished)
+				{
+				  	printParsingError(md, "Syntax error. Relation name can't contain space symbols.", c);
+				  	return c;
+				}
+				word_started = true;
+				strncat(rel_name, &c, 1);
+				break;
         }
         c = readNextSymbol(md, fin);
     }
@@ -247,14 +252,8 @@ readName(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, int 
 char *
 getFullRelName(char *schema_name, char *table_name, char *column_name)
 {
-    char *full_name = malloc(REL_SIZE * 3); /* Schema.Table.Field */
-    memset(full_name, 0, REL_SIZE * 3);
-    strcpy(full_name, schema_name);
-    strncat(full_name, &REL_SEP, 1);
-    strcat(full_name, table_name);
-    strncat(full_name, &REL_SEP, 1);
-    strcat(full_name, column_name);
-    return full_name;
+    /* Schema.Table.Column */
+    return psprintf("%s%c%s%c%s", schema_name, REL_SEP, table_name, REL_SEP, column_name);
 }
 
 /**
@@ -264,37 +263,35 @@ getFullRelName(char *schema_name, char *table_name, char *column_name)
  * {
  *      Table1
  *      {
- *            field11 : function_name11
- *          , field12 : function_name12
- *          , field13 : function_name13
+ *            column11 : function_name11
+ *          , column12 : function_name12
+ *          , column13 : function_name13
  *      }
  *
  *      Table2
  *      {
- *            field21 : function_name21
- *          , field22 : function_name22
- *      --This function will be stored in `masking_func_query_path` list, and these functions will be
- *      --created by script from the path 'path_to_file_with_function' - `pg_dump.c:createMaskingFunctions`
- *      --and used for 'field23' - `masking.c:addFunctionToColumn`
- *          , field23 : "path_to_file_with_function"
+ *            column21 : function_name21
+ *          , column22 : function_name22
+ *          , column23 : "path_to_file_with_function/masking.sql"
+ *      // Function 'masking.sql' will be stored in `masking_func_query_path` list, and it will be
+ *      // created by script from the path 'path_to_file_with_function'. See more `pg_dump.c:createMaskingFunctions`
  *      }
  *  }
  *
- *  --Functions inside this block will be used for all schemes
- * default
+ *
+ * default // Functions inside this block will be used for all schemas
  * {
- *      --Functions inside this block will be used for all tables
- *      default
+ *
+ *      default // Functions inside this block will be used for all tables
  *      {
- *          --Function 'for_all_fields' will be used for all fields did not covered by exact functions
- *          default: for_all_fields,
- *          field1: value1,
- *          field2: value2
+ *          default: for_all_columns, // This function will be used for all columns did not covered by exact functions
+ *          column1: value1,
+ *          column2: value2
  *      }
- *      --Functions inside this block will be used for tables with name 'Table' in the all schemes
- *      Table
+ *
+ *      Table // Functions inside this block will be used for tables with name 'Table' in the all schemas
  *      {
- *          field : function_name
+ *          column : function_name
  *      }
  * }
  */
@@ -475,29 +472,23 @@ concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_nam
     /* Default function */
     if (strcmp(function_name, DEFAULT_NAME)==0)
 	{
-	  strcpy(col_with_func, "_masking_function.");
-	  strcat(col_with_func, function_name);
+	  strcpy(col_with_func, psprintf("_masking_function.%s", function_name));
 	}
-	/* Function name already contains schema name. If not, then add the same scheme */
+	/* Function name already contains schema name. If not, then add the same schema */
 	else if (strrchr(function_name, '.') != NULL)
     {
         strcpy(col_with_func, function_name);
     }
     else
     {
-        strcpy(col_with_func, schema_name);
-        strcat(col_with_func, ".");
-        strcat(col_with_func, function_name);
+	  	strcpy(col_with_func, psprintf("%s.%s", schema_name, function_name));
     }
-    strcat(col_with_func, "(");
-    strcat(col_with_func, column_name);
-    strcat(col_with_func, ")");
+    strcpy(col_with_func, psprintf("%s(%s)", col_with_func, column_name));
 }
 
 /*
  * Wrapping columns with functions
  * schema_name.function_name(schema_name.table_name.column_name)
- * return ' ' - if
  */
 char *
 addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map)
@@ -507,15 +498,15 @@ addFunctionToColumn(char *schema_name, char *table_name, char *column_name, Mask
     int index = getMapIndexByKey(map, getFullRelName(schema_name, table_name, column_name));
     if (index == -1) /* If didn't find, try to find function, that used for all schemas */
     {
-        /* Try to find for exact table and column [default.table.field] */
+        /* Try to find for exact table and column [default.table.column] */
         index = getMapIndexByKey(map, getFullRelName(DEFAULT_NAME, table_name, column_name));
         if (index == -1) /* If didn't find, try to find function, that used for all schemas and all tables */
         {
-            /* Try to find for exact column [default.default.field] */
+            /* Try to find for exact column [default.default.column] */
             index = getMapIndexByKey(map, getFullRelName(DEFAULT_NAME, DEFAULT_NAME, column_name));
             if (index == -1) /* If didn't find, try to find function, that used for all schemas and all tables and all columns */
             {
-                /* Try to find function that used for all fields in all schemas and tables [default.default.default] */
+                /* Try to find function that used for all columns in all schemas and tables [default.default.default] */
                 index = getMapIndexByKey(map, getFullRelName(DEFAULT_NAME, DEFAULT_NAME, DEFAULT_NAME));
             }
         }
@@ -570,7 +561,10 @@ readWord(FILE *fin, char *word)
  * the query, but only the start of it. We expecting the pattern:
  * `create [or replace] function {func_name}`
  * If something is wrong we will not use function and leave
- * the field without transforming.
+ * the column without transforming.
+ *
+ * We don't check the full script because we are guessing that this script will be
+ * run by users who has access to run them and will not harm theirs own data
  */
 int
 extractFunctionNameFromQueryFile(char *filename, char *func_name)
@@ -684,34 +678,57 @@ readQueryForCreatingFunction(char *filename)
     return query;
 }
 
+void
+maskingColumns(char *schema_name, char *table_name, char* column_list, MaskingMap *masking_map, PQExpBuffer *q)
+{
+    char *current_column_name = strtok(column_list, " ,()");
+    char *masked_query = malloc(COL_WITH_FUNC_SIZE);
+    char *func_with_column = malloc(COL_WITH_FUNC_SIZE);
+
+    while (current_column_name != NULL)
+    {
+        func_with_column = addFunctionToColumn(schema_name, table_name, current_column_name, masking_map);
+        if (func_with_column[0] != '\0')
+        {
+            strcpy(masked_query, func_with_column);
+        }
+        else
+        {
+            strcpy(masked_query, current_column_name);
+        }
+        current_column_name = strtok(NULL, " ,()");
+        if (current_column_name != NULL)
+            strcat(masked_query, ",");
+        appendPQExpBufferStr(*q, masked_query);
+    }
+    free(masked_query);
+}
+
 /**
  * getMaskingPatternFromFile
  *
- * Parse the specified masking file with description of what we need to mask
- * If the filename is "-" then filters will be
- * read from STDIN rather than a file.
+ * Parse the specified masking file with description of what we need to mask into masking_map
  */
 int
-getMaskingPatternFromFile(const char *filename, MaskingMap *map, SimpleStringList *masking_func_query_path)
+getMaskingPatternFromFile(const char *filename, MaskingMap *masking_map, SimpleStringList *masking_func_query_path)
 {
   FILE *fin;
   int exit_result;
   if (filename[0]=='\0')
   {
 	pg_log_error("--masking filename shouldn't be empty");
-	exit_nicely(1);
+	return 1;
   }
 
   fin = fopen(filename, "r");
 
   if (fin == NULL)
   {
-	exit_nicely(1);
+	pg_log_error("--masking couldn't open file `%s`", filename);
+	return 1;
   }
 
-  map = newMaskingMap();
-
-  exit_result = readMaskingPatternFromFile(fin, map, &masking_func_query_path);
+  exit_result = readMaskingPatternFromFile(fin, masking_map, masking_func_query_path);
   fclose(fin);
   return exit_result;
 }

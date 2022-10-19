@@ -20,7 +20,9 @@
 #include <string.h>
 #include <stdbool.h>
 #include <limits.h>
+#include "fe_utils/option_utils.h"
 #include "fe_utils/simple_list.h"
+#include "dumputils.h"
 
 typedef struct _pair
 {
@@ -57,16 +59,15 @@ MaskingDebugDetails
   enum ParsingState parsing_state;
 };
 
-int getMaskingPatternFromFile(const char *filename, MaskingMap *map, SimpleStringList *masking_func_query_path);
-extern int readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking_func_query_path);
+static SimpleStringList masking_func_query_path = {NULL, NULL}; /* List of path to query with masking functions, that must be created before starting dump */
+static MaskingMap *masking_map; /* Map of columns and functions for data masking */
+
 char *addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map);
-char *getFullRelName(char *schema_name, char *table_name, char *column_name);
-void concatFunctionAndColumn(char *col_with_func, char *schema_name, char *column_name, char *function_name);
-char *readQueryForCreatingFunction(char *filename);
-extern void extractFuncNameIfPath(char *func_path, SimpleStringList *masking_func_query_path);
-void removeQuotes(char *func_name);
-char *readWord(FILE *fin, char *word);
-int extractFunctionNameFromQueryFile(char *filename, char *func_name);
 char *default_functions(void);
+int getMaskingPatternFromFile(const char *filename, MaskingMap *masking_map, SimpleStringList *masking_func_query_path);
+void maskingColumns(char *schema_name, char *table_name, char* column_list, MaskingMap *masking_map, PQExpBuffer *q);
+MaskingMap *newMaskingMap(void);
+extern int readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking_func_query_path);
+char *readQueryForCreatingFunction(char *filename);
 
 #endif                            /* MASKING_H */
