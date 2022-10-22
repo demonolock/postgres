@@ -67,6 +67,8 @@
 #include "pg_dump.h"
 #include "storage/block.h"
 
+#include "masking.c"
+
 typedef struct
 {
 	Oid			roleoid;		/* role's OID */
@@ -413,6 +415,8 @@ main(int argc, char **argv)
 		{"on-conflict-do-nothing", no_argument, &dopt.do_nothing, 1},
 		{"rows-per-insert", required_argument, NULL, 10},
 		{"include-foreign-data", required_argument, NULL, 11},
+		{"mask-columns", required_argument, NULL, 12},
+		{"mask-function", required_argument, NULL, 13},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -623,6 +627,14 @@ main(int argc, char **argv)
 										  optarg);
 				break;
 
+			case 12:			/* columns for masking */
+				simple_string_list_append(&mask_columns_list, optarg);
+				break;
+
+			case 13:			/* function for masking - can be SQL function from .sql file,
+								   declared in CLI or declared in DB*/
+				simple_string_list_append(&mask_func_list, optarg);
+				break;
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -657,6 +669,8 @@ main(int argc, char **argv)
 	 */
 	if (dopt.binary_upgrade)
 		dopt.sequence_data = 1;
+
+	formMaskingLists(&dopt);
 
 	if (dopt.dataOnly && dopt.schemaOnly)
 		pg_fatal("options -s/--schema-only and -a/--data-only cannot be used together");
@@ -1034,6 +1048,11 @@ help(const char *progname)
 			 "                               servers matching PATTERN\n"));
 	printf(_("  --inserts                    dump data as INSERT commands, rather than COPY\n"));
 	printf(_("  --load-via-partition-root    load partitions via the root table\n"));
+	printf(_("  --mask-columns               names of columns that will be masked \n"
+			 "                               if table name is not specified, mask in all tables\n"));
+	printf(_("  --mask-function              name of function that will mask corresponding columns\n"
+			 "                               can specify schema in which function is stored\n"
+			 "								 can use filepath to file with function arguments\n"));
 	printf(_("  --no-comments                do not dump comments\n"));
 	printf(_("  --no-publications            do not dump publications\n"));
 	printf(_("  --no-security-labels         do not dump security label assignments\n"));
@@ -1991,17 +2010,26 @@ dumpTableData_copy(Archive *fout, const void *dcontext)
 
 	/*
 	 * Use COPY (SELECT ...) TO when dumping a foreign table's data, and when
-	 * a filter condition was specified.  For other cases a simple COPY
-	 * suffices.
+	 * a filter condition was specified. OR masking of some columns is needed
+	 * For other cases a simple COPY suffices.
 	 */
-	if (tdinfo->filtercond || tbinfo->relkind == RELKIND_FOREIGN_TABLE)
+	if (tdinfo->filtercond || tbinfo->relkind == RELKIND_FOREIGN_TABLE
+		|| mask_column_info_list.head)
 	{
 		appendPQExpBufferStr(q, "COPY (SELECT ");
 		/* klugery to get rid of parens in column list */
 		if (strlen(column_list) > 2)
 		{
-			appendPQExpBufferStr(q, column_list + 1);
-			q->data[q->len - 1] = ' ';
+			if (mask_column_info_list.head != NULL)
+			{
+				maskColumns(tbinfo, pg_strdup(column_list), &q, NULL);
+				appendPQExpBufferStr(q, " ");
+			}
+			else
+			{
+				appendPQExpBufferStr(q, column_list + 1);
+				q->data[q->len - 1] = ' ';
+			}
 		}
 		else
 			appendPQExpBufferStr(q, "* ");
@@ -2132,6 +2160,10 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 				i;
 	int			rows_per_statement = dopt->dump_inserts;
 	int			rows_this_statement = 0;
+	/*for masking*/
+
+	SimpleStringList column_names = {NULL, NULL};
+	SimpleStringListCell *current_column;
 
 	/*
 	 * If we're going to emit INSERTs with column names, the most efficient
@@ -2152,9 +2184,25 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 		if (nfields > 0)
 			appendPQExpBufferStr(q, ", ");
 		if (tbinfo->attgenerated[i])
+		{
 			appendPQExpBufferStr(q, "NULL");
+			simple_string_list_append(&column_names, "NULL");
+		}
 		else
-			appendPQExpBufferStr(q, fmtId(tbinfo->attnames[i]));
+		{
+			if (mask_column_info_list.head != NULL)
+			{
+				/*taking columns that should be masked */
+				/*char* copy_column_list = pg_strdup(tbinfo->attnames[i]);
+				char* current_column_name = strtok(copy_column_list, " ,()");*/
+				maskColumns(tbinfo, tbinfo->attnames[i], &q, &column_names);
+			}
+			else
+			{
+				appendPQExpBufferStr(q, fmtId(tbinfo->attnames[i]));
+				simple_string_list_append(&column_names, fmtId(tbinfo->attnames[i]));
+			}
+		}
 		attgenerated[nfields] = tbinfo->attgenerated[i];
 		nfields++;
 	}
@@ -2215,13 +2263,14 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 				/* append the list of column names if required */
 				if (dopt->column_inserts)
 				{
+					current_column = column_names.head;
 					appendPQExpBufferChar(insertStmt, '(');
 					for (int field = 0; field < nfields; field++)
 					{
 						if (field > 0)
 							appendPQExpBufferStr(insertStmt, ", ");
-						appendPQExpBufferStr(insertStmt,
-											 fmtId(PQfname(res, field)));
+						appendPQExpBufferStr(insertStmt, current_column->val);
+						current_column = current_column->next;
 					}
 					appendPQExpBufferStr(insertStmt, ") ");
 				}
