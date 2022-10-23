@@ -29,6 +29,7 @@
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/tzparser.h"
 
@@ -4782,8 +4783,8 @@ TemporalSimplify(int32 max_precis, Node *node)
  * to create the final array of timezone tokens.  The argument array
  * is already sorted in name order.
  *
- * The result is a TimeZoneAbbrevTable (which must be a single malloc'd chunk)
- * or NULL on malloc failure.  No other error conditions are defined.
+ * The result is a TimeZoneAbbrevTable (which must be a single guc_malloc'd
+ * chunk) or NULL on alloc failure.  No other error conditions are defined.
  */
 TimeZoneAbbrevTable *
 ConvertTimeZoneAbbrevs(struct tzEntry *abbrevs, int n)
@@ -4812,7 +4813,7 @@ ConvertTimeZoneAbbrevs(struct tzEntry *abbrevs, int n)
 	}
 
 	/* Alloc the result ... */
-	tbl = malloc(tbl_size);
+	tbl = guc_malloc(LOG, tbl_size);
 	if (!tbl)
 		return NULL;
 
@@ -5057,7 +5058,7 @@ pg_timezone_names(PG_FUNCTION_ARGS)
 	Interval   *resInterval;
 	struct pg_itm_in itm_in;
 
-	SetSingleFuncCall(fcinfo, 0);
+	InitMaterializedSRF(fcinfo, 0);
 
 	/* initialize timezone scanning code */
 	tzenum = pg_tzenumerate_start();
