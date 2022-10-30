@@ -1,11 +1,11 @@
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2022, PostgreSQL Global Development Group
 
 use strict;
 use warnings;
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
-use Test::More tests => 84;
+use Test::More tests => 85;
 
 my $tempdir = PostgreSQL::Test::Utils::tempdir;
 my $inputfile;

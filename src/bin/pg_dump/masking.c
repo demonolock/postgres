@@ -16,7 +16,7 @@
 #include "masking.h"
 #include "common/logging.h"
 
-#define REL_SIZE 65 /* Length of relation name - 63 bytes (symbols) + addition symbol for correct work with option --quote-all-identifiers*/
+#define REL_SIZE 64 /* Length of relation name - 63 bytes (symbols) + addition symbol for correct work with option --quote-all-identifiers*/
 #define DEFAULT_NAME "default"
 #define COL_WITH_FUNC_SIZE 3 * REL_SIZE + 3 /* schema_name.function name + '(' + column_name + ') */
 
@@ -42,11 +42,10 @@ char skipOneLineComment(char c, struct MaskingDebugDetails *md, FILE *fin);
 MaskingMap *
 newMaskingMap()
 {
-    MaskingMap *map = malloc(sizeof(MaskingMap));
+    MaskingMap *map = pg_malloc(sizeof(MaskingMap));
     map->size = 0;
     map->capacity = 8;
-    map->data = malloc(sizeof(Pair) * map->capacity);
-    memset(map->data, 0, sizeof(Pair) * map->capacity);
+    map->data = pg_malloc0(sizeof(Pair) * map->capacity);
     return map;
 }
 
@@ -77,20 +76,18 @@ setMapValue(MaskingMap *map, char *key, char *value)
         if (index != -1) /* Already have key in map */
         {
             free(map->data[index]->value);
-            map->data[index]->value = malloc(strlen(value) + 1);
+            map->data[index]->value = pg_malloc(strlen(value) + 1);
             strcpy(map->data[index]->value, value);
         }
         else
         {
-            Pair *pair = malloc(sizeof(Pair));
-            pair->key = malloc(strlen(key) + 1);
-            pair->value = malloc(strlen(value) + 1);
-            memset(pair->key, 0, strlen(key));
-            memset(pair->value, 0, strlen(value));
+            Pair *pair = pg_malloc(sizeof(Pair));
+            pair->key = pg_malloc0(strlen(key) + 1);
+            pair->value = pg_malloc0(strlen(value) + 1);
             strcpy(pair->key, key);
             strcpy(pair->value, value);
 
-            map->data[map->size] = malloc(sizeof(Pair));
+            map->data[map->size] = pg_malloc(sizeof(Pair));
             *map->data[map->size] = *pair;
             map->size++;
             free(pair);
@@ -98,7 +95,7 @@ setMapValue(MaskingMap *map, char *key, char *value)
         if (map->size == map->capacity) /* Increase capacity */
         {
             map->capacity *= 1.5;
-            map->data = realloc(map->data, sizeof(Pair) * map->capacity);
+            map->data = pg_realloc(map->data, sizeof(Pair) * map->capacity);
         }
     }
     free(key);
@@ -315,10 +312,10 @@ readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking
     md.parsing_state = SCHEMA_NAME;
     exit_status = EXIT_SUCCESS;
 
-    schema_name = malloc(REL_SIZE);
-    table_name = malloc(REL_SIZE);
-    column_name = malloc(REL_SIZE);
-    func_name = malloc(PATH_MAX + 1); /* We can get function name or path to file with a creating function query */
+    schema_name = pg_malloc(REL_SIZE);
+    table_name = pg_malloc(REL_SIZE);
+    column_name = pg_malloc(REL_SIZE);
+    func_name = pg_malloc(PATH_MAX + 1); /* We can get function name or path to file with a creating function query */
 
     brace_counter = 0;
     close_brace_counter = 0;
@@ -511,8 +508,7 @@ addFunctionToColumn(char *schema_name, char *table_name, char *column_name, Mask
             }
         }
     }
-    col_with_func = malloc(COL_WITH_FUNC_SIZE);
-    memset(col_with_func, 0, COL_WITH_FUNC_SIZE);
+    col_with_func = pg_malloc0(COL_WITH_FUNC_SIZE);
     if (index != -1)
     {
         char *function_name = map->data[index]->value;
@@ -525,7 +521,7 @@ addFunctionToColumn(char *schema_name, char *table_name, char *column_name, Mask
 void
 removeQuotes(char *func_name)
 {
-    char *new_func_name = malloc(PATH_MAX + 1);
+    char *new_func_name = pg_malloc(PATH_MAX + 1);
     strncpy(new_func_name, func_name + 1, strlen(func_name) - 2);
     memset(func_name, 0, PATH_MAX);
     strcpy(func_name, new_func_name);
@@ -584,8 +580,7 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name)
     }
     else
     {
-        word = malloc(REL_SIZE);
-        memset(word, 0, REL_SIZE);
+        word = pg_malloc0(REL_SIZE);
         if (strcmp(readWord(fin, word), "create") == 0) /* reading 'create' */
         {
             if (strcmp(readWord(fin, word), "or") == 0) /* reading 'or' | 'function' */
@@ -636,7 +631,7 @@ extractFuncNameIfPath(char *func_path, SimpleStringList *masking_func_query_path
     char *func_name;
     if (func_path[0] == '"')
     {
-        func_name = malloc(REL_SIZE);
+        func_name = pg_malloc(REL_SIZE);
         removeQuotes(func_path);
         if (extractFunctionNameFromQueryFile(func_path, func_name) != 0) /* Read function name from query and store in func_name */
         {
@@ -657,8 +652,7 @@ readQueryForCreatingFunction(char *filename)
     FILE *fin;
     char *query;
     long fsize;
-    query = malloc(sizeof(char));
-    memset(query, 0, sizeof(char));
+    query = pg_malloc0(sizeof(char));
     fin = fopen(filename, "r");
     if (fin != NULL)
     {
@@ -682,8 +676,8 @@ void
 maskingColumns(char *schema_name, char *table_name, char* column_list, MaskingMap *masking_map, PQExpBuffer *q)
 {
     char *current_column_name = strtok(column_list, " ,()");
-    char *masked_query = malloc(COL_WITH_FUNC_SIZE);
-    char *func_with_column = malloc(COL_WITH_FUNC_SIZE);
+    char *masked_query = pg_malloc(COL_WITH_FUNC_SIZE);
+    char *func_with_column = pg_malloc(COL_WITH_FUNC_SIZE);
 
     while (current_column_name != NULL)
     {

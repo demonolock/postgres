@@ -914,7 +914,7 @@ PostgreSQL documentation
             }
         }
 
-        /* Functions inside this block will be used for all schemes */
+        /* Functions inside this block will be used for all schemas */
         default {
             /* Functions inside this block will be used for all tables */
             default {
@@ -927,7 +927,7 @@ PostgreSQL documentation
             }
 
             /* Functions inside this block will be used for tables with name 'Table'
-               in the all schemes */
+               in the all schemas */
             Table {
                    field : function_name
             }
