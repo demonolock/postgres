@@ -19,6 +19,7 @@
 #define REL_SIZE 64 /* Length of relation name - 63 bytes (symbols) + addition symbol for correct work with option --quote-all-identifiers*/
 #define DEFAULT_NAME "default"
 #define COL_WITH_FUNC_SIZE 3 * REL_SIZE + 3 /* schema_name.function name + '(' + column_name + ') */
+#define CAPACITY_MULTIPLIER 2
 
 char REL_SEP = '.'; /* Relation separator */
 
@@ -37,6 +38,8 @@ char *readWord(FILE *fin, char *word);
 void setMapValue(MaskingMap *map, char *key, char *value);
 char skipMultiLineComment(char c, struct MaskingDebugDetails *md, FILE *fin);
 char skipOneLineComment(char c, struct MaskingDebugDetails *md, FILE *fin);
+void* allocate_memory(size_t size);
+char* copy_string(const char *source);
 
 /* Initialise masking map */
 MaskingMap *
@@ -67,44 +70,60 @@ getMapIndexByKey(MaskingMap *map, char *key)
 /*
  * Add value to map or rewrite, if key already exists
  */
-void
-setMapValue(MaskingMap *map, char *key, char *value)
-{
-    if (key != NULL)
-    {
-        int index = getMapIndexByKey(map, key);
-        if (index != -1) /* Already have key in map */
-        {
-            free(map->data[index]->value);
-            map->data[index]->value = pg_malloc(strlen(value) + 1);
-            strcpy(map->data[index]->value, value);
-        }
-        else
-        {
-            Pair *pair = pg_malloc(sizeof(Pair));
-            pair->key = pg_malloc0(strlen(key) + 1);
-            pair->value = pg_malloc0(strlen(value) + 1);
-            strcpy(pair->key, key);
-            strcpy(pair->value, value);
+void*
+allocate_memory(size_t size) {
+    void *ptr;
+    ptr = pg_malloc(size);
+    if (!ptr) {
+        pg_log_error("Could not allocate memory: error code");
+    }
+    return ptr;
+}
 
-            map->data[map->size] = pg_malloc(sizeof(Pair));
-            *map->data[map->size] = *pair;
-            map->size++;
-            free(pair);
+char*
+copy_string(const char *source) {
+    char *dest;
+    if (!source) return NULL;
+    dest = allocate_memory(strlen(source) + 1);
+    if (dest) strcpy(dest, source);
+    return dest;
+}
+
+void
+setMapValue(MaskingMap *map, char *key, char *value) {
+    if (key) {
+        int index = getMapIndexByKey(map, key);
+        if (index != -1) { /* Key already exists in map */
+            free(map->data[index]->value);
+            map->data[index]->value = copy_string(value);
         }
-        if (map->size == map->capacity) /* Increase capacity */
-        {
-            map->capacity *= 1.5;
-            map->data = pg_realloc(map->data, sizeof(Pair) * map->capacity);
+        else {
+            if (map->size == map->capacity) { /* Increase capacity */
+                map->capacity *= CAPACITY_MULTIPLIER;
+                map->data = pg_realloc(map->data, sizeof(Pair) * map->capacity);
+                if (!map->data) {
+                    pg_log_error("setMapValue: could not allocate memory for key or value: error code");
+                    return;
+                }
+            }
+
+            map->data[map->size] = allocate_memory(sizeof(Pair));
+            if (!map->data[map->size]) return;
+
+            map->data[map->size]->key = copy_string(key);
+            map->data[map->size]->value = copy_string(value);
+
+            if (!map->data[map->size]->key || !map->data[map->size]->value) return;
+
+            map->size++;
         }
     }
-    free(key);
 }
 
 void
 printParsingError(struct MaskingDebugDetails *md, char *message, char current_symbol)
 {
-    pg_log_error("Error position (symbol '%c'): line: %d pos: %d. %s\n", current_symbol, md->line_num, md->symbol_num,
+    pg_log_error("Error position (symbol '%c'): line: %d pos: %d. %s.", current_symbol, md->line_num, md->symbol_num,
            message);
 }
 
@@ -120,53 +139,52 @@ isSpace(char c)
     return c == ' ' || c == '\t' || c == '\n' || c == EOF;
 }
 
-/* Read to the end of a comment */
 char
 skipOneLineComment(char c, struct MaskingDebugDetails *md, FILE *fin)
 {
-	while (md->is_comment)
-	{
-		c = readNextSymbol(md, fin);
-		switch (c)
-		{
-			case '\n':
-				md->is_comment = false; /* End of a one line comment */
-				c = readNextSymbol(md, fin);
-				break;
-			case EOF:
-			  	return c; /* Handling `EOF` outside the function */
-			default:
-			  	continue;
-		}
-	}
-	return c;
+    while (md->is_comment)
+    {
+        c = readNextSymbol(md, fin);
+        switch (c)
+        {
+            case '\n':
+                md->is_comment = false; /* End of a one line comment */
+                c = readNextSymbol(md, fin);
+                break;
+            case EOF:
+                return c; /* Handling `EOF` outside the function */
+            default:
+                continue;
+        }
+    }
+    return c;
 }
 
 /* Read to the end of a comment */
 char
 skipMultiLineComment(char c, struct MaskingDebugDetails *md, FILE *fin)
 {
-	while (md->is_comment)
-	{
-		c = readNextSymbol(md, fin);
-		switch (c)
-		{
-			case '*':
-				c = readNextSymbol(md, fin);
-				if (c == '/')
-				{
-					md->is_comment = false; /* End of a multi line comment */
-					c = readNextSymbol(md, fin);
-					break;
-				}
-				continue;
-			case EOF:
-			  return c; /* Handling `EOF` outside the function */
-			default:
-			  continue;
-		}
-	}
-  return c;
+    while (md->is_comment)
+    {
+        c = readNextSymbol(md, fin);
+        switch (c)
+        {
+            case '*':
+                c = readNextSymbol(md, fin);
+                if (c == '/')
+                {
+                    md->is_comment = false; /* End of a multi line comment */
+                    c = readNextSymbol(md, fin);
+                    break;
+                }
+                continue;
+            case EOF:
+                return c; /* Handling `EOF` outside the function */
+            default:
+                continue;
+        }
+    }
+    return c;
 }
 
 /*
@@ -179,7 +197,7 @@ char
 readNextSymbol(struct MaskingDebugDetails *md, FILE *fin)
 {
     char c = fgetc(fin);
-  	/* Count lines and columns */
+    /* Count lines and columns */
     if (c == '\n')
     {
         md->line_num++;
@@ -189,68 +207,79 @@ readNextSymbol(struct MaskingDebugDetails *md, FILE *fin)
     {
         md->symbol_num++;
     }
-  	/* Skip comment */
-  	if (c == '/' && !md->is_comment) /* First slash */
-	{
-		char next_c = fgetc(fin);
-		fseek(fin, -1, SEEK_CUR); /* Returning on 1 symbol back for correct line counting */
-		if (next_c == '/')
-		{
-			md->is_comment = true;
-			c = skipOneLineComment(c, md, fin);
-		}
-		else if (next_c == '*')
-		{
-			md->is_comment = true;
-			c = skipMultiLineComment(c, md, fin);
-		}
-	}
+    /* Skip comment */
+    if (c == '/' && !md->is_comment) /* First slash */
+    {
+        char next_c = fgetc(fin);
+        fseek(fin, -1, SEEK_CUR); /* Returning on 1 symbol back for correct line counting */
+        if (next_c == '/')
+        {
+            md->is_comment = true;
+            c = skipOneLineComment(c, md, fin);
+        }
+        else if (next_c == '*')
+        {
+            md->is_comment = true;
+            c = skipMultiLineComment(c, md, fin);
+        }
+    }
     return c;
 }
 
-/* Read relation name */
+
+/* Concat schema name, table name and column name */
+char *
+getFullRelName(char *schema_name, char *table_name, char *column_name)
+{
+    /* Ensure none of the input pointers are NULL */
+    if (schema_name == NULL || table_name == NULL || column_name == NULL)
+    {
+        pg_log_error("Error: one or more input pointers are NULL.");
+        return NULL;
+    }
+
+    /* Schema.Table.Column */
+    return psprintf("%s%c%s%c%s", schema_name, REL_SEP, table_name, REL_SEP, column_name);
+}
+
 char
 readName(char *rel_name, char c, struct MaskingDebugDetails *md, FILE *fin, int size)
 {
-  	bool word_started = false;
-  	bool word_finished = false;
-    memset(rel_name, 0,  size);
-    while (!isTerminal(c))
+    bool word_started = false;
+    bool word_finished = false;
+    char single_char_str[2] = "\0\0";
+    int current_length = 0;
+    memset(rel_name, 0, size);
+
+    while (!isTerminal(c) && current_length < size - 1)
     {
         switch (c)
         {
             case ' ':
             case '\t':
             case '\n':
-				if (word_started && !word_finished)
-				{
-				  	word_finished = true;
-				}
-				break; /* Skip space symbols */
+                if (word_started && !word_finished)
+                {
+                    word_finished = true;
+                }
+                break;
             case EOF:
-                return c; /* Handling `EOF` outside the function */
-
+                return c;
             default:
-				if (word_finished)
-				{
-				  	printParsingError(md, "Syntax error. Relation name can't contain space symbols.", c);
-				  	return c;
-				}
-				word_started = true;
-				strncat(rel_name, &c, 1);
-				break;
+                if (word_finished)
+                {
+                    printParsingError(md, "Syntax error. Relation name can't contain space symbols.", c);
+                    return c;
+                }
+                word_started = true;
+                single_char_str[0] = c;
+                strncat(rel_name, single_char_str, 1);
+                current_length++;
+                break;
         }
         c = readNextSymbol(md, fin);
     }
     return c;
-}
-
-/* Concat schema name, table name and column name */
-char *
-getFullRelName(char *schema_name, char *table_name, char *column_name)
-{
-    /* Schema.Table.Column */
-    return psprintf("%s%c%s%c%s", schema_name, REL_SEP, table_name, REL_SEP, column_name);
 }
 
 /**
@@ -574,9 +603,9 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name)
     {
         fin = fopen(filename, "r");
     }
-    if (fin == NULL)
-    {
-        pg_log_warning("Problem with file \'%s\"", filename);
+    if (fin == NULL) {
+        pg_log_warning("Problem with file \'%s\".", filename);
+        return 1;
     }
     else
     {
@@ -587,7 +616,7 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name)
             {
                 if (strcmp(readWord(fin, word), "replace") != 0) /* reading 'replace' */
                 {
-                    pg_log_warning("Keyword 'replace' was expected, but found '%s'. Check query for creating a function '%s'.\n",
+                    pg_log_warning("Keyword 'replace' was expected, but found '%s'. Check query for creating a function '%s'.",
                            word, filename);
                     goto free_resources;
                 }
@@ -599,7 +628,7 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name)
         }
         else
         {
-            pg_log_warning("Keyword 'create' was expected, but found '%s'. Check query for creating a function '%s'.\n", word,
+            pg_log_warning("Keyword 'create' was expected, but found '%s'. Check query for creating a function '%s'.", word,
                    filename);
             goto free_resources;
         }
@@ -609,7 +638,7 @@ extractFunctionNameFromQueryFile(char *filename, char *func_name)
         }
         else
         {
-            pg_log_warning("Keyword 'function' was expected, but found '%s'. Check query for creating a function '%s'.\n", word,
+            pg_log_warning("Keyword 'function' was expected, but found '%s'. Check query for creating a function '%s'.", word,
                    filename);
             goto free_resources;
         }
@@ -654,21 +683,22 @@ readQueryForCreatingFunction(char *filename)
     long fsize;
     query = pg_malloc0(sizeof(char));
     fin = fopen(filename, "r");
-    if (fin != NULL)
+    if (fin == NULL)
     {
-        fseek(fin, 0L, SEEK_END);
-        fsize = ftell(fin);
-        fseek(fin, 0L, SEEK_SET);
-
-        query = (char *) calloc(fsize + 1, sizeof(char));
-
-        fsize = (int) fread(query, sizeof(char), fsize, fin);
-        if (fsize==0)
-        {
-            pg_log_error("File is empty `%s`", filename);
-        }
-        fclose(fin);
+        pg_log_warning("Problem with file \'%s\".", filename);
+        return query;
     }
+
+    fseek(fin, 0, SEEK_END);
+    fsize = ftell(fin);
+    fseek(fin, 0, SEEK_SET);  /* same as rewind(fin); */
+
+    query = realloc(query, sizeof(char) * (fsize + 1));
+    fread(query, 1, fsize, fin);
+
+    fclose(fin);
+
+    query[fsize] = 0;
     return query;
 }
 

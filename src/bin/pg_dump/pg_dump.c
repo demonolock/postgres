@@ -18265,7 +18265,7 @@ createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path)
         query = readQueryForCreatingFunction(filename);
         if (query[0]=='\0')
         {
-            pg_log_warning("Query is empty. Check file `%s`", filename);
+            pg_log_warning("Query is empty. Check file `%s`.", filename);
             exit_result++;
         }
         else
@@ -18275,7 +18275,7 @@ createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path)
 
         if (!result)
         {
-            pg_log_warning("Failed execution of query from file \"%s\"", filename);
+            pg_log_warning("Failed execution of query from file \"%s\".", filename);
         }
 	  	free(query);
     }

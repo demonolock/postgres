@@ -24,6 +24,9 @@
 #include "fe_utils/simple_list.h"
 #include "dumputils.h"
 
+/* Define a struct to manage our buffer */
+#define BF_BUFFER_SIZE 1024
+
 typedef struct _pair
 {
   char *key;
@@ -53,11 +56,21 @@ ParsingState
 struct
 MaskingDebugDetails
 {
-  int line_num;
-  int symbol_num;
-  bool is_comment;
-  enum ParsingState parsing_state;
+    int line_num;
+    int symbol_num;
+    bool is_comment;
+    enum ParsingState parsing_state;
 };
+
+typedef struct {
+    char *schema_name;
+    char *table_name;
+    char *column_name;
+    char *func_name;
+    bool skip_reading;
+    char c;
+    struct MaskingDebugDetails md;
+} ParserState;
 
 char *addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map);
 char *default_functions(void);
