@@ -59,7 +59,6 @@
 #include "dumputils.h"
 #include "fe_utils/option_utils.h"
 #include "fe_utils/string_utils.h"
-#include "fe_utils/query_utils.h"
 #include "getopt_long.h"
 #include "libpq/libpq-fs.h"
 #include "masking.h"
@@ -129,9 +128,6 @@ static SimpleOidList foreign_servers_include_oids = {NULL, NULL};
 
 static SimpleStringList extension_include_patterns = {NULL, NULL};
 static SimpleOidList extension_include_oids = {NULL, NULL};
-/* List of path to query with masking functions, that must be created before starting dump */
-static SimpleStringList masking_func_query_path = {NULL, NULL};
-static MaskingMap *masking_map; /* Map of columns and functions for data masking */
 
 static const CatalogId nilCatalogId = {0, 0};
 
@@ -323,7 +319,6 @@ static void appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 static char *get_synchronized_snapshot(Archive *fout);
 static void setupDumpWorker(Archive *AH);
 static TableInfo *getRootTableInfo(const TableInfo *tbinfo);
-static int createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path);
 
 int
 main(int argc, char **argv)
@@ -402,8 +397,8 @@ main(int argc, char **argv)
 		{"no-tablespaces", no_argument, &dopt.outputNoTablespaces, 1},
 		{"quote-all-identifiers", no_argument, &quote_all_identifiers, 1},
 		{"load-via-partition-root", no_argument, &dopt.load_via_partition_root, 1},
-        {"masking", required_argument, NULL, 13},
-        {"role", required_argument, NULL, 3},
+		{"masking", required_argument, NULL, 13},
+		{"role", required_argument, NULL, 3},
 		{"section", required_argument, NULL, 5},
 		{"serializable-deferrable", no_argument, &dopt.serializable_deferrable, 1},
 		{"snapshot", required_argument, NULL, 6},
@@ -420,7 +415,7 @@ main(int argc, char **argv)
 		{"rows-per-insert", required_argument, NULL, 10},
 		{"include-foreign-data", required_argument, NULL, 11},
 
-        {NULL, 0, NULL, 0}
+		{NULL, 0, NULL, 0}
 	};
 
 	pg_logging_init(argv[0]);
@@ -629,10 +624,9 @@ main(int argc, char **argv)
 										  optarg);
 				break;
 
-            case 13:			/* masking */
-				masking_map = newMaskingMap();
-			    /* If reading of masking patterns was unsuccessful, then exit */
-				if (getMaskingPatternFromFile(optarg, masking_map, &masking_func_query_path) != 0)
+			case 13:			/* masking */
+				dopt.masking = parseMaskingConfig(optarg);
+				if (!dopt.masking)
 					exit_nicely(1);
 				break;
 
@@ -756,10 +750,6 @@ main(int argc, char **argv)
 	 * death.
 	 */
 	ConnectDatabase(fout, &dopt.cparams, false);
-    if (masking_map) /* If run with --masking option */
-    {
-        createMaskingFunctions(fout, &masking_func_query_path);
-    }
 	setup_connection(fout, dumpencoding, dumpsnapshot, use_role);
 
 	/*
@@ -1051,8 +1041,8 @@ help(const char *progname)
 			 "                               servers matching PATTERN\n"));
 	printf(_("  --inserts                    dump data as INSERT commands, rather than COPY\n"));
 	printf(_("  --load-via-partition-root    load partitions via the root table\n"));
+	printf(_("  --masking=FILENAME           mask column data using rules from FILENAME\n"));
 	printf(_("  --no-comments                do not dump comments\n"));
-    printf(_("  --masking    				 data masking, helps with hiding sensitive data\n"));
 	printf(_("  --no-publications            do not dump publications\n"));
 	printf(_("  --no-security-labels         do not dump security label assignments\n"));
 	printf(_("  --no-subscriptions           do not dump subscriptions\n"));
@@ -2009,40 +1999,78 @@ dumpTableData_copy(Archive *fout, const void *dcontext)
 
 	/*
 	 * Use COPY (SELECT ...) TO when dumping a foreign table's data, and when
-	 * a filter (tdinfo->filtercond) or masking (masking_map) condition was specified.
-	 * For other cases a simple COPY suffices.
+	 * a filter condition or masking was specified.  For other cases a simple
+	 * COPY suffices.
 	 */
-	if (tdinfo->filtercond || tbinfo->relkind == RELKIND_FOREIGN_TABLE || masking_map)
+	if (tdinfo->filtercond || tbinfo->relkind == RELKIND_FOREIGN_TABLE
+		|| fout->dopt->masking)
 	{
 		appendPQExpBufferStr(q, "COPY (SELECT ");
-		/* klugery to get rid of parens in column list */
-		if (strlen(column_list) > 2)
+
+		if (fout->dopt->masking)
 		{
-			if (masking_map) /* If run with --masking option */
+			/*
+			 * Build column list with inline masking expressions.  Iterate
+			 * the real attribute array so we get proper names and types.
+			 */
+			int		nfields = 0;
+			int		j;
+
+			for (j = 0; j < tbinfo->numatts; j++)
 			{
-                maskingColumns(tbinfo->dobj.namespace->dobj.name, tbinfo->dobj.name, pg_strdup(column_list), masking_map, &q);
-                appendPQExpBufferStr(q, " ");
+				char   *expr;
+
+				if (tbinfo->attisdropped[j])
+					continue;
+				if (tbinfo->attgenerated[j])
+					continue;
+				if (nfields > 0)
+					appendPQExpBufferStr(q, ", ");
+
+				expr = getMaskingExpression(fout->dopt->masking,
+										   tbinfo->dobj.namespace->dobj.name,
+										   tbinfo->dobj.name,
+										   tbinfo->attnames[j],
+										   tbinfo->atttypnames[j]);
+				if (expr)
+				{
+					appendPQExpBuffer(q, "%s AS %s",
+									  expr, fmtId(tbinfo->attnames[j]));
+					pg_free(expr);
+				}
+				else
+					appendPQExpBufferStr(q, fmtId(tbinfo->attnames[j]));
+
+				nfields++;
 			}
+			if (nfields == 0)
+				appendPQExpBufferStr(q, "* ");
 			else
+				appendPQExpBufferChar(q, ' ');
+		}
+		else
+		{
+			/* klugery to get rid of parens in column list */
+			if (strlen(column_list) > 2)
 			{
 				appendPQExpBufferStr(q, column_list + 1);
 				q->data[q->len - 1] = ' ';
 			}
+			else
+				appendPQExpBufferStr(q, "* ");
 		}
-		else
-			appendPQExpBufferStr(q, "* ");
 
 		appendPQExpBuffer(q, "FROM %s %s) TO stdout;",
 						  fmtQualifiedDumpable(tbinfo),
 						  tdinfo->filtercond ? tdinfo->filtercond : "");
 	}
-    else
-    {
-        appendPQExpBuffer(q, "COPY %s %s TO stdout;",
-                          fmtQualifiedDumpable(tbinfo),
-                          column_list);
-    }
-    res = ExecuteSqlQuery(fout, q->data, PGRES_COPY_OUT);
+	else
+	{
+		appendPQExpBuffer(q, "COPY %s %s TO stdout;",
+						  fmtQualifiedDumpable(tbinfo),
+						  column_list);
+	}
+	res = ExecuteSqlQuery(fout, q->data, PGRES_COPY_OUT);
 	PQclear(res);
 	destroyPQExpBuffer(clistBuf);
 
@@ -2179,24 +2207,25 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 			appendPQExpBufferStr(q, ", ");
 		if (tbinfo->attgenerated[i])
 			appendPQExpBufferStr(q, "NULL");
-		else if (masking_map) /* If run with --masking option */
+		else if (dopt->masking)
 		{
-			char *column_with_fun;
-			column_with_fun=addFunctionToColumn(tbinfo->dobj.namespace->dobj.name, tbinfo->dobj.name,
-												tbinfo->attnames[i], masking_map);
+			char *expr;
 
-			if (column_with_fun[0] != '\0')
+			expr = getMaskingExpression(dopt->masking,
+									   tbinfo->dobj.namespace->dobj.name,
+									   tbinfo->dobj.name,
+									   tbinfo->attnames[i],
+									   tbinfo->atttypnames[i]);
+			if (expr)
 			{
-				appendPQExpBufferStr(q, column_with_fun);
+				appendPQExpBufferStr(q, expr);
+				pg_free(expr);
 			}
 			else
-			{
 				appendPQExpBufferStr(q, fmtId(tbinfo->attnames[i]));
-			}
-			free(column_with_fun);
-        }
+		}
 		else
-		  appendPQExpBufferStr(q, fmtId(tbinfo->attnames[i]));
+			appendPQExpBufferStr(q, fmtId(tbinfo->attnames[i]));
 
 		attgenerated[nfields] = tbinfo->attgenerated[i];
 		nfields++;
@@ -18242,49 +18271,3 @@ appendReloptionsArrayAH(PQExpBuffer buffer, const char *reloptions,
 		pg_log_warning("could not parse %s array", "reloptions");
 }
 
-/**
- * Read paths to functions from `masking_func_query_path`,
- * read query inside the files and run them. We checked them
- * in function masking.c:extractFunctionNameFromQueryFile.
- */
-int
-createMaskingFunctions(Archive *AH, SimpleStringList *masking_func_query_path)
-{
-    int exit_result;
-    PGconn *conn = GetConnection(AH);
-    char *filename;
-    char *query;
-    bool result;
-
-    exit_result=0;
-    result = false;
-    /* Read all custom masking functions and create them */
-    for (SimpleStringListCell *cell = masking_func_query_path->head; cell; cell = cell->next)
-    {
-        filename=cell->val;
-        query = readQueryForCreatingFunction(filename);
-        if (query[0]=='\0')
-        {
-            pg_log_warning("Query is empty. Check file `%s`.", filename);
-            exit_result++;
-        }
-        else
-        {
-            result = executeMaintenanceCommand(conn, query, true);
-        }
-
-        if (!result)
-        {
-            pg_log_warning("Failed execution of query from file \"%s\".", filename);
-        }
-	  	free(query);
-    }
-    /* Read all default functions and create them */
-    result = executeMaintenanceCommand(conn, default_functions(), true);
-    if (!result)
-    {
-        pg_log_warning("Problem during creating default functions from method `masking.c:default_functions`");
-        exit_result++;
-    }
-    return exit_result;
-}

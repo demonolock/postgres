@@ -2,82 +2,85 @@
  *
  * masking.h
  *
- *	Data masking tool for pg_dump
+ *	  Data masking for pg_dump: header with types and prototypes
  *
  * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *		src/bin/pg_dump/masking.h
+ *	  src/bin/pg_dump/masking.h
  *
  *-------------------------------------------------------------------------
  */
 #ifndef MASKING_H
 #define MASKING_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdbool.h>
-#include <limits.h>
-#include "fe_utils/option_utils.h"
-#include "fe_utils/simple_list.h"
-#include "dumputils.h"
+#include "libpq-fe.h"
+#include "pqexpbuffer.h"
 
-/* Define a struct to manage our buffer */
-#define BF_BUFFER_SIZE 1024
-
-typedef struct _pair
+/*
+ * Built-in masking strategies.
+ *
+ * Each strategy maps to a pure inline SQL expression — nothing is created
+ * on the server.
+ */
+typedef enum MaskingStrategy
 {
-  char *key;
-  char *value;
-} Pair;
+	MASK_CONSTANT,		/* replace with a fixed literal */
+	MASK_NULL,			/* replace with NULL */
+	MASK_ZERO,			/* type-appropriate zero value */
+	MASK_SCRAMBLE,		/* md5 hash, preserves approximate length */
+	MASK_PARTIAL,		/* keep last N chars, mask the rest */
+	MASK_FAKE_EMAIL,	/* deterministic fake email */
+	MASK_FAKE_NAME,		/* deterministic fake name */
+	MASK_RANDOM_INT,	/* deterministic int in [min, max] */
+	MASK_RANDOM_DATE,	/* deterministic date in a range */
+	MASK_NOISE,			/* percentage noise on numeric values */
+	MASK_DEFAULT,		/* type-appropriate full replacement */
+	MASK_SQL,			/* user-supplied SQL expression */
+	MASK_FUNCTION		/* call an existing server-side function */
+} MaskingStrategy;
 
-typedef struct MaskingMap
+/*
+ * One masking rule, parsed from a single line of the config file.
+ *
+ * schema_pattern / table_pattern / column_pattern may be "*" (wildcard)
+ * or "default" (fallback), or an exact name.
+ *
+ * type_pattern is non-NULL only for @type rules.
+ */
+typedef struct MaskingRule
 {
-  Pair **data;
-  int size;
-  int capacity;
-} MaskingMap;
+	char		   *schema_pattern;
+	char		   *table_pattern;
+	char		   *column_pattern;
+	char		   *type_pattern;		/* NULL unless @type rule */
+	MaskingStrategy	strategy;
+	char		   *str_param;			/* value=, expr=, name= */
+	int				int_param;			/* last=, min=, variance= */
+	int				int_param2;			/* max for range */
+} MaskingRule;
 
-enum
-ParsingState
+/*
+ * Complete masking configuration, suitable for embedding in DumpOptions.
+ */
+typedef struct MaskingConfig
 {
-  SCHEMA_NAME,
-  TABLE_NAME,
-  COLUMN_NAME,
-  FUNCTION_NAME,
-  WAIT_COLON,
-  WAIT_OPEN_BRACE,
-  WAIT_CLOSE_BRACE,
-  WAIT_COMMA
-};
+	MaskingRule	   *rules;
+	int				nrules;
+	int				capacity;
+	char		   *salt;		/* optional salt for deterministic masking */
+} MaskingConfig;
 
-struct
-MaskingDebugDetails
-{
-    int line_num;
-    int symbol_num;
-    bool is_comment;
-    enum ParsingState parsing_state;
-};
+/* ---- public API ---- */
 
-typedef struct {
-    char *schema_name;
-    char *table_name;
-    char *column_name;
-    char *func_name;
-    bool skip_reading;
-    char c;
-    struct MaskingDebugDetails md;
-} ParserState;
+extern MaskingConfig *parseMaskingConfig(const char *filename);
+extern void freeMaskingConfig(MaskingConfig *conf);
 
-char *addFunctionToColumn(char *schema_name, char *table_name, char *column_name, MaskingMap *map);
-char *default_functions(void);
-int getMaskingPatternFromFile(const char *filename, MaskingMap *masking_map, SimpleStringList *masking_func_query_path);
-void maskingColumns(char *schema_name, char *table_name, char* column_list, MaskingMap *masking_map, PQExpBuffer *q);
-MaskingMap *newMaskingMap(void);
-extern int readMaskingPatternFromFile(FILE *fin, MaskingMap *map, SimpleStringList *masking_func_query_path);
-char *readQueryForCreatingFunction(char *filename);
+extern char *getMaskingExpression(const MaskingConfig *conf,
+								 const char *schema_name,
+								 const char *table_name,
+								 const char *column_name,
+								 const char *type_name);
 
-#endif                            /* MASKING_H */
+#endif							/* MASKING_H */

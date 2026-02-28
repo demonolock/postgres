@@ -885,53 +885,66 @@ PostgreSQL documentation
       <term><option>--masking=<replaceable class="parameter">filename</replaceable></option></term>
       <listitem>
        <para>
-        Specify a filename from which to read masking patterns for using masking functions
-        to fields. You have ability to use user-defined functions from file, functions that
-        already defined in the cluster and default functions.
-
-        Default masking functions - are full masking according to the data types.
-        Returns 'XXXX' for string data types [text, varchar, character].
-        Returns 0 for numeric data types [int, numeric, real, smallint, bigint].
-        Returns '1900-01-01' for date and '1900-01-01 00:00:00' for timestamp.
-
-        Here is an example of masking pattern file:
-
-        masking_file.txt
+        Mask column data during dump using rules defined in
+        <replaceable class="parameter">filename</replaceable>.
+        Each line in the file specifies a masking rule with the format:
+       </para>
+       <synopsis>
+<replaceable>schema</replaceable>.<replaceable>table</replaceable>.<replaceable>column</replaceable>    <replaceable>strategy</replaceable>    [<replaceable>key</replaceable>=<replaceable>value</replaceable> ...]
+       </synopsis>
+       <para>
+        The schema, table, and column components may use <literal>*</literal>
+        as a wildcard matching any name, or <literal>default</literal> as a
+        fallback.  Lines starting with <literal>#</literal> are comments.
+       </para>
+       <para>
+        No objects are created on the server.  All masking is performed via
+        inline SQL expressions in <command>COPY (SELECT ...) TO</command>,
+        making it safe for read-only replicas and change-managed production
+        environments.
+       </para>
+       <para>
+        Available strategies:
+       </para>
+       <itemizedlist>
+        <listitem><para><literal>constant</literal> (value=V) &mdash; replace with a fixed literal</para></listitem>
+        <listitem><para><literal>null</literal> &mdash; replace with NULL</para></listitem>
+        <listitem><para><literal>zero</literal> &mdash; type-appropriate zero value</para></listitem>
+        <listitem><para><literal>scramble</literal> &mdash; deterministic md5 hash</para></listitem>
+        <listitem><para><literal>partial</literal> (last=N) &mdash; mask all but last N characters</para></listitem>
+        <listitem><para><literal>fake_email</literal> &mdash; deterministic fake email address</para></listitem>
+        <listitem><para><literal>fake_name</literal> &mdash; deterministic pseudonym</para></listitem>
+        <listitem><para><literal>random_int</literal> (min=M max=N) &mdash; deterministic integer in range</para></listitem>
+        <listitem><para><literal>random_date</literal> (days=N) &mdash; deterministic date in range</para></listitem>
+        <listitem><para><literal>noise</literal> (variance=N) &mdash; add percentage noise to numbers</para></listitem>
+        <listitem><para><literal>default</literal> &mdash; full replacement by type (XXXX for text, 0 for numbers, etc.)</para></listitem>
+        <listitem><para><literal>sql</literal> (expr=EXPR) &mdash; arbitrary SQL expression</para></listitem>
+        <listitem><para><literal>function</literal> (name=F) &mdash; call an existing server function</para></listitem>
+       </itemizedlist>
+       <para>
+        An optional <literal>.salt = <replaceable>value</replaceable></literal>
+        directive sets a salt for deterministic strategies (scramble, fake_email,
+        fake_name, etc.), ensuring the same input always produces the same
+        output while preventing rainbow-table attacks.
+       </para>
+       <para>
+        Example:
         <programlisting>
-        Schema1 {
-            Table1 {
-                  field11 : function_name11
-                , field12 : function_name12
-                , field13 : function_name13
-            }
+# Masking rules for production dump
+.salt = my_secret_salt
 
-            Table2 {
-                  field21 : function_name21
-                , field22 : function_name22
-                /* This function will be created by script from the path 'path_to_file_with_function'
-                   and used for 'field23' */
-                , field23 : "path_to_file_with_function"
-            }
-        }
+# Exact column match
+public.users.email          fake_email
+public.users.ssn            constant    value=XXX-XX-XXXX
 
-        /* Functions inside this block will be used for all schemas */
-        default {
-            /* Functions inside this block will be used for all tables */
-            default {
-                  /* Function 'for_all_fields' will be used for all fields
-                     did not covered by exact functions */
-                  default: for_all_fields,
-                  field1: value1,
-                  /* Using default masking function for field2 */
-                  field2: default
-            }
+# Wildcard: mask phone everywhere
+*.*.phone                   partial     last=4
 
-            /* Functions inside this block will be used for tables with name 'Table'
-               in the all schemas */
-            Table {
-                   field : function_name
-            }
-        }
+# Type-based rule
+@timestamptz                constant    value=2000-01-01T00:00:00Z
+
+# Default fallback for all unmatched text columns
+default.default.default     default
         </programlisting>
        </para>
       </listitem>
