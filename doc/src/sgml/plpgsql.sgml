@@ -1117,9 +1117,13 @@ PERFORM <replaceable>query</replaceable>;
      result.  Write the <replaceable>query</replaceable> the same
      way you would write an SQL <command>SELECT</command> command, but replace the
      initial keyword <command>SELECT</command> with <command>PERFORM</command>.
-     For <command>WITH</command> queries, use <command>PERFORM</command> and then
-     place the query in parentheses.  (In this case, the query can only
-     return one row.)
+     For <command>WITH</command> queries, write
+     <literal>PERFORM WITH ... SELECT ...</literal> &mdash; the
+     <command>WITH</command> clause follows <command>PERFORM</command>
+     directly, just as it would precede <command>SELECT</command> in
+     ordinary SQL.  (The older syntax
+     <literal>PERFORM (<replaceable>query</replaceable>)</literal>
+     also continues to work, but is no longer necessary.)
      <application>PL/pgSQL</application> variables will be
      substituted into the query just as described above,
      and the plan is cached in the same way.  Also, the special variable

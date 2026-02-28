@@ -2096,6 +2096,92 @@ SELECT * FROM perform_test;
 
 drop table perform_test;
 --
+-- test PERFORM with CTE (common table expression)
+--
+-- basic PERFORM WITH, PERFORM WITH RECURSIVE, and PERFORM WITH multiple CTEs
+create function perform_with_cte() returns void as $$
+BEGIN
+	PERFORM WITH vals AS (SELECT 1 AS x)
+		SELECT x FROM vals;
+
+	PERFORM WITH RECURSIVE nums(n) AS (
+		SELECT 1
+		UNION ALL
+		SELECT n + 1 FROM nums WHERE n < 5
+	)
+	SELECT n FROM nums;
+
+	PERFORM WITH
+		a AS (SELECT 1 AS x),
+		b AS (SELECT 2 AS y)
+	SELECT x, y FROM a, b;
+END;
+$$ language plpgsql;
+SELECT perform_with_cte();
+ perform_with_cte 
+------------------
+ 
+(1 row)
+
+-- PERFORM WITH that has side effects (data-modifying CTE) and sets FOUND
+create table perform_cte_test (a int);
+create function perform_with_cte_sideeffect() returns boolean as $$
+BEGIN
+	PERFORM WITH inserted AS (
+		INSERT INTO perform_cte_test VALUES (1), (2), (3)
+		RETURNING *
+	)
+	SELECT * FROM inserted;
+	RETURN FOUND;
+END;
+$$ language plpgsql;
+SELECT perform_with_cte_sideeffect();
+ perform_with_cte_sideeffect 
+-----------------------------
+ t
+(1 row)
+
+SELECT * FROM perform_cte_test;
+ a 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+-- FOUND is set correctly for empty CTE result
+DO $$
+DECLARE found_val boolean;
+BEGIN
+	PERFORM WITH empty AS (SELECT 1 WHERE false)
+	SELECT * FROM empty;
+	found_val := FOUND;
+	RAISE NOTICE 'FOUND after empty CTE: %', found_val;
+END;
+$$;
+NOTICE:  FOUND after empty CTE: f
+-- PERFORM with_func() is not misdetected as CTE (word boundary check)
+create function with_val(int) returns int as $$
+BEGIN
+	RETURN $1 + 1;
+END;
+$$ language plpgsql;
+DO $$
+BEGIN
+	PERFORM with_val(42);
+END;
+$$;
+-- backward compat: PERFORM (WITH ...) parenthesized form still works
+DO $$
+BEGIN
+	PERFORM (WITH vals AS (SELECT 42 AS x) SELECT x FROM vals);
+END;
+$$;
+drop table perform_cte_test;
+drop function with_val(int);
+drop function perform_with_cte();
+drop function perform_with_cte_sideeffect();
+--
 -- Test proper snapshot handling in simple expressions
 --
 create temp table users(login text, id serial);

@@ -897,34 +897,79 @@ stmt_perform	: K_PERFORM
 					{
 						PLpgSQL_stmt_perform *new;
 						int			startloc;
+						int			tok;
 
 						new = palloc0_object(PLpgSQL_stmt_perform);
 						new->cmd_type = PLPGSQL_STMT_PERFORM;
 						new->lineno   = plpgsql_location_to_lineno(@1, yyscanner);
 						new->stmtid = ++plpgsql_curr_compile->nstatements;
-						plpgsql_push_back_token(K_PERFORM, &yylval, &yylloc, yyscanner);
 
 						/*
-						 * Since PERFORM isn't legal SQL, we have to cheat to
-						 * the extent of substituting "SELECT" for "PERFORM"
-						 * in the parsed text.  It does not seem worth
-						 * inventing a separate parse mode for this one case.
-						 * We can't do syntax-checking until after we make the
-						 * substitution.
+						 * Determine whether this is PERFORM WITH ... (a CTE
+						 * query).  We handle that differently from a regular
+						 * PERFORM because replacing PERFORM with SELECT would
+						 * produce "SELECT WITH ..." which is not valid SQL.
+						 * Instead, for CTEs we omit PERFORM from the query
+						 * text entirely, since the CTE already contains its
+						 * own SELECT.
+						 *
+						 * We detect this at the token level by peeking at the
+						 * next token.  "WITH" is not a PL/pgSQL keyword, so
+						 * the scanner returns it as T_WORD.
 						 */
-						new->expr = read_sql_construct(';', 0, 0, ";",
-													   RAW_PARSE_DEFAULT,
-													   false, false,
-													   &startloc, NULL,
-													   &yylval, &yylloc, yyscanner);
-						/* overwrite "perform" ... */
-						memcpy(new->expr->query, " SELECT", 7);
-						/* left-justify to get rid of the leading space */
-						memmove(new->expr->query, new->expr->query + 1,
-								strlen(new->expr->query));
-						/* offset syntax error position to account for that */
-						check_sql_expr(new->expr->query, new->expr->parseMode,
-									   startloc + 1, yyscanner);
+						tok = yylex(&yylval, &yylloc, yyscanner);
+						plpgsql_push_back_token(tok, &yylval, &yylloc, yyscanner);
+
+						if (tok == T_WORD &&
+							!yylval.word.quoted &&
+							strcmp(yylval.word.ident, "with") == 0)
+						{
+							/*
+							 * PERFORM WITH ...: read from WITH onward.  The
+							 * resulting "WITH ... SELECT ..." is already
+							 * valid SQL, so we can pass valid_sql = true.
+							 */
+							new->expr = read_sql_construct(';', 0, 0, ";",
+														   RAW_PARSE_DEFAULT,
+														   false, true,
+														   &startloc, NULL,
+														   &yylval, &yylloc, yyscanner);
+						}
+						else
+						{
+							/*
+							 * Regular PERFORM <expr>.  Push back K_PERFORM
+							 * so that read_sql_construct includes it in the
+							 * query text, then substitute SELECT for it.
+							 *
+							 * Since PERFORM isn't legal SQL, we have to
+							 * cheat to the extent of substituting "SELECT"
+							 * for "PERFORM" in the parsed text.  It does not
+							 * seem worth inventing a separate parse mode for
+							 * this one case.  We can't do syntax-checking
+							 * until after we make the substitution.
+							 */
+							yylloc = @1;
+							plpgsql_push_back_token(K_PERFORM,
+													&yylval, &yylloc,
+													yyscanner);
+
+							new->expr = read_sql_construct(';', 0, 0, ";",
+														   RAW_PARSE_DEFAULT,
+														   false, false,
+														   &startloc, NULL,
+														   &yylval, &yylloc, yyscanner);
+
+							/* overwrite "PERFORM" with " SELECT" (same length) */
+							memcpy(new->expr->query, " SELECT", 7);
+							/* left-justify to get rid of the leading space */
+							memmove(new->expr->query, new->expr->query + 1,
+									strlen(new->expr->query));
+							/* offset syntax error position to account for that */
+							check_sql_expr(new->expr->query,
+										   new->expr->parseMode,
+										   startloc + 1, yyscanner);
+						}
 
 						$$ = (PLpgSQL_stmt *) new;
 					}
