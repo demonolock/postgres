@@ -49,8 +49,9 @@ g_int_consistent(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	ArrayType  *query = PG_GETARG_ARRAYTYPE_P_COPY(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	bool		retval = false; /* silence compiler warning */
 
@@ -186,7 +187,7 @@ g_int_compress(PG_FUNCTION_ARGS)
 					 errmsg("input array is too big (%d maximum allowed, %d current), use gist__intbig_ops opclass instead",
 							2 * num_ranges - 1, ARRNELEMS(r))));
 
-		retval = palloc(sizeof(GISTENTRY));
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(r),
 					  entry->rel, entry->page, entry->offset, false);
 
@@ -276,7 +277,7 @@ g_int_compress(PG_FUNCTION_ARGS)
 					 errmsg("data is too sparse, recreate index using gist__intbig_ops opclass instead")));
 
 		r = resize_intArrayType(r, len);
-		retval = palloc(sizeof(GISTENTRY));
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(r),
 					  entry->rel, entry->page, entry->offset, false);
 		PG_RETURN_POINTER(retval);
@@ -297,8 +298,7 @@ g_int_decompress(PG_FUNCTION_ARGS)
 	ArrayType  *in;
 	int			lenin;
 	int		   *din;
-	int			i,
-				j;
+	int			i;
 
 	in = DatumGetArrayTypeP(entry->key);
 
@@ -307,7 +307,7 @@ g_int_decompress(PG_FUNCTION_ARGS)
 	{
 		if (in != (ArrayType *) DatumGetPointer(entry->key))
 		{
-			retval = palloc(sizeof(GISTENTRY));
+			retval = palloc_object(GISTENTRY);
 			gistentryinit(*retval, PointerGetDatum(in),
 						  entry->rel, entry->page, entry->offset, false);
 			PG_RETURN_POINTER(retval);
@@ -322,7 +322,7 @@ g_int_decompress(PG_FUNCTION_ARGS)
 	{							/* not compressed value */
 		if (in != (ArrayType *) DatumGetPointer(entry->key))
 		{
-			retval = palloc(sizeof(GISTENTRY));
+			retval = palloc_object(GISTENTRY);
 			gistentryinit(*retval, PointerGetDatum(in),
 						  entry->rel, entry->page, entry->offset, false);
 
@@ -342,13 +342,16 @@ g_int_decompress(PG_FUNCTION_ARGS)
 	dr = ARRPTR(r);
 
 	for (i = 0; i < lenin; i += 2)
-		for (j = din[i]; j <= din[i + 1]; j++)
+	{
+		/* use int64 for j in case din[i + 1] is INT_MAX */
+		for (int64 j = din[i]; j <= din[i + 1]; j++)
 			if ((!i) || *(dr - 1) != j)
-				*dr++ = j;
+				*dr++ = (int) j;
+	}
 
 	if (in != (ArrayType *) DatumGetPointer(entry->key))
 		pfree(in);
-	retval = palloc(sizeof(GISTENTRY));
+	retval = palloc_object(GISTENTRY);
 	gistentryinit(*retval, PointerGetDatum(r),
 				  entry->rel, entry->page, entry->offset, false);
 
@@ -533,7 +536,7 @@ g_int_picksplit(PG_FUNCTION_ARGS)
 	/*
 	 * sort entries
 	 */
-	costvector = (SPLITCOST *) palloc(sizeof(SPLITCOST) * maxoff);
+	costvector = palloc_array(SPLITCOST, maxoff);
 	for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
 	{
 		costvector[i - 1].pos = i;

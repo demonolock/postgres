@@ -8,7 +8,7 @@
  *	using ExecInitExpr() et al.  This converts the tree into a flat array
  *	of ExprEvalSteps, which may be thought of as instructions in a program.
  *	At runtime, we'll execute steps, starting with the first, until we reach
- *	an EEOP_DONE opcode.
+ *	an EEOP_DONE_{RETURN|NO_RETURN} opcode.
  *
  *	This file contains the "compilation" logic.  It is independent of the
  *	specific execution technology we use (switch statement, computed goto,
@@ -19,7 +19,7 @@
  *	and "Expression Evaluation" sections.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -47,17 +47,23 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
-#include "utils/datum.h"
+#include "utils/jsonfuncs.h"
+#include "utils/jsonpath.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
 
 typedef struct ExprSetupInfo
 {
-	/* Highest attribute numbers fetched from inner/outer/scan tuple slots: */
+	/*
+	 * Highest attribute numbers fetched from inner/outer/scan/old/new tuple
+	 * slots:
+	 */
 	AttrNumber	last_inner;
 	AttrNumber	last_outer;
 	AttrNumber	last_scan;
+	AttrNumber	last_old;
+	AttrNumber	last_new;
 	/* MULTIEXPR SubPlan nodes appearing in the expression: */
 	List	   *multiexpr_subplans;
 } ExprSetupInfo;
@@ -68,6 +74,9 @@ static void ExecInitExprRec(Expr *node, ExprState *state,
 static void ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args,
 						 Oid funcid, Oid inputcollid,
 						 ExprState *state);
+static void ExecInitSubPlanExpr(SubPlan *subplan,
+								ExprState *state,
+								Datum *resv, bool *resnull);
 static void ExecCreateExprSetupSteps(ExprState *state, Node *node);
 static void ExecPushExprSetupSteps(ExprState *state, ExprSetupInfo *info);
 static bool expr_setup_walker(Node *node, ExprSetupInfo *info);
@@ -87,6 +96,13 @@ static void ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 								  FunctionCallInfo fcinfo, AggStatePerTrans pertrans,
 								  int transno, int setno, int setoff, bool ishash,
 								  bool nullcheck);
+static void ExecInitJsonExpr(JsonExpr *jsexpr, ExprState *state,
+							 Datum *resv, bool *resnull,
+							 ExprEvalStep *scratch);
+static void ExecInitJsonCoercion(ExprState *state, JsonReturning *returning,
+								 ErrorSaveContext *escontext, bool omit_quotes,
+								 bool exists_coerce,
+								 Datum *resv, bool *resnull);
 
 
 /*
@@ -146,7 +162,7 @@ ExecInitExpr(Expr *node, PlanState *parent)
 	ExecInitExprRec(node, state, &state->resvalue, &state->resnull);
 
 	/* Finally, append a DONE step */
-	scratch.opcode = EEOP_DONE;
+	scratch.opcode = EEOP_DONE_RETURN;
 	ExprEvalPushStep(state, &scratch);
 
 	ExecReadyExpr(state);
@@ -183,7 +199,7 @@ ExecInitExprWithParams(Expr *node, ParamListInfo ext_params)
 	ExecInitExprRec(node, state, &state->resvalue, &state->resnull);
 
 	/* Finally, append a DONE step */
-	scratch.opcode = EEOP_DONE;
+	scratch.opcode = EEOP_DONE_RETURN;
 	ExprEvalPushStep(state, &scratch);
 
 	ExecReadyExpr(state);
@@ -215,7 +231,6 @@ ExecInitQual(List *qual, PlanState *parent)
 	ExprState  *state;
 	ExprEvalStep scratch = {0};
 	List	   *adjust_jumps = NIL;
-	ListCell   *lc;
 
 	/* short-circuit (here and in ExecQual) for empty restriction list */
 	if (qual == NIL)
@@ -249,10 +264,8 @@ ExecInitQual(List *qual, PlanState *parent)
 	scratch.resvalue = &state->resvalue;
 	scratch.resnull = &state->resnull;
 
-	foreach(lc, qual)
+	foreach_ptr(Expr, node, qual)
 	{
-		Expr	   *node = (Expr *) lfirst(lc);
-
 		/* first evaluate expression */
 		ExecInitExprRec(node, state, &state->resvalue, &state->resnull);
 
@@ -264,9 +277,9 @@ ExecInitQual(List *qual, PlanState *parent)
 	}
 
 	/* adjust jump targets */
-	foreach(lc, adjust_jumps)
+	foreach_int(jump, adjust_jumps)
 	{
-		ExprEvalStep *as = &state->steps[lfirst_int(lc)];
+		ExprEvalStep *as = &state->steps[jump];
 
 		Assert(as->opcode == EEOP_QUAL);
 		Assert(as->d.qualexpr.jumpdone == -1);
@@ -278,7 +291,7 @@ ExecInitQual(List *qual, PlanState *parent)
 	 * have yielded TRUE, and since its result is stored in the desired output
 	 * location, we're done.
 	 */
-	scratch.opcode = EEOP_DONE;
+	scratch.opcode = EEOP_DONE_RETURN;
 	ExprEvalPushStep(state, &scratch);
 
 	ExecReadyExpr(state);
@@ -438,8 +451,25 @@ ExecBuildProjectionInfo(List *targetList,
 					/* INDEX_VAR is handled by default case */
 
 				default:
-					/* get the tuple from the relation being scanned */
-					scratch.opcode = EEOP_ASSIGN_SCAN_VAR;
+
+					/*
+					 * Get the tuple from the relation being scanned, or the
+					 * old/new tuple slot, if old/new values were requested.
+					 */
+					switch (variable->varreturningtype)
+					{
+						case VAR_RETURNING_DEFAULT:
+							scratch.opcode = EEOP_ASSIGN_SCAN_VAR;
+							break;
+						case VAR_RETURNING_OLD:
+							scratch.opcode = EEOP_ASSIGN_OLD_VAR;
+							state->flags |= EEO_FLAG_HAS_OLD;
+							break;
+						case VAR_RETURNING_NEW:
+							scratch.opcode = EEOP_ASSIGN_NEW_VAR;
+							state->flags |= EEO_FLAG_HAS_NEW;
+							break;
+					}
 					break;
 			}
 
@@ -473,7 +503,7 @@ ExecBuildProjectionInfo(List *targetList,
 		}
 	}
 
-	scratch.opcode = EEOP_DONE;
+	scratch.opcode = EEOP_DONE_NO_RETURN;
 	ExprEvalPushStep(state, &scratch);
 
 	ExecReadyExpr(state);
@@ -527,7 +557,7 @@ ExecBuildUpdateProjection(List *targetList,
 	int			nAssignableCols;
 	bool		sawJunk;
 	Bitmapset  *assignedCols;
-	ExprSetupInfo deform = {0, 0, 0, NIL};
+	ExprSetupInfo deform = {0, 0, 0, 0, 0, NIL};
 	ExprEvalStep scratch = {0};
 	int			outerattnum;
 	ListCell   *lc,
@@ -590,7 +620,7 @@ ExecBuildUpdateProjection(List *targetList,
 	 */
 	for (int attnum = relDesc->natts; attnum > 0; attnum--)
 	{
-		Form_pg_attribute attr = TupleDescAttr(relDesc, attnum - 1);
+		CompactAttribute *attr = TupleDescCompactAttr(relDesc, attnum - 1);
 
 		if (attr->attisdropped)
 			continue;
@@ -686,7 +716,7 @@ ExecBuildUpdateProjection(List *targetList,
 	 */
 	for (int attnum = 1; attnum <= relDesc->natts; attnum++)
 	{
-		Form_pg_attribute attr = TupleDescAttr(relDesc, attnum - 1);
+		CompactAttribute *attr = TupleDescCompactAttr(relDesc, attnum - 1);
 
 		if (attr->attisdropped)
 		{
@@ -712,7 +742,7 @@ ExecBuildUpdateProjection(List *targetList,
 		}
 	}
 
-	scratch.opcode = EEOP_DONE;
+	scratch.opcode = EEOP_DONE_NO_RETURN;
 	ExprEvalPushStep(state, &scratch);
 
 	ExecReadyExpr(state);
@@ -916,6 +946,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 					/* system column */
 					scratch.d.var.attnum = variable->varattno;
 					scratch.d.var.vartype = variable->vartype;
+					scratch.d.var.varreturningtype = variable->varreturningtype;
 					switch (variable->varno)
 					{
 						case INNER_VAR:
@@ -928,7 +959,20 @@ ExecInitExprRec(Expr *node, ExprState *state,
 							/* INDEX_VAR is handled by default case */
 
 						default:
-							scratch.opcode = EEOP_SCAN_SYSVAR;
+							switch (variable->varreturningtype)
+							{
+								case VAR_RETURNING_DEFAULT:
+									scratch.opcode = EEOP_SCAN_SYSVAR;
+									break;
+								case VAR_RETURNING_OLD:
+									scratch.opcode = EEOP_OLD_SYSVAR;
+									state->flags |= EEO_FLAG_HAS_OLD;
+									break;
+								case VAR_RETURNING_NEW:
+									scratch.opcode = EEOP_NEW_SYSVAR;
+									state->flags |= EEO_FLAG_HAS_NEW;
+									break;
+							}
 							break;
 					}
 				}
@@ -937,6 +981,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 					/* regular user column */
 					scratch.d.var.attnum = variable->varattno - 1;
 					scratch.d.var.vartype = variable->vartype;
+					scratch.d.var.varreturningtype = variable->varreturningtype;
 					switch (variable->varno)
 					{
 						case INNER_VAR:
@@ -949,7 +994,20 @@ ExecInitExprRec(Expr *node, ExprState *state,
 							/* INDEX_VAR is handled by default case */
 
 						default:
-							scratch.opcode = EEOP_SCAN_VAR;
+							switch (variable->varreturningtype)
+							{
+								case VAR_RETURNING_DEFAULT:
+									scratch.opcode = EEOP_SCAN_VAR;
+									break;
+								case VAR_RETURNING_OLD:
+									scratch.opcode = EEOP_OLD_VAR;
+									state->flags |= EEO_FLAG_HAS_OLD;
+									break;
+								case VAR_RETURNING_NEW:
+									scratch.opcode = EEOP_NEW_VAR;
+									state->flags |= EEO_FLAG_HAS_NEW;
+									break;
+							}
 							break;
 					}
 				}
@@ -1110,6 +1168,19 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				break;
 			}
 
+		case T_MergeSupportFunc:
+			{
+				/* must be in a MERGE, else something messed up */
+				if (!state->parent ||
+					!IsA(state->parent, ModifyTableState) ||
+					((ModifyTableState *) state->parent)->operation != CMD_MERGE)
+					elog(ERROR, "MergeSupportFunc found in non-merge plan node");
+
+				scratch.opcode = EEOP_MERGE_SUPPORT_FUNC;
+				ExprEvalPushStep(state, &scratch);
+				break;
+			}
+
 		case T_SubscriptingRef:
 			{
 				SubscriptingRef *sbsref = (SubscriptingRef *) node;
@@ -1169,6 +1240,14 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				ExecInitFunc(&scratch, node,
 							 op->args, op->opfuncid, op->inputcollid,
 							 state);
+
+				/*
+				 * If first argument is of varlena type, we'll need to ensure
+				 * that the value passed to the comparison function is a
+				 * read-only pointer.
+				 */
+				scratch.d.func.make_ro =
+					(get_typlen(exprType((Node *) linitial(op->args))) == -1);
 
 				/*
 				 * Change opcode of call instruction to EEOP_NULLIF.
@@ -1233,7 +1312,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				}
 
 				/* Set up the primary fmgr lookup information */
-				finfo = palloc0(sizeof(FmgrInfo));
+				finfo = palloc0_object(FmgrInfo);
 				fcinfo = palloc0(SizeForFunctionCallInfo(2));
 				fmgr_info(cmpfuncid, finfo);
 				fmgr_info_set_expr((Node *) node, finfo);
@@ -1309,7 +1388,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 
 				/* allocate scratch memory used by all steps of AND/OR */
 				if (boolexpr->boolop != NOT_EXPR)
-					scratch.d.boolexpr.anynull = (bool *) palloc(sizeof(bool));
+					scratch.d.boolexpr.anynull = palloc_object(bool);
 
 				/*
 				 * For each argument evaluate the argument itself, then
@@ -1388,7 +1467,6 @@ ExecInitExprRec(Expr *node, ExprState *state,
 		case T_SubPlan:
 			{
 				SubPlan    *subplan = (SubPlan *) node;
-				SubPlanState *sstate;
 
 				/*
 				 * Real execution of a MULTIEXPR SubPlan has already been
@@ -1405,19 +1483,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 					break;
 				}
 
-				if (!state->parent)
-					elog(ERROR, "SubPlan found with no parent plan");
-
-				sstate = ExecInitSubPlan(subplan, state->parent);
-
-				/* add SubPlanState nodes to state->parent->subPlan */
-				state->parent->subPlan = lappend(state->parent->subPlan,
-												 sstate);
-
-				scratch.opcode = EEOP_SUBPLAN;
-				scratch.d.subplan.sstate = sstate;
-
-				ExprEvalPushStep(state, &scratch);
+				ExecInitSubPlanExpr(subplan, state, resv, resnull);
 				break;
 			}
 
@@ -1455,11 +1521,11 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				ReleaseTupleDesc(tupDesc);
 
 				/* create workspace for column values */
-				values = (Datum *) palloc(sizeof(Datum) * ncolumns);
-				nulls = (bool *) palloc(sizeof(bool) * ncolumns);
+				values = palloc_array(Datum, ncolumns);
+				nulls = palloc_array(bool, ncolumns);
 
 				/* create shared composite-type-lookup cache struct */
-				rowcachep = palloc(sizeof(ExprEvalRowtypeCache));
+				rowcachep = palloc_object(ExprEvalRowtypeCache);
 				rowcachep->cacheptr = NULL;
 
 				/* emit code to evaluate the composite input value */
@@ -1562,10 +1628,13 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				 * We don't check permissions here as a type's input/output
 				 * function are assumed to be executable by everyone.
 				 */
-				scratch.opcode = EEOP_IOCOERCE;
+				if (state->escontext == NULL)
+					scratch.opcode = EEOP_IOCOERCE;
+				else
+					scratch.opcode = EEOP_IOCOERCE_SAFE;
 
 				/* lookup the source type's output function */
-				scratch.d.iocoerce.finfo_out = palloc0(sizeof(FmgrInfo));
+				scratch.d.iocoerce.finfo_out = palloc0_object(FmgrInfo);
 				scratch.d.iocoerce.fcinfo_data_out = palloc0(SizeForFunctionCallInfo(1));
 
 				getTypeOutputInfo(exprType((Node *) iocoerce->arg),
@@ -1577,7 +1646,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 										 1, InvalidOid, NULL, NULL);
 
 				/* lookup the result type's input function */
-				scratch.d.iocoerce.finfo_in = palloc0(sizeof(FmgrInfo));
+				scratch.d.iocoerce.finfo_in = palloc0_object(FmgrInfo);
 				scratch.d.iocoerce.fcinfo_data_in = palloc0(SizeForFunctionCallInfo(3));
 
 				getTypeInputInfo(iocoerce->resulttype,
@@ -1597,6 +1666,8 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				fcinfo_in->args[1].isnull = false;
 				fcinfo_in->args[2].value = Int32GetDatum(-1);
 				fcinfo_in->args[2].isnull = false;
+
+				fcinfo_in->context = (Node *) state->escontext;
 
 				ExprEvalPushStep(state, &scratch);
 				break;
@@ -1628,8 +1699,8 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				elemstate->parent = state->parent;
 				elemstate->ext_params = state->ext_params;
 
-				elemstate->innermost_caseval = (Datum *) palloc(sizeof(Datum));
-				elemstate->innermost_casenull = (bool *) palloc(sizeof(bool));
+				elemstate->innermost_caseval = palloc_object(Datum);
+				elemstate->innermost_casenull = palloc_object(bool);
 
 				ExecInitExprRec(acoerce->elemexpr, elemstate,
 								&elemstate->resvalue, &elemstate->resnull);
@@ -1643,7 +1714,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				else
 				{
 					/* Not trivial, so append a DONE step */
-					scratch.opcode = EEOP_DONE;
+					scratch.opcode = EEOP_DONE_RETURN;
 					ExprEvalPushStep(elemstate, &scratch);
 					/* and ready the subexpression */
 					ExecReadyExpr(elemstate);
@@ -1656,8 +1727,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				if (elemstate)
 				{
 					/* Set up workspace for array_map */
-					scratch.d.arraycoerce.amstate =
-						(ArrayMapState *) palloc0(sizeof(ArrayMapState));
+					scratch.d.arraycoerce.amstate = palloc0_object(ArrayMapState);
 				}
 				else
 				{
@@ -1712,8 +1782,8 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				if (caseExpr->arg != NULL)
 				{
 					/* Evaluate testexpr into caseval/casenull workspace */
-					caseval = palloc(sizeof(Datum));
-					casenull = palloc(sizeof(bool));
+					caseval = palloc_object(Datum);
+					casenull = palloc_object(bool);
 
 					ExecInitExprRec(caseExpr->arg, state,
 									caseval, casenull);
@@ -1830,13 +1900,17 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				 * actually within a CaseExpr, ArrayCoerceExpr, etc structure.
 				 * That can happen because some parts of the system abuse
 				 * CaseTestExpr to cause a read of a value externally supplied
-				 * in econtext->caseValue_datum.  We'll take care of that
-				 * scenario at runtime.
+				 * in econtext->caseValue_datum.  We'll take care of that by
+				 * generating a specialized operation.
 				 */
-				scratch.opcode = EEOP_CASE_TESTVAL;
-				scratch.d.casetest.value = state->innermost_caseval;
-				scratch.d.casetest.isnull = state->innermost_casenull;
-
+				if (state->innermost_caseval == NULL)
+					scratch.opcode = EEOP_CASE_TESTVAL_EXT;
+				else
+				{
+					scratch.opcode = EEOP_CASE_TESTVAL;
+					scratch.d.casetest.value = state->innermost_caseval;
+					scratch.d.casetest.isnull = state->innermost_casenull;
+				}
 				ExprEvalPushStep(state, &scratch);
 				break;
 			}
@@ -1855,9 +1929,9 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				 */
 				scratch.opcode = EEOP_ARRAYEXPR;
 				scratch.d.arrayexpr.elemvalues =
-					(Datum *) palloc(sizeof(Datum) * nelems);
+					palloc_array(Datum, nelems);
 				scratch.d.arrayexpr.elemnulls =
-					(bool *) palloc(sizeof(bool) * nelems);
+					palloc_array(bool, nelems);
 				scratch.d.arrayexpr.nelems = nelems;
 
 				/* fill remaining fields of step */
@@ -1931,9 +2005,9 @@ ExecInitExprRec(Expr *node, ExprState *state,
 
 				/* space for the individual field datums */
 				scratch.d.row.elemvalues =
-					(Datum *) palloc(sizeof(Datum) * nelems);
+					palloc_array(Datum, nelems);
 				scratch.d.row.elemnulls =
-					(bool *) palloc(sizeof(bool) * nelems);
+					palloc_array(bool, nelems);
 				/* as explained above, make sure any extra columns are null */
 				memset(scratch.d.row.elemnulls, true, sizeof(bool) * nelems);
 
@@ -2034,7 +2108,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 							 BTORDER_PROC, lefttype, righttype, opfamily);
 
 					/* Set up the primary fmgr lookup information */
-					finfo = palloc0(sizeof(FmgrInfo));
+					finfo = palloc0_object(FmgrInfo);
 					fcinfo = palloc0(SizeForFunctionCallInfo(2));
 					fmgr_info(proc, finfo);
 					fmgr_info_set_expr((Node *) node, finfo);
@@ -2081,7 +2155,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 
 				/* Finally, examine the last comparison result */
 				scratch.opcode = EEOP_ROWCOMPARE_FINAL;
-				scratch.d.rowcompare_final.rctype = rcexpr->rctype;
+				scratch.d.rowcompare_final.cmptype = rcexpr->cmptype;
 				ExprEvalPushStep(state, &scratch);
 
 				/* adjust jump targets */
@@ -2177,7 +2251,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				 */
 
 				/* Perform function lookup */
-				finfo = palloc0(sizeof(FmgrInfo));
+				finfo = palloc0_object(FmgrInfo);
 				fcinfo = palloc0(SizeForFunctionCallInfo(2));
 				fmgr_info(typentry->cmp_proc, finfo);
 				fmgr_info_set_expr((Node *) node, finfo);
@@ -2186,10 +2260,8 @@ ExecInitExprRec(Expr *node, ExprState *state,
 
 				scratch.opcode = EEOP_MINMAX;
 				/* allocate space to store arguments */
-				scratch.d.minmax.values =
-					(Datum *) palloc(sizeof(Datum) * nelems);
-				scratch.d.minmax.nulls =
-					(bool *) palloc(sizeof(bool) * nelems);
+				scratch.d.minmax.values = palloc_array(Datum, nelems);
+				scratch.d.minmax.nulls = palloc_array(bool, nelems);
 				scratch.d.minmax.nelems = nelems;
 
 				scratch.d.minmax.op = minmaxexpr->op;
@@ -2238,10 +2310,8 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				/* allocate space for storing all the arguments */
 				if (nnamed)
 				{
-					scratch.d.xmlexpr.named_argvalue =
-						(Datum *) palloc(sizeof(Datum) * nnamed);
-					scratch.d.xmlexpr.named_argnull =
-						(bool *) palloc(sizeof(bool) * nnamed);
+					scratch.d.xmlexpr.named_argvalue = palloc_array(Datum, nnamed);
+					scratch.d.xmlexpr.named_argnull = palloc_array(bool, nnamed);
 				}
 				else
 				{
@@ -2251,10 +2321,8 @@ ExecInitExprRec(Expr *node, ExprState *state,
 
 				if (nargs)
 				{
-					scratch.d.xmlexpr.argvalue =
-						(Datum *) palloc(sizeof(Datum) * nargs);
-					scratch.d.xmlexpr.argnull =
-						(bool *) palloc(sizeof(bool) * nargs);
+					scratch.d.xmlexpr.argvalue = palloc_array(Datum, nargs);
+					scratch.d.xmlexpr.argnull = palloc_array(bool, nargs);
 				}
 				else
 				{
@@ -2294,21 +2362,10 @@ ExecInitExprRec(Expr *node, ExprState *state,
 			{
 				JsonValueExpr *jve = (JsonValueExpr *) node;
 
+				Assert(jve->raw_expr != NULL);
 				ExecInitExprRec(jve->raw_expr, state, resv, resnull);
-
-				if (jve->formatted_expr)
-				{
-					Datum	   *innermost_caseval = state->innermost_caseval;
-					bool	   *innermost_isnull = state->innermost_casenull;
-
-					state->innermost_caseval = resv;
-					state->innermost_casenull = resnull;
-
-					ExecInitExprRec(jve->formatted_expr, state, resv, resnull);
-
-					state->innermost_caseval = innermost_caseval;
-					state->innermost_casenull = innermost_isnull;
-				}
+				Assert(jve->formatted_expr != NULL);
+				ExecInitExprRec(jve->formatted_expr, state, resv, resnull);
 				break;
 			}
 
@@ -2324,19 +2381,25 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				{
 					ExecInitExprRec(ctor->func, state, resv, resnull);
 				}
+				else if ((ctor->type == JSCTOR_JSON_PARSE && !ctor->unique) ||
+						 ctor->type == JSCTOR_JSON_SERIALIZE)
+				{
+					/* Use the value of the first argument as result */
+					ExecInitExprRec(linitial(args), state, resv, resnull);
+				}
 				else
 				{
 					JsonConstructorExprState *jcstate;
 
-					jcstate = palloc0(sizeof(JsonConstructorExprState));
+					jcstate = palloc0_object(JsonConstructorExprState);
 
 					scratch.opcode = EEOP_JSON_CONSTRUCTOR;
 					scratch.d.json_constructor.jcstate = jcstate;
 
 					jcstate->constructor = ctor;
-					jcstate->arg_values = (Datum *) palloc(sizeof(Datum) * nargs);
-					jcstate->arg_nulls = (bool *) palloc(sizeof(bool) * nargs);
-					jcstate->arg_types = (Oid *) palloc(sizeof(Oid) * nargs);
+					jcstate->arg_values = palloc_array(Datum, nargs);
+					jcstate->arg_nulls = palloc_array(bool, nargs);
+					jcstate->arg_types = palloc_array(Oid, nargs);
 					jcstate->nargs = nargs;
 
 					foreach(lc, args)
@@ -2360,6 +2423,29 @@ ExecInitExprRec(Expr *node, ExprState *state,
 											&jcstate->arg_nulls[argno]);
 						}
 						argno++;
+					}
+
+					/* prepare type cache for datum_to_json[b]() */
+					if (ctor->type == JSCTOR_JSON_SCALAR)
+					{
+						bool		is_jsonb =
+							ctor->returning->format->format_type == JS_FORMAT_JSONB;
+
+						jcstate->arg_type_cache =
+							palloc(sizeof(*jcstate->arg_type_cache) * nargs);
+
+						for (int i = 0; i < nargs; i++)
+						{
+							JsonTypeCategory category;
+							Oid			outfuncid;
+							Oid			typid = jcstate->arg_types[i];
+
+							json_categorize_type(typid, is_jsonb,
+												 &category, &outfuncid);
+
+							jcstate->arg_type_cache[i].outfuncid = outfuncid;
+							jcstate->arg_type_cache[i].category = (int) category;
+						}
 					}
 
 					ExprEvalPushStep(state, &scratch);
@@ -2391,6 +2477,23 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				scratch.d.is_json.pred = pred;
 
 				ExprEvalPushStep(state, &scratch);
+				break;
+			}
+
+		case T_JsonExpr:
+			{
+				JsonExpr   *jsexpr = castNode(JsonExpr, node);
+
+				/*
+				 * No need to initialize a full JsonExprState For
+				 * JSON_TABLE(), because the upstream caller tfuncFetchRows()
+				 * is only interested in the value of formatted_expr.
+				 */
+				if (jsexpr->op == JSON_TABLE_OP)
+					ExecInitExprRec((Expr *) jsexpr->formatted_expr, state,
+									resv, resnull);
+				else
+					ExecInitJsonExpr(jsexpr, state, resv, resnull, &scratch);
 				break;
 			}
 
@@ -2488,14 +2591,18 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				 * that innermost_domainval could be NULL, if we're compiling
 				 * a standalone domain check rather than one embedded in a
 				 * larger expression.  In that case we must read from
-				 * econtext->domainValue_datum.  We'll take care of that
-				 * scenario at runtime.
+				 * econtext->domainValue_datum.  We'll take care of that by
+				 * generating a specialized operation.
 				 */
-				scratch.opcode = EEOP_DOMAIN_TESTVAL;
-				/* we share instruction union variant with case testval */
-				scratch.d.casetest.value = state->innermost_domainval;
-				scratch.d.casetest.isnull = state->innermost_domainnull;
-
+				if (state->innermost_domainval == NULL)
+					scratch.opcode = EEOP_DOMAIN_TESTVAL_EXT;
+				else
+				{
+					scratch.opcode = EEOP_DOMAIN_TESTVAL;
+					/* we share instruction union variant with case testval */
+					scratch.d.casetest.value = state->innermost_domainval;
+					scratch.d.casetest.isnull = state->innermost_domainnull;
+				}
 				ExprEvalPushStep(state, &scratch);
 				break;
 			}
@@ -2519,6 +2626,34 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				break;
 			}
 
+		case T_ReturningExpr:
+			{
+				ReturningExpr *rexpr = (ReturningExpr *) node;
+				int			retstep;
+
+				/* Skip expression evaluation if OLD/NEW row doesn't exist */
+				scratch.opcode = EEOP_RETURNINGEXPR;
+				scratch.d.returningexpr.nullflag = rexpr->retold ?
+					EEO_FLAG_OLD_IS_NULL : EEO_FLAG_NEW_IS_NULL;
+				scratch.d.returningexpr.jumpdone = -1;	/* set below */
+				ExprEvalPushStep(state, &scratch);
+				retstep = state->steps_len - 1;
+
+				/* Steps to evaluate expression to return */
+				ExecInitExprRec(rexpr->retexpr, state, resv, resnull);
+
+				/* Jump target used if OLD/NEW row doesn't exist */
+				state->steps[retstep].d.returningexpr.jumpdone = state->steps_len;
+
+				/* Update ExprState flags */
+				if (rexpr->retold)
+					state->flags |= EEO_FLAG_HAS_OLD;
+				else
+					state->flags |= EEO_FLAG_HAS_NEW;
+
+				break;
+			}
+
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(node));
@@ -2538,7 +2673,7 @@ ExprEvalPushStep(ExprState *es, const ExprEvalStep *s)
 	if (es->steps_alloc == 0)
 	{
 		es->steps_alloc = 16;
-		es->steps = palloc(sizeof(ExprEvalStep) * es->steps_alloc);
+		es->steps = palloc_array(ExprEvalStep, es->steps_alloc);
 	}
 	else if (es->steps_alloc == es->steps_len)
 	{
@@ -2590,7 +2725,7 @@ ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args, Oid funcid,
 							   FUNC_MAX_ARGS)));
 
 	/* Allocate function lookup data and parameter workspace for this call */
-	scratch->d.func.finfo = palloc0(sizeof(FmgrInfo));
+	scratch->d.func.finfo = palloc0_object(FmgrInfo);
 	scratch->d.func.fcinfo_data = palloc0(SizeForFunctionCallInfo(nargs));
 	flinfo = scratch->d.func.finfo;
 	fcinfo = scratch->d.func.fcinfo_data;
@@ -2646,7 +2781,15 @@ ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args, Oid funcid,
 	if (pgstat_track_functions <= flinfo->fn_stats)
 	{
 		if (flinfo->fn_strict && nargs > 0)
-			scratch->opcode = EEOP_FUNCEXPR_STRICT;
+		{
+			/* Choose nargs optimized implementation if available. */
+			if (nargs == 1)
+				scratch->opcode = EEOP_FUNCEXPR_STRICT_1;
+			else if (nargs == 2)
+				scratch->opcode = EEOP_FUNCEXPR_STRICT_2;
+			else
+				scratch->opcode = EEOP_FUNCEXPR_STRICT;
+		}
 		else
 			scratch->opcode = EEOP_FUNCEXPR;
 	}
@@ -2660,13 +2803,79 @@ ExecInitFunc(ExprEvalStep *scratch, Expr *node, List *args, Oid funcid,
 }
 
 /*
+ * Append the steps necessary for the evaluation of a SubPlan node to
+ * ExprState->steps.
+ *
+ * subplan - SubPlan expression to evaluate
+ * state - ExprState to whose ->steps to append the necessary operations
+ * resv / resnull - where to store the result of the node into
+ */
+static void
+ExecInitSubPlanExpr(SubPlan *subplan,
+					ExprState *state,
+					Datum *resv, bool *resnull)
+{
+	ExprEvalStep scratch = {0};
+	SubPlanState *sstate;
+	ListCell   *pvar;
+	ListCell   *l;
+
+	if (!state->parent)
+		elog(ERROR, "SubPlan found with no parent plan");
+
+	/*
+	 * Generate steps to evaluate input arguments for the subplan.
+	 *
+	 * We evaluate the argument expressions into resv/resnull, and then use
+	 * PARAM_SET to update the parameter. We do that, instead of evaluating
+	 * directly into the param, to avoid depending on the pointer value
+	 * remaining stable / being included in the generated expression. It's ok
+	 * to use resv/resnull for multiple params, as each parameter evaluation
+	 * is immediately followed by an EEOP_PARAM_SET (and thus are saved before
+	 * they could be overwritten again).
+	 *
+	 * Any calculation we have to do can be done in the parent econtext, since
+	 * the Param values don't need to have per-query lifetime.
+	 */
+	Assert(list_length(subplan->parParam) == list_length(subplan->args));
+	forboth(l, subplan->parParam, pvar, subplan->args)
+	{
+		int			paramid = lfirst_int(l);
+		Expr	   *arg = (Expr *) lfirst(pvar);
+
+		ExecInitExprRec(arg, state, resv, resnull);
+
+		scratch.opcode = EEOP_PARAM_SET;
+		scratch.resvalue = resv;
+		scratch.resnull = resnull;
+		scratch.d.param.paramid = paramid;
+		/* paramtype's not actually used, but we might as well fill it */
+		scratch.d.param.paramtype = exprType((Node *) arg);
+		ExprEvalPushStep(state, &scratch);
+	}
+
+	sstate = ExecInitSubPlan(subplan, state->parent);
+
+	/* add SubPlanState nodes to state->parent->subPlan */
+	state->parent->subPlan = lappend(state->parent->subPlan,
+									 sstate);
+
+	scratch.opcode = EEOP_SUBPLAN;
+	scratch.resvalue = resv;
+	scratch.resnull = resnull;
+	scratch.d.subplan.sstate = sstate;
+
+	ExprEvalPushStep(state, &scratch);
+}
+
+/*
  * Add expression steps performing setup that's needed before any of the
  * main execution of the expression.
  */
 static void
 ExecCreateExprSetupSteps(ExprState *state, Node *node)
 {
-	ExprSetupInfo info = {0, 0, 0, NIL};
+	ExprSetupInfo info = {0, 0, 0, 0, 0, NIL};
 
 	/* Prescan to find out what we need. */
 	expr_setup_walker(node, &info);
@@ -2689,8 +2898,8 @@ ExecPushExprSetupSteps(ExprState *state, ExprSetupInfo *info)
 	scratch.resnull = NULL;
 
 	/*
-	 * Add steps deforming the ExprState's inner/outer/scan slots as much as
-	 * required by any Vars appearing in the expression.
+	 * Add steps deforming the ExprState's inner/outer/scan/old/new slots as
+	 * much as required by any Vars appearing in the expression.
 	 */
 	if (info->last_inner > 0)
 	{
@@ -2722,6 +2931,26 @@ ExecPushExprSetupSteps(ExprState *state, ExprSetupInfo *info)
 		if (ExecComputeSlotInfo(state, &scratch))
 			ExprEvalPushStep(state, &scratch);
 	}
+	if (info->last_old > 0)
+	{
+		scratch.opcode = EEOP_OLD_FETCHSOME;
+		scratch.d.fetch.last_var = info->last_old;
+		scratch.d.fetch.fixed = false;
+		scratch.d.fetch.kind = NULL;
+		scratch.d.fetch.known_desc = NULL;
+		if (ExecComputeSlotInfo(state, &scratch))
+			ExprEvalPushStep(state, &scratch);
+	}
+	if (info->last_new > 0)
+	{
+		scratch.opcode = EEOP_NEW_FETCHSOME;
+		scratch.d.fetch.last_var = info->last_new;
+		scratch.d.fetch.fixed = false;
+		scratch.d.fetch.kind = NULL;
+		scratch.d.fetch.known_desc = NULL;
+		if (ExecComputeSlotInfo(state, &scratch))
+			ExprEvalPushStep(state, &scratch);
+	}
 
 	/*
 	 * Add steps to execute any MULTIEXPR SubPlans appearing in the
@@ -2733,29 +2962,12 @@ ExecPushExprSetupSteps(ExprState *state, ExprSetupInfo *info)
 	foreach(lc, info->multiexpr_subplans)
 	{
 		SubPlan    *subplan = (SubPlan *) lfirst(lc);
-		SubPlanState *sstate;
 
 		Assert(subplan->subLinkType == MULTIEXPR_SUBLINK);
 
-		/* This should match what ExecInitExprRec does for other SubPlans: */
-
-		if (!state->parent)
-			elog(ERROR, "SubPlan found with no parent plan");
-
-		sstate = ExecInitSubPlan(subplan, state->parent);
-
-		/* add SubPlanState nodes to state->parent->subPlan */
-		state->parent->subPlan = lappend(state->parent->subPlan,
-										 sstate);
-
-		scratch.opcode = EEOP_SUBPLAN;
-		scratch.d.subplan.sstate = sstate;
-
 		/* The result can be ignored, but we better put it somewhere */
-		scratch.resvalue = &state->resvalue;
-		scratch.resnull = &state->resnull;
-
-		ExprEvalPushStep(state, &scratch);
+		ExecInitSubPlanExpr(subplan, state,
+							&state->resvalue, &state->resnull);
 	}
 }
 
@@ -2785,7 +2997,18 @@ expr_setup_walker(Node *node, ExprSetupInfo *info)
 				/* INDEX_VAR is handled by default case */
 
 			default:
-				info->last_scan = Max(info->last_scan, attnum);
+				switch (variable->varreturningtype)
+				{
+					case VAR_RETURNING_DEFAULT:
+						info->last_scan = Max(info->last_scan, attnum);
+						break;
+					case VAR_RETURNING_OLD:
+						info->last_old = Max(info->last_old, attnum);
+						break;
+					case VAR_RETURNING_NEW:
+						info->last_new = Max(info->last_new, attnum);
+						break;
+				}
 				break;
 		}
 		return false;
@@ -2813,8 +3036,7 @@ expr_setup_walker(Node *node, ExprSetupInfo *info)
 		return false;
 	if (IsA(node, GroupingFunc))
 		return false;
-	return expression_tree_walker(node, expr_setup_walker,
-								  (void *) info);
+	return expression_tree_walker(node, expr_setup_walker, info);
 }
 
 /*
@@ -2823,6 +3045,11 @@ expr_setup_walker(Node *node, ExprSetupInfo *info)
  * The goal is to determine whether a slot is 'fixed', that is, every
  * evaluation of the expression will have the same type of slot, with an
  * equivalent descriptor.
+ *
+ * EEOP_OLD_FETCHSOME and EEOP_NEW_FETCHSOME are used to process RETURNING, if
+ * OLD/NEW columns are referred to explicitly.  In both cases, the tuple
+ * descriptor comes from the parent scan node, so we treat them the same as
+ * EEOP_SCAN_FETCHSOME.
  *
  * Returns true if the deforming step is required, false otherwise.
  */
@@ -2837,7 +3064,9 @@ ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op)
 
 	Assert(opcode == EEOP_INNER_FETCHSOME ||
 		   opcode == EEOP_OUTER_FETCHSOME ||
-		   opcode == EEOP_SCAN_FETCHSOME);
+		   opcode == EEOP_SCAN_FETCHSOME ||
+		   opcode == EEOP_OLD_FETCHSOME ||
+		   opcode == EEOP_NEW_FETCHSOME);
 
 	if (op->d.fetch.known_desc != NULL)
 	{
@@ -2889,7 +3118,9 @@ ExecComputeSlotInfo(ExprState *state, ExprEvalStep *op)
 			desc = ExecGetResultType(os);
 		}
 	}
-	else if (opcode == EEOP_SCAN_FETCHSOME)
+	else if (opcode == EEOP_SCAN_FETCHSOME ||
+			 opcode == EEOP_OLD_FETCHSOME ||
+			 opcode == EEOP_NEW_FETCHSOME)
 	{
 		desc = parent->scandesc;
 
@@ -2936,6 +3167,12 @@ ExecInitWholeRowVar(ExprEvalStep *scratch, Var *variable, ExprState *state)
 	scratch->d.wholerow.slow = false;
 	scratch->d.wholerow.tupdesc = NULL; /* filled at runtime */
 	scratch->d.wholerow.junkFilter = NULL;
+
+	/* update ExprState flags if Var refers to OLD/NEW */
+	if (variable->varreturningtype == VAR_RETURNING_OLD)
+		state->flags |= EEO_FLAG_HAS_OLD;
+	else if (variable->varreturningtype == VAR_RETURNING_NEW)
+		state->flags |= EEO_FLAG_HAS_NEW;
 
 	/*
 	 * If the input tuple came from a subquery, it might contain "resjunk"
@@ -3289,6 +3526,7 @@ ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
 	/* we'll allocate workspace only if needed */
 	scratch->d.domaincheck.checkvalue = NULL;
 	scratch->d.domaincheck.checknull = NULL;
+	scratch->d.domaincheck.escontext = state->escontext;
 
 	/*
 	 * Evaluate argument - it's fine to directly store it into resv/resnull,
@@ -3314,8 +3552,7 @@ ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
 	 * during executor initialization.  That means we don't need typcache.c to
 	 * provide compiled exprs.
 	 */
-	constraint_ref = (DomainConstraintRef *)
-		palloc(sizeof(DomainConstraintRef));
+	constraint_ref = palloc_object(DomainConstraintRef);
 	InitDomainConstraintRef(ctest->resulttype,
 							constraint_ref,
 							CurrentMemoryContext,
@@ -3345,9 +3582,9 @@ ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
 				if (scratch->d.domaincheck.checkvalue == NULL)
 				{
 					scratch->d.domaincheck.checkvalue =
-						(Datum *) palloc(sizeof(Datum));
+						palloc_object(Datum);
 					scratch->d.domaincheck.checknull =
-						(bool *) palloc(sizeof(bool));
+						palloc_object(bool);
 				}
 
 				/*
@@ -3365,8 +3602,8 @@ ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
 						ExprEvalStep scratch2 = {0};
 
 						/* Yes, so make output workspace for MAKE_READONLY */
-						domainval = (Datum *) palloc(sizeof(Datum));
-						domainnull = (bool *) palloc(sizeof(bool));
+						domainval = palloc_object(Datum);
+						domainnull = palloc_object(bool);
 
 						/* Emit MAKE_READONLY */
 						scratch2.opcode = EEOP_MAKE_READONLY;
@@ -3438,7 +3675,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 	PlanState  *parent = &aggstate->ss.ps;
 	ExprEvalStep scratch = {0};
 	bool		isCombine = DO_AGGSPLIT_COMBINE(aggstate->aggsplit);
-	ExprSetupInfo deform = {0, 0, 0, NIL};
+	ExprSetupInfo deform = {0, 0, 0, 0, 0, NIL};
 
 	state->expr = (Expr *) aggstate;
 	state->parent = parent;
@@ -3657,6 +3894,8 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 		{
 			if (strictnulls)
 				scratch.opcode = EEOP_AGG_STRICT_INPUT_CHECK_NULLS;
+			else if (strictargs && pertrans->numTransInputs == 1)
+				scratch.opcode = EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1;
 			else
 				scratch.opcode = EEOP_AGG_STRICT_INPUT_CHECK_ARGS;
 			scratch.d.agg_strict_input_check.nulls = strictnulls;
@@ -3733,6 +3972,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 				as->d.jump.jumpdone = state->steps_len;
 			}
 			else if (as->opcode == EEOP_AGG_STRICT_INPUT_CHECK_ARGS ||
+					 as->opcode == EEOP_AGG_STRICT_INPUT_CHECK_ARGS_1 ||
 					 as->opcode == EEOP_AGG_STRICT_INPUT_CHECK_NULLS)
 			{
 				Assert(as->d.agg_strict_input_check.jumpnull == -1);
@@ -3756,7 +3996,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 
 	scratch.resvalue = NULL;
 	scratch.resnull = NULL;
-	scratch.opcode = EEOP_DONE;
+	scratch.opcode = EEOP_DONE_NO_RETURN;
 	ExprEvalPushStep(state, &scratch);
 
 	ExecReadyExpr(state);
@@ -3876,6 +4116,335 @@ ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 }
 
 /*
+ * Build an ExprState that calls the given hash function(s) on the attnums
+ * given by 'keyColIdx' .  When numCols > 1, the hash values returned by each
+ * hash function are combined to produce a single hash value.
+ *
+ * desc: tuple descriptor for the to-be-hashed columns
+ * ops: TupleTableSlotOps to use for the give TupleDesc
+ * hashfunctions: FmgrInfos for each hash function to call, one per numCols.
+ * These are used directly in the returned ExprState so must remain allocated.
+ * collations: collation to use when calling the hash function.
+ * numCols: array length of hashfunctions, collations and keyColIdx.
+ * parent: PlanState node that the resulting ExprState will be evaluated at
+ * init_value: Normally 0, but can be set to other values to seed the hash
+ * with.  Non-zero is marginally slower, so best to only use if it's provably
+ * worthwhile.
+ */
+ExprState *
+ExecBuildHash32FromAttrs(TupleDesc desc, const TupleTableSlotOps *ops,
+						 FmgrInfo *hashfunctions, Oid *collations,
+						 int numCols, AttrNumber *keyColIdx,
+						 PlanState *parent, uint32 init_value)
+{
+	ExprState  *state = makeNode(ExprState);
+	ExprEvalStep scratch = {0};
+	NullableDatum *iresult = NULL;
+	intptr_t	opcode;
+	AttrNumber	last_attnum = 0;
+
+	Assert(numCols >= 0);
+
+	state->parent = parent;
+
+	/*
+	 * Make a place to store intermediate hash values between subsequent
+	 * hashing of individual columns.  We only need this if there is more than
+	 * one column to hash or an initial value plus one column.
+	 */
+	if ((int64) numCols + (init_value != 0) > 1)
+		iresult = palloc_object(NullableDatum);
+
+	/* find the highest attnum so we deform the tuple to that point */
+	for (int i = 0; i < numCols; i++)
+		last_attnum = Max(last_attnum, keyColIdx[i]);
+
+	scratch.opcode = EEOP_INNER_FETCHSOME;
+	scratch.d.fetch.last_var = last_attnum;
+	scratch.d.fetch.fixed = false;
+	scratch.d.fetch.kind = ops;
+	scratch.d.fetch.known_desc = desc;
+	if (ExecComputeSlotInfo(state, &scratch))
+		ExprEvalPushStep(state, &scratch);
+
+	if (init_value == 0)
+	{
+		/*
+		 * No initial value, so we can assign the result of the hash function
+		 * for the first attribute without having to concern ourselves with
+		 * combining the result with any initial value.
+		 */
+		opcode = EEOP_HASHDATUM_FIRST;
+	}
+	else
+	{
+		/*
+		 * Set up operation to set the initial value.  Normally we store this
+		 * in the intermediate hash value location, but if there are no
+		 * columns to hash, store it in the ExprState's result field.
+		 */
+		scratch.opcode = EEOP_HASHDATUM_SET_INITVAL;
+		scratch.d.hashdatum_initvalue.init_value = UInt32GetDatum(init_value);
+		scratch.resvalue = numCols > 0 ? &iresult->value : &state->resvalue;
+		scratch.resnull = numCols > 0 ? &iresult->isnull : &state->resnull;
+
+		ExprEvalPushStep(state, &scratch);
+
+		/*
+		 * When using an initial value use the NEXT32 ops as the FIRST ops
+		 * would overwrite the stored initial value.
+		 */
+		opcode = EEOP_HASHDATUM_NEXT32;
+	}
+
+	for (int i = 0; i < numCols; i++)
+	{
+		FmgrInfo   *finfo;
+		FunctionCallInfo fcinfo;
+		Oid			inputcollid = collations[i];
+		AttrNumber	attnum = keyColIdx[i] - 1;
+
+		finfo = &hashfunctions[i];
+		fcinfo = palloc0(SizeForFunctionCallInfo(1));
+
+		/* Initialize function call parameter structure too */
+		InitFunctionCallInfoData(*fcinfo, finfo, 1, inputcollid, NULL, NULL);
+
+		/*
+		 * Fetch inner Var for this attnum and store it in the 1st arg of the
+		 * hash func.
+		 */
+		scratch.opcode = EEOP_INNER_VAR;
+		scratch.resvalue = &fcinfo->args[0].value;
+		scratch.resnull = &fcinfo->args[0].isnull;
+		scratch.d.var.attnum = attnum;
+		scratch.d.var.vartype = TupleDescAttr(desc, attnum)->atttypid;
+		scratch.d.var.varreturningtype = VAR_RETURNING_DEFAULT;
+
+		ExprEvalPushStep(state, &scratch);
+
+		/* Call the hash function */
+		scratch.opcode = opcode;
+
+		if (i == numCols - 1)
+		{
+			/*
+			 * The result for hashing the final column is stored in the
+			 * ExprState.
+			 */
+			scratch.resvalue = &state->resvalue;
+			scratch.resnull = &state->resnull;
+		}
+		else
+		{
+			Assert(iresult != NULL);
+
+			/* intermediate values are stored in an intermediate result */
+			scratch.resvalue = &iresult->value;
+			scratch.resnull = &iresult->isnull;
+		}
+
+		/*
+		 * NEXT32 opcodes need to look at the intermediate result.  We might
+		 * as well just set this for all ops.  FIRSTs won't look at it.
+		 */
+		scratch.d.hashdatum.iresult = iresult;
+
+		scratch.d.hashdatum.finfo = finfo;
+		scratch.d.hashdatum.fcinfo_data = fcinfo;
+		scratch.d.hashdatum.fn_addr = finfo->fn_addr;
+		scratch.d.hashdatum.jumpdone = -1;
+
+		ExprEvalPushStep(state, &scratch);
+
+		/* subsequent attnums must be combined with the previous */
+		opcode = EEOP_HASHDATUM_NEXT32;
+	}
+
+	scratch.resvalue = NULL;
+	scratch.resnull = NULL;
+	scratch.opcode = EEOP_DONE_RETURN;
+	ExprEvalPushStep(state, &scratch);
+
+	ExecReadyExpr(state);
+
+	return state;
+}
+
+/*
+ * Build an ExprState that calls the given hash function(s) on the given
+ * 'hash_exprs'.  When multiple expressions are present, the hash values
+ * returned by each hash function are combined to produce a single hash value.
+ *
+ * desc: tuple descriptor for the to-be-hashed expressions
+ * ops: TupleTableSlotOps for the TupleDesc
+ * hashfunc_oids: Oid for each hash function to call, one for each 'hash_expr'
+ * collations: collation to use when calling the hash function.
+ * hash_expr: list of expressions to hash the value of
+ * opstrict: array corresponding to the 'hashfunc_oids' to store op_strict()
+ * parent: PlanState node that the 'hash_exprs' will be evaluated at
+ * init_value: Normally 0, but can be set to other values to seed the hash
+ * with some other value.  Using non-zero is slightly less efficient but can
+ * be useful.
+ * keep_nulls: if true, evaluation of the returned ExprState will abort early
+ * returning NULL if the given hash function is strict and the Datum to hash
+ * is null.  When set to false, any NULL input Datums are skipped.
+ */
+ExprState *
+ExecBuildHash32Expr(TupleDesc desc, const TupleTableSlotOps *ops,
+					const Oid *hashfunc_oids, const List *collations,
+					const List *hash_exprs, const bool *opstrict,
+					PlanState *parent, uint32 init_value, bool keep_nulls)
+{
+	ExprState  *state = makeNode(ExprState);
+	ExprEvalStep scratch = {0};
+	NullableDatum *iresult = NULL;
+	List	   *adjust_jumps = NIL;
+	ListCell   *lc;
+	ListCell   *lc2;
+	intptr_t	strict_opcode;
+	intptr_t	opcode;
+	int			num_exprs = list_length(hash_exprs);
+
+	Assert(num_exprs == list_length(collations));
+
+	state->parent = parent;
+
+	/* Insert setup steps as needed. */
+	ExecCreateExprSetupSteps(state, (Node *) hash_exprs);
+
+	/*
+	 * Make a place to store intermediate hash values between subsequent
+	 * hashing of individual expressions.  We only need this if there is more
+	 * than one expression to hash or an initial value plus one expression.
+	 */
+	if ((int64) num_exprs + (init_value != 0) > 1)
+		iresult = palloc_object(NullableDatum);
+
+	if (init_value == 0)
+	{
+		/*
+		 * No initial value, so we can assign the result of the hash function
+		 * for the first hash_expr without having to concern ourselves with
+		 * combining the result with any initial value.
+		 */
+		strict_opcode = EEOP_HASHDATUM_FIRST_STRICT;
+		opcode = EEOP_HASHDATUM_FIRST;
+	}
+	else
+	{
+		/*
+		 * Set up operation to set the initial value.  Normally we store this
+		 * in the intermediate hash value location, but if there are no exprs
+		 * to hash, store it in the ExprState's result field.
+		 */
+		scratch.opcode = EEOP_HASHDATUM_SET_INITVAL;
+		scratch.d.hashdatum_initvalue.init_value = UInt32GetDatum(init_value);
+		scratch.resvalue = num_exprs > 0 ? &iresult->value : &state->resvalue;
+		scratch.resnull = num_exprs > 0 ? &iresult->isnull : &state->resnull;
+
+		ExprEvalPushStep(state, &scratch);
+
+		/*
+		 * When using an initial value use the NEXT32/NEXT32_STRICT ops as the
+		 * FIRST/FIRST_STRICT ops would overwrite the stored initial value.
+		 */
+		strict_opcode = EEOP_HASHDATUM_NEXT32_STRICT;
+		opcode = EEOP_HASHDATUM_NEXT32;
+	}
+
+	forboth(lc, hash_exprs, lc2, collations)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		FmgrInfo   *finfo;
+		FunctionCallInfo fcinfo;
+		int			i = foreach_current_index(lc);
+		Oid			funcid;
+		Oid			inputcollid = lfirst_oid(lc2);
+
+		funcid = hashfunc_oids[i];
+
+		/* Allocate hash function lookup data. */
+		finfo = palloc0_object(FmgrInfo);
+		fcinfo = palloc0(SizeForFunctionCallInfo(1));
+
+		fmgr_info(funcid, finfo);
+
+		/*
+		 * Build the steps to evaluate the hash function's argument have it so
+		 * the value of that is stored in the 0th argument of the hash func.
+		 */
+		ExecInitExprRec(expr,
+						state,
+						&fcinfo->args[0].value,
+						&fcinfo->args[0].isnull);
+
+		if (i == num_exprs - 1)
+		{
+			/* the result for hashing the final expr is stored in the state */
+			scratch.resvalue = &state->resvalue;
+			scratch.resnull = &state->resnull;
+		}
+		else
+		{
+			Assert(iresult != NULL);
+
+			/* intermediate values are stored in an intermediate result */
+			scratch.resvalue = &iresult->value;
+			scratch.resnull = &iresult->isnull;
+		}
+
+		/*
+		 * NEXT32 opcodes need to look at the intermediate result.  We might
+		 * as well just set this for all ops.  FIRSTs won't look at it.
+		 */
+		scratch.d.hashdatum.iresult = iresult;
+
+		/* Initialize function call parameter structure too */
+		InitFunctionCallInfoData(*fcinfo, finfo, 1, inputcollid, NULL, NULL);
+
+		scratch.d.hashdatum.finfo = finfo;
+		scratch.d.hashdatum.fcinfo_data = fcinfo;
+		scratch.d.hashdatum.fn_addr = finfo->fn_addr;
+
+		scratch.opcode = opstrict[i] && !keep_nulls ? strict_opcode : opcode;
+		scratch.d.hashdatum.jumpdone = -1;
+
+		ExprEvalPushStep(state, &scratch);
+		adjust_jumps = lappend_int(adjust_jumps, state->steps_len - 1);
+
+		/*
+		 * For subsequent keys we must combine the hash value with the
+		 * previous hashes.
+		 */
+		strict_opcode = EEOP_HASHDATUM_NEXT32_STRICT;
+		opcode = EEOP_HASHDATUM_NEXT32;
+	}
+
+	/* adjust jump targets */
+	foreach(lc, adjust_jumps)
+	{
+		ExprEvalStep *as = &state->steps[lfirst_int(lc)];
+
+		Assert(as->opcode == EEOP_HASHDATUM_FIRST ||
+			   as->opcode == EEOP_HASHDATUM_FIRST_STRICT ||
+			   as->opcode == EEOP_HASHDATUM_NEXT32 ||
+			   as->opcode == EEOP_HASHDATUM_NEXT32_STRICT);
+		Assert(as->d.hashdatum.jumpdone == -1);
+		as->d.hashdatum.jumpdone = state->steps_len;
+	}
+
+	scratch.resvalue = NULL;
+	scratch.resnull = NULL;
+	scratch.opcode = EEOP_DONE_RETURN;
+	ExprEvalPushStep(state, &scratch);
+
+	ExecReadyExpr(state);
+
+	return state;
+}
+
+/*
  * Build equality expression that can be evaluated using ExecQual(), returning
  * true if the expression context's inner/outer tuple are NOT DISTINCT. I.e
  * two nulls match, a null and a not-null don't match.
@@ -3965,7 +4534,7 @@ ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
 		InvokeFunctionExecuteHook(foid);
 
 		/* Set up the primary fmgr lookup information */
-		finfo = palloc0(sizeof(FmgrInfo));
+		finfo = palloc0_object(FmgrInfo);
 		fcinfo = palloc0(SizeForFunctionCallInfo(2));
 		fmgr_info(foid, finfo);
 		fmgr_info_set_expr(NULL, finfo);
@@ -3976,6 +4545,7 @@ ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
 		scratch.opcode = EEOP_INNER_VAR;
 		scratch.d.var.attnum = attno - 1;
 		scratch.d.var.vartype = latt->atttypid;
+		scratch.d.var.varreturningtype = VAR_RETURNING_DEFAULT;
 		scratch.resvalue = &fcinfo->args[0].value;
 		scratch.resnull = &fcinfo->args[0].isnull;
 		ExprEvalPushStep(state, &scratch);
@@ -3984,6 +4554,7 @@ ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
 		scratch.opcode = EEOP_OUTER_VAR;
 		scratch.d.var.attnum = attno - 1;
 		scratch.d.var.vartype = ratt->atttypid;
+		scratch.d.var.varreturningtype = VAR_RETURNING_DEFAULT;
 		scratch.resvalue = &fcinfo->args[1].value;
 		scratch.resnull = &fcinfo->args[1].isnull;
 		ExprEvalPushStep(state, &scratch);
@@ -4020,7 +4591,7 @@ ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
 
 	scratch.resvalue = NULL;
 	scratch.resnull = NULL;
-	scratch.opcode = EEOP_DONE;
+	scratch.opcode = EEOP_DONE_RETURN;
 	ExprEvalPushStep(state, &scratch);
 
 	ExecReadyExpr(state);
@@ -4099,7 +4670,7 @@ ExecBuildParamSetEqual(TupleDesc desc,
 		InvokeFunctionExecuteHook(foid);
 
 		/* Set up the primary fmgr lookup information */
-		finfo = palloc0(sizeof(FmgrInfo));
+		finfo = palloc0_object(FmgrInfo);
 		fcinfo = palloc0(SizeForFunctionCallInfo(2));
 		fmgr_info(foid, finfo);
 		fmgr_info_set_expr(NULL, finfo);
@@ -4110,6 +4681,7 @@ ExecBuildParamSetEqual(TupleDesc desc,
 		scratch.opcode = EEOP_INNER_VAR;
 		scratch.d.var.attnum = attno;
 		scratch.d.var.vartype = att->atttypid;
+		scratch.d.var.varreturningtype = VAR_RETURNING_DEFAULT;
 		scratch.resvalue = &fcinfo->args[0].value;
 		scratch.resnull = &fcinfo->args[0].isnull;
 		ExprEvalPushStep(state, &scratch);
@@ -4118,6 +4690,7 @@ ExecBuildParamSetEqual(TupleDesc desc,
 		scratch.opcode = EEOP_OUTER_VAR;
 		scratch.d.var.attnum = attno;
 		scratch.d.var.vartype = att->atttypid;
+		scratch.d.var.varreturningtype = VAR_RETURNING_DEFAULT;
 		scratch.resvalue = &fcinfo->args[1].value;
 		scratch.resnull = &fcinfo->args[1].isnull;
 		ExprEvalPushStep(state, &scratch);
@@ -4154,10 +4727,340 @@ ExecBuildParamSetEqual(TupleDesc desc,
 
 	scratch.resvalue = NULL;
 	scratch.resnull = NULL;
-	scratch.opcode = EEOP_DONE;
+	scratch.opcode = EEOP_DONE_RETURN;
 	ExprEvalPushStep(state, &scratch);
 
 	ExecReadyExpr(state);
 
 	return state;
+}
+
+/*
+ * Push steps to evaluate a JsonExpr and its various subsidiary expressions.
+ */
+static void
+ExecInitJsonExpr(JsonExpr *jsexpr, ExprState *state,
+				 Datum *resv, bool *resnull,
+				 ExprEvalStep *scratch)
+{
+	JsonExprState *jsestate = palloc0_object(JsonExprState);
+	ListCell   *argexprlc;
+	ListCell   *argnamelc;
+	List	   *jumps_return_null = NIL;
+	List	   *jumps_to_end = NIL;
+	ListCell   *lc;
+	ErrorSaveContext *escontext;
+	bool		returning_domain =
+		get_typtype(jsexpr->returning->typid) == TYPTYPE_DOMAIN;
+
+	Assert(jsexpr->on_error != NULL);
+
+	jsestate->jsexpr = jsexpr;
+
+	/*
+	 * Evaluate formatted_expr storing the result into
+	 * jsestate->formatted_expr.
+	 */
+	ExecInitExprRec((Expr *) jsexpr->formatted_expr, state,
+					&jsestate->formatted_expr.value,
+					&jsestate->formatted_expr.isnull);
+
+	/* JUMP to return NULL if formatted_expr evaluates to NULL */
+	jumps_return_null = lappend_int(jumps_return_null, state->steps_len);
+	scratch->opcode = EEOP_JUMP_IF_NULL;
+	scratch->resnull = &jsestate->formatted_expr.isnull;
+	scratch->d.jump.jumpdone = -1;	/* set below */
+	ExprEvalPushStep(state, scratch);
+
+	/*
+	 * Evaluate pathspec expression storing the result into
+	 * jsestate->pathspec.
+	 */
+	ExecInitExprRec((Expr *) jsexpr->path_spec, state,
+					&jsestate->pathspec.value,
+					&jsestate->pathspec.isnull);
+
+	/* JUMP to return NULL if path_spec evaluates to NULL */
+	jumps_return_null = lappend_int(jumps_return_null, state->steps_len);
+	scratch->opcode = EEOP_JUMP_IF_NULL;
+	scratch->resnull = &jsestate->pathspec.isnull;
+	scratch->d.jump.jumpdone = -1;	/* set below */
+	ExprEvalPushStep(state, scratch);
+
+	/* Steps to compute PASSING args. */
+	jsestate->args = NIL;
+	forboth(argexprlc, jsexpr->passing_values,
+			argnamelc, jsexpr->passing_names)
+	{
+		Expr	   *argexpr = (Expr *) lfirst(argexprlc);
+		String	   *argname = lfirst_node(String, argnamelc);
+		JsonPathVariable *var = palloc_object(JsonPathVariable);
+
+		var->name = argname->sval;
+		var->namelen = strlen(var->name);
+		var->typid = exprType((Node *) argexpr);
+		var->typmod = exprTypmod((Node *) argexpr);
+
+		ExecInitExprRec(argexpr, state, &var->value, &var->isnull);
+
+		jsestate->args = lappend(jsestate->args, var);
+	}
+
+	/* Step for jsonpath evaluation; see ExecEvalJsonExprPath(). */
+	scratch->opcode = EEOP_JSONEXPR_PATH;
+	scratch->resvalue = resv;
+	scratch->resnull = resnull;
+	scratch->d.jsonexpr.jsestate = jsestate;
+	ExprEvalPushStep(state, scratch);
+
+	/*
+	 * Step to return NULL after jumping to skip the EEOP_JSONEXPR_PATH step
+	 * when either formatted_expr or pathspec is NULL.  Adjust jump target
+	 * addresses of JUMPs that we added above.
+	 */
+	foreach(lc, jumps_return_null)
+	{
+		ExprEvalStep *as = &state->steps[lfirst_int(lc)];
+
+		as->d.jump.jumpdone = state->steps_len;
+	}
+	scratch->opcode = EEOP_CONST;
+	scratch->resvalue = resv;
+	scratch->resnull = resnull;
+	scratch->d.constval.value = (Datum) 0;
+	scratch->d.constval.isnull = true;
+	ExprEvalPushStep(state, scratch);
+
+	escontext = jsexpr->on_error->btype != JSON_BEHAVIOR_ERROR ?
+		&jsestate->escontext : NULL;
+
+	/*
+	 * To handle coercion errors softly, use the following ErrorSaveContext to
+	 * pass to ExecInitExprRec() when initializing the coercion expressions
+	 * and in the EEOP_JSONEXPR_COERCION step.
+	 */
+	jsestate->escontext.type = T_ErrorSaveContext;
+
+	/*
+	 * Steps to coerce the result value computed by EEOP_JSONEXPR_PATH or the
+	 * NULL returned on NULL input as described above.
+	 */
+	jsestate->jump_eval_coercion = -1;
+	if (jsexpr->use_json_coercion)
+	{
+		jsestate->jump_eval_coercion = state->steps_len;
+
+		ExecInitJsonCoercion(state, jsexpr->returning, escontext,
+							 jsexpr->omit_quotes,
+							 jsexpr->op == JSON_EXISTS_OP,
+							 resv, resnull);
+	}
+	else if (jsexpr->use_io_coercion)
+	{
+		/*
+		 * Here we only need to initialize the FunctionCallInfo for the target
+		 * type's input function, which is called by ExecEvalJsonExprPath()
+		 * itself, so no additional step is necessary.
+		 */
+		Oid			typinput;
+		Oid			typioparam;
+		FmgrInfo   *finfo;
+		FunctionCallInfo fcinfo;
+
+		getTypeInputInfo(jsexpr->returning->typid, &typinput, &typioparam);
+		finfo = palloc0_object(FmgrInfo);
+		fcinfo = palloc0(SizeForFunctionCallInfo(3));
+		fmgr_info(typinput, finfo);
+		fmgr_info_set_expr((Node *) jsexpr->returning, finfo);
+		InitFunctionCallInfoData(*fcinfo, finfo, 3, InvalidOid, NULL, NULL);
+
+		/*
+		 * We can preload the second and third arguments for the input
+		 * function, since they're constants.
+		 */
+		fcinfo->args[1].value = ObjectIdGetDatum(typioparam);
+		fcinfo->args[1].isnull = false;
+		fcinfo->args[2].value = Int32GetDatum(jsexpr->returning->typmod);
+		fcinfo->args[2].isnull = false;
+		fcinfo->context = (Node *) escontext;
+
+		jsestate->input_fcinfo = fcinfo;
+	}
+
+	/*
+	 * Add a special step, if needed, to check if the coercion evaluation ran
+	 * into an error but was not thrown because the ON ERROR behavior is not
+	 * ERROR.  It will set jsestate->error if an error did occur.
+	 */
+	if (jsestate->jump_eval_coercion >= 0 && escontext != NULL)
+	{
+		scratch->opcode = EEOP_JSONEXPR_COERCION_FINISH;
+		scratch->d.jsonexpr.jsestate = jsestate;
+		ExprEvalPushStep(state, scratch);
+	}
+
+	jsestate->jump_empty = jsestate->jump_error = -1;
+
+	/*
+	 * Step to check jsestate->error and return the ON ERROR expression if
+	 * there is one.  This handles both the errors that occur during jsonpath
+	 * evaluation in EEOP_JSONEXPR_PATH and subsequent coercion evaluation.
+	 *
+	 * Speed up common cases by avoiding extra steps for a NULL-valued ON
+	 * ERROR expression unless RETURNING a domain type, where constraints must
+	 * be checked. ExecEvalJsonExprPath() already returns NULL on error,
+	 * making additional steps unnecessary in typical scenarios. Note that the
+	 * default ON ERROR behavior for JSON_VALUE() and JSON_QUERY() is to
+	 * return NULL.
+	 */
+	if (jsexpr->on_error->btype != JSON_BEHAVIOR_ERROR &&
+		(!(IsA(jsexpr->on_error->expr, Const) &&
+		   ((Const *) jsexpr->on_error->expr)->constisnull) ||
+		 returning_domain))
+	{
+		ErrorSaveContext *saved_escontext;
+
+		jsestate->jump_error = state->steps_len;
+
+		/* JUMP to end if false, that is, skip the ON ERROR expression. */
+		jumps_to_end = lappend_int(jumps_to_end, state->steps_len);
+		scratch->opcode = EEOP_JUMP_IF_NOT_TRUE;
+		scratch->resvalue = &jsestate->error.value;
+		scratch->resnull = &jsestate->error.isnull;
+		scratch->d.jump.jumpdone = -1;	/* set below */
+		ExprEvalPushStep(state, scratch);
+
+		/*
+		 * Steps to evaluate the ON ERROR expression; handle errors softly to
+		 * rethrow them in COERCION_FINISH step that will be added later.
+		 */
+		saved_escontext = state->escontext;
+		state->escontext = escontext;
+		ExecInitExprRec((Expr *) jsexpr->on_error->expr,
+						state, resv, resnull);
+		state->escontext = saved_escontext;
+
+		/* Step to coerce the ON ERROR expression if needed */
+		if (jsexpr->on_error->coerce)
+			ExecInitJsonCoercion(state, jsexpr->returning, escontext,
+								 jsexpr->omit_quotes, false,
+								 resv, resnull);
+
+		/*
+		 * Add a COERCION_FINISH step to check for errors that may occur when
+		 * coercing and rethrow them.
+		 */
+		if (jsexpr->on_error->coerce ||
+			IsA(jsexpr->on_error->expr, CoerceViaIO) ||
+			IsA(jsexpr->on_error->expr, CoerceToDomain))
+		{
+			scratch->opcode = EEOP_JSONEXPR_COERCION_FINISH;
+			scratch->resvalue = resv;
+			scratch->resnull = resnull;
+			scratch->d.jsonexpr.jsestate = jsestate;
+			ExprEvalPushStep(state, scratch);
+		}
+
+		/* JUMP to end to skip the ON EMPTY steps added below. */
+		jumps_to_end = lappend_int(jumps_to_end, state->steps_len);
+		scratch->opcode = EEOP_JUMP;
+		scratch->d.jump.jumpdone = -1;
+		ExprEvalPushStep(state, scratch);
+	}
+
+	/*
+	 * Step to check jsestate->empty and return the ON EMPTY expression if
+	 * there is one.
+	 *
+	 * See the comment above for details on the optimization for NULL-valued
+	 * expressions.
+	 */
+	if (jsexpr->on_empty != NULL &&
+		jsexpr->on_empty->btype != JSON_BEHAVIOR_ERROR &&
+		(!(IsA(jsexpr->on_empty->expr, Const) &&
+		   ((Const *) jsexpr->on_empty->expr)->constisnull) ||
+		 returning_domain))
+	{
+		ErrorSaveContext *saved_escontext;
+
+		jsestate->jump_empty = state->steps_len;
+
+		/* JUMP to end if false, that is, skip the ON EMPTY expression. */
+		jumps_to_end = lappend_int(jumps_to_end, state->steps_len);
+		scratch->opcode = EEOP_JUMP_IF_NOT_TRUE;
+		scratch->resvalue = &jsestate->empty.value;
+		scratch->resnull = &jsestate->empty.isnull;
+		scratch->d.jump.jumpdone = -1;	/* set below */
+		ExprEvalPushStep(state, scratch);
+
+		/*
+		 * Steps to evaluate the ON EMPTY expression; handle errors softly to
+		 * rethrow them in COERCION_FINISH step that will be added later.
+		 */
+		saved_escontext = state->escontext;
+		state->escontext = escontext;
+		ExecInitExprRec((Expr *) jsexpr->on_empty->expr,
+						state, resv, resnull);
+		state->escontext = saved_escontext;
+
+		/* Step to coerce the ON EMPTY expression if needed */
+		if (jsexpr->on_empty->coerce)
+			ExecInitJsonCoercion(state, jsexpr->returning, escontext,
+								 jsexpr->omit_quotes, false,
+								 resv, resnull);
+
+		/*
+		 * Add a COERCION_FINISH step to check for errors that may occur when
+		 * coercing and rethrow them.
+		 */
+		if (jsexpr->on_empty->coerce ||
+			IsA(jsexpr->on_empty->expr, CoerceViaIO) ||
+			IsA(jsexpr->on_empty->expr, CoerceToDomain))
+		{
+
+			scratch->opcode = EEOP_JSONEXPR_COERCION_FINISH;
+			scratch->resvalue = resv;
+			scratch->resnull = resnull;
+			scratch->d.jsonexpr.jsestate = jsestate;
+			ExprEvalPushStep(state, scratch);
+		}
+	}
+
+	foreach(lc, jumps_to_end)
+	{
+		ExprEvalStep *as = &state->steps[lfirst_int(lc)];
+
+		as->d.jump.jumpdone = state->steps_len;
+	}
+
+	jsestate->jump_end = state->steps_len;
+}
+
+/*
+ * Initialize a EEOP_JSONEXPR_COERCION step to coerce the value given in resv
+ * to the given RETURNING type.
+ */
+static void
+ExecInitJsonCoercion(ExprState *state, JsonReturning *returning,
+					 ErrorSaveContext *escontext, bool omit_quotes,
+					 bool exists_coerce,
+					 Datum *resv, bool *resnull)
+{
+	ExprEvalStep scratch = {0};
+
+	/* For json_populate_type() */
+	scratch.opcode = EEOP_JSONEXPR_COERCION;
+	scratch.resvalue = resv;
+	scratch.resnull = resnull;
+	scratch.d.jsonexpr_coercion.targettype = returning->typid;
+	scratch.d.jsonexpr_coercion.targettypmod = returning->typmod;
+	scratch.d.jsonexpr_coercion.json_coercion_cache = NULL;
+	scratch.d.jsonexpr_coercion.escontext = escontext;
+	scratch.d.jsonexpr_coercion.omit_quotes = omit_quotes;
+	scratch.d.jsonexpr_coercion.exists_coerce = exists_coerce;
+	scratch.d.jsonexpr_coercion.exists_cast_to_int = exists_coerce &&
+		getBaseType(returning->typid) == INT4OID;
+	scratch.d.jsonexpr_coercion.exists_check_domain = exists_coerce &&
+		DomainHasConstraints(returning->typid);
+	ExprEvalPushStep(state, &scratch);
 }

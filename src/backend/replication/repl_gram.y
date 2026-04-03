@@ -3,7 +3,7 @@
  *
  * repl_gram.y				- Parser for the replication commands
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,9 +22,7 @@
 #include "replication/walsender.h"
 #include "replication/walsender_private.h"
 
-
-/* Result of the parsing is returned here */
-Node *replication_parse_result;
+#include "repl_gram.h"
 
 
 /*
@@ -37,6 +35,10 @@ Node *replication_parse_result;
 
 %}
 
+%parse-param {Node **replication_parse_result_p}
+%parse-param {yyscan_t yyscanner}
+%lex-param   {yyscan_t yyscanner}
+%pure-parser
 %expect 0
 %name-prefix="replication_yy"
 
@@ -64,6 +66,7 @@ Node *replication_parse_result;
 %token K_START_REPLICATION
 %token K_CREATE_REPLICATION_SLOT
 %token K_DROP_REPLICATION_SLOT
+%token K_ALTER_REPLICATION_SLOT
 %token K_TIMELINE_HISTORY
 %token K_WAIT
 %token K_TIMELINE
@@ -76,11 +79,13 @@ Node *replication_parse_result;
 %token K_EXPORT_SNAPSHOT
 %token K_NOEXPORT_SNAPSHOT
 %token K_USE_SNAPSHOT
+%token K_UPLOAD_MANIFEST
 
 %type <node>	command
 %type <node>	base_backup start_replication start_logical_replication
-				create_replication_slot drop_replication_slot identify_system
-				read_replication_slot timeline_history show
+				create_replication_slot drop_replication_slot
+				alter_replication_slot identify_system read_replication_slot
+				timeline_history show upload_manifest
 %type <list>	generic_option_list
 %type <defelt>	generic_option
 %type <uintval>	opt_timeline
@@ -96,7 +101,9 @@ Node *replication_parse_result;
 
 firstcmd: command opt_semicolon
 				{
-					replication_parse_result = $1;
+					*replication_parse_result_p = $1;
+
+					(void) yynerrs; /* suppress compiler warning */
 				}
 			;
 
@@ -111,9 +118,11 @@ command:
 			| start_logical_replication
 			| create_replication_slot
 			| drop_replication_slot
+			| alter_replication_slot
 			| read_replication_slot
 			| timeline_history
 			| show
+			| upload_manifest
 			;
 
 /*
@@ -257,8 +266,20 @@ drop_replication_slot:
 				}
 			;
 
+/* ALTER_REPLICATION_SLOT slot (options) */
+alter_replication_slot:
+			K_ALTER_REPLICATION_SLOT IDENT '(' generic_option_list ')'
+				{
+					AlterReplicationSlotCmd *cmd;
+					cmd = makeNode(AlterReplicationSlotCmd);
+					cmd->slotname = $2;
+					cmd->options = $4;
+					$$ = (Node *) cmd;
+				}
+			;
+
 /*
- * START_REPLICATION [SLOT slot] [PHYSICAL] %X/%X [TIMELINE %d]
+ * START_REPLICATION [SLOT slot] [PHYSICAL] %X/%08X [TIMELINE %u]
  */
 start_replication:
 			K_START_REPLICATION opt_slot opt_physical RECPTR opt_timeline
@@ -274,7 +295,7 @@ start_replication:
 				}
 			;
 
-/* START_REPLICATION SLOT slot LOGICAL %X/%X options */
+/* START_REPLICATION SLOT slot LOGICAL %X/%08X options */
 start_logical_replication:
 			K_START_REPLICATION K_SLOT IDENT K_LOGICAL RECPTR plugin_options
 				{
@@ -288,7 +309,7 @@ start_logical_replication:
 				}
 			;
 /*
- * TIMELINE_HISTORY %d
+ * TIMELINE_HISTORY %u
  */
 timeline_history:
 			K_TIMELINE_HISTORY UCONST
@@ -306,6 +327,15 @@ timeline_history:
 					$$ = (Node *) cmd;
 				}
 			;
+
+/* UPLOAD_MANIFEST doesn't currently accept any arguments */
+upload_manifest:
+			K_UPLOAD_MANIFEST
+				{
+					UploadManifestCmd *cmd = makeNode(UploadManifestCmd);
+
+					$$ = (Node *) cmd;
+				}
 
 opt_physical:
 			K_PHYSICAL
@@ -399,6 +429,7 @@ ident_or_keyword:
 			| K_START_REPLICATION			{ $$ = "start_replication"; }
 			| K_CREATE_REPLICATION_SLOT	{ $$ = "create_replication_slot"; }
 			| K_DROP_REPLICATION_SLOT		{ $$ = "drop_replication_slot"; }
+			| K_ALTER_REPLICATION_SLOT		{ $$ = "alter_replication_slot"; }
 			| K_TIMELINE_HISTORY			{ $$ = "timeline_history"; }
 			| K_WAIT						{ $$ = "wait"; }
 			| K_TIMELINE					{ $$ = "timeline"; }
@@ -411,6 +442,7 @@ ident_or_keyword:
 			| K_EXPORT_SNAPSHOT				{ $$ = "export_snapshot"; }
 			| K_NOEXPORT_SNAPSHOT			{ $$ = "noexport_snapshot"; }
 			| K_USE_SNAPSHOT				{ $$ = "use_snapshot"; }
+			| K_UPLOAD_MANIFEST				{ $$ = "upload_manifest"; }
 		;
 
 %%

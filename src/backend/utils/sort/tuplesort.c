@@ -7,8 +7,8 @@
  * applied to different kinds of sortable objects.  Implementation of
  * the particular sorting variants is given in tuplesortvariants.c.
  * This module works efficiently for both small and large amounts
- * of data.  Small amounts are sorted in-memory using qsort().  Large
- * amounts are sorted using temporary files and a standard external sort
+ * of data.  Small amounts are sorted in-memory.  Large amounts are
+ * sorted using temporary files and a standard external sort
  * algorithm.
  *
  * See Knuth, volume 3, for more than you want to know about external
@@ -26,16 +26,16 @@
  * Historically, we divided the input into sorted runs using replacement
  * selection, in the form of a priority tree implemented as a heap
  * (essentially Knuth's Algorithm 5.2.3H), but now we always use quicksort
- * for run generation.
+ * or radix sort for run generation.
  *
  * The approximate amount of memory allowed for any one sort operation
  * is specified in kilobytes by the caller (most pass work_mem).  Initially,
  * we absorb tuples and simply store them in an unsorted array as long as
  * we haven't exceeded workMem.  If we reach the end of the input without
- * exceeding workMem, we sort the array using qsort() and subsequently return
+ * exceeding workMem, we sort the array in memory and subsequently return
  * tuples just by scanning the tuple array sequentially.  If we do exceed
  * workMem, we begin to emit tuples into sorted runs in temporary tapes.
- * When tuples are dumped in batch after quicksorting, we begin a new run
+ * When tuples are dumped in batch after in-memory sorting, we begin a new run
  * with a new output tape.  If we reach the max number of tapes, we write
  * subsequent runs on the existing tapes in a round-robin fashion.  We will
  * need multiple merge passes to finish the merge in that case.  After the
@@ -88,7 +88,7 @@
  * produce exactly one output run from their partial input.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -101,31 +101,25 @@
 
 #include <limits.h>
 
-#include "catalog/pg_am.h"
 #include "commands/tablespace.h"
-#include "executor/executor.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "storage/shmem.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
-#include "utils/rel.h"
 #include "utils/tuplesort.h"
 
 /*
- * Initial size of memtuples array.  We're trying to select this size so that
- * array doesn't exceed ALLOCSET_SEPARATE_THRESHOLD and so that the overhead of
- * allocation might possibly be lowered.  However, we don't consider array sizes
- * less than 1024.
- *
+ * Initial size of memtuples array.  This must be more than
+ * ALLOCSET_SEPARATE_THRESHOLD; see comments in grow_memtuples().  Clamp at
+ * 1024 elements to avoid excessive reallocs.
  */
 #define INITIAL_MEMTUPSIZE Max(1024, \
 	ALLOCSET_SEPARATE_THRESHOLD / sizeof(SortTuple) + 1)
 
 /* GUC variables */
-#ifdef TRACE_SORT
 bool		trace_sort = false;
-#endif
 
 #ifdef DEBUG_BOUNDED_SORT
 bool		optimize_bounded_sort = true;
@@ -162,7 +156,7 @@ typedef enum
 	TSS_BUILDRUNS,				/* Loading tuples; writing to tape */
 	TSS_SORTEDINMEM,			/* Sort completed entirely in memory */
 	TSS_SORTEDONTAPE,			/* Sort completed, final run is on tape */
-	TSS_FINALMERGE				/* Performing final merge on-the-fly */
+	TSS_FINALMERGE,				/* Performing final merge on-the-fly */
 } TupSortStatus;
 
 /*
@@ -194,15 +188,19 @@ struct Tuplesortstate
 								 * tuples to return? */
 	bool		boundUsed;		/* true if we made use of a bounded heap */
 	int			bound;			/* if bounded, the maximum number of tuples */
+	int64		tupleMem;		/* memory consumed by individual tuples.
+								 * storing this separately from what we track
+								 * in availMem allows us to subtract the
+								 * memory consumed by all tuples when dumping
+								 * tuples to tape */
 	int64		availMem;		/* remaining memory available, in bytes */
 	int64		allowedMem;		/* total memory allowed, in bytes */
 	int			maxTapes;		/* max number of input tapes to merge in each
 								 * pass */
 	int64		maxSpace;		/* maximum amount of space occupied among sort
 								 * of groups, either in-memory or on-disk */
-	bool		isMaxSpaceDisk; /* true when maxSpace is value for on-disk
-								 * space, false when it's value for in-memory
-								 * space */
+	bool		isMaxSpaceDisk; /* true when maxSpace tracks on-disk space,
+								 * false means in-memory */
 	TupSortStatus maxSpaceStatus;	/* sort status when maxSpace was reached */
 	LogicalTapeSet *tapeset;	/* logtape.c object for tapes in a temp file */
 
@@ -296,7 +294,7 @@ struct Tuplesortstate
 	bool		eof_reached;	/* reached EOF (needed for cursors) */
 
 	/* markpos_xxx holds marked position for mark and restore */
-	long		markpos_block;	/* tape block# (only used if SORTEDONTAPE) */
+	int64		markpos_block;	/* tape block# (only used if SORTEDONTAPE) */
 	int			markpos_offset; /* saved "current", or offset in tape block */
 	bool		markpos_eof;	/* saved "eof_reached" */
 
@@ -332,9 +330,7 @@ struct Tuplesortstate
 	/*
 	 * Resource snapshot for time of sort start.
 	 */
-#ifdef TRACE_SORT
 	PGRUsage	ru_start;
-#endif
 };
 
 /*
@@ -480,127 +476,14 @@ static void free_sort_tuple(Tuplesortstate *state, SortTuple *stup);
 static void tuplesort_free(Tuplesortstate *state);
 static void tuplesort_updatemax(Tuplesortstate *state);
 
-/*
- * Specialized comparators that we can inline into specialized sorts.  The goal
- * is to try to sort two tuples without having to follow the pointers to the
- * comparator or the tuple.
- *
- * XXX: For now, these fall back to comparator functions that will compare the
- * leading datum a second time.
- *
- * XXX: For now, there is no specialization for cases where datum1 is
- * authoritative and we don't even need to fall back to a callback at all (that
- * would be true for types like int4/int8/timestamp/date, but not true for
- * abbreviations of text or multi-key sorts.  There could be!  Is it worth it?
- */
-
-/* Used if first key's comparator is ssup_datum_unsigned_cmp */
-static pg_attribute_always_inline int
-qsort_tuple_unsigned_compare(SortTuple *a, SortTuple *b, Tuplesortstate *state)
-{
-	int			compare;
-
-	compare = ApplyUnsignedSortComparator(a->datum1, a->isnull1,
-										  b->datum1, b->isnull1,
-										  &state->base.sortKeys[0]);
-	if (compare != 0)
-		return compare;
-
-	/*
-	 * No need to waste effort calling the tiebreak function when there are no
-	 * other keys to sort on.
-	 */
-	if (state->base.onlyKey != NULL)
-		return 0;
-
-	return state->base.comparetup(a, b, state);
-}
-
-#if SIZEOF_DATUM >= 8
-/* Used if first key's comparator is ssup_datum_signed_cmp */
-static pg_attribute_always_inline int
-qsort_tuple_signed_compare(SortTuple *a, SortTuple *b, Tuplesortstate *state)
-{
-	int			compare;
-
-	compare = ApplySignedSortComparator(a->datum1, a->isnull1,
-										b->datum1, b->isnull1,
-										&state->base.sortKeys[0]);
-
-	if (compare != 0)
-		return compare;
-
-	/*
-	 * No need to waste effort calling the tiebreak function when there are no
-	 * other keys to sort on.
-	 */
-	if (state->base.onlyKey != NULL)
-		return 0;
-
-	return state->base.comparetup(a, b, state);
-}
-#endif
-
-/* Used if first key's comparator is ssup_datum_int32_cmp */
-static pg_attribute_always_inline int
-qsort_tuple_int32_compare(SortTuple *a, SortTuple *b, Tuplesortstate *state)
-{
-	int			compare;
-
-	compare = ApplyInt32SortComparator(a->datum1, a->isnull1,
-									   b->datum1, b->isnull1,
-									   &state->base.sortKeys[0]);
-
-	if (compare != 0)
-		return compare;
-
-	/*
-	 * No need to waste effort calling the tiebreak function when there are no
-	 * other keys to sort on.
-	 */
-	if (state->base.onlyKey != NULL)
-		return 0;
-
-	return state->base.comparetup(a, b, state);
-}
 
 /*
  * Special versions of qsort just for SortTuple objects.  qsort_tuple() sorts
  * any variant of SortTuples, using the appropriate comparetup function.
  * qsort_ssup() is specialized for the case where the comparetup function
  * reduces to ApplySortComparator(), that is single-key MinimalTuple sorts
- * and Datum sorts.  qsort_tuple_{unsigned,signed,int32} are specialized for
- * common comparison functions on pass-by-value leading datums.
+ * and Datum sorts.
  */
-
-#define ST_SORT qsort_tuple_unsigned
-#define ST_ELEMENT_TYPE SortTuple
-#define ST_COMPARE(a, b, state) qsort_tuple_unsigned_compare(a, b, state)
-#define ST_COMPARE_ARG_TYPE Tuplesortstate
-#define ST_CHECK_FOR_INTERRUPTS
-#define ST_SCOPE static
-#define ST_DEFINE
-#include "lib/sort_template.h"
-
-#if SIZEOF_DATUM >= 8
-#define ST_SORT qsort_tuple_signed
-#define ST_ELEMENT_TYPE SortTuple
-#define ST_COMPARE(a, b, state) qsort_tuple_signed_compare(a, b, state)
-#define ST_COMPARE_ARG_TYPE Tuplesortstate
-#define ST_CHECK_FOR_INTERRUPTS
-#define ST_SCOPE static
-#define ST_DEFINE
-#include "lib/sort_template.h"
-#endif
-
-#define ST_SORT qsort_tuple_int32
-#define ST_ELEMENT_TYPE SortTuple
-#define ST_COMPARE(a, b, state) qsort_tuple_int32_compare(a, b, state)
-#define ST_COMPARE_ARG_TYPE Tuplesortstate
-#define ST_CHECK_FOR_INTERRUPTS
-#define ST_SCOPE static
-#define ST_DEFINE
-#include "lib/sort_template.h"
 
 #define ST_SORT qsort_tuple
 #define ST_ELEMENT_TYPE SortTuple
@@ -622,6 +505,23 @@ qsort_tuple_int32_compare(SortTuple *a, SortTuple *b, Tuplesortstate *state)
 #define ST_SCOPE static
 #define ST_DEFINE
 #include "lib/sort_template.h"
+
+/* state for radix sort */
+typedef struct RadixSortInfo
+{
+	union
+	{
+		size_t		count;
+		size_t		offset;
+	};
+	size_t		next_offset;
+} RadixSortInfo;
+
+/*
+ * Threshold below which qsort_tuple() is generally faster than a radix sort.
+ */
+#define QSORT_THRESHOLD 40
+
 
 /*
  *		tuplesort_begin_xxx
@@ -681,12 +581,10 @@ tuplesort_begin_common(int workMem, SortCoordinate coordinate, int sortopt)
 	 */
 	oldcontext = MemoryContextSwitchTo(maincontext);
 
-	state = (Tuplesortstate *) palloc0(sizeof(Tuplesortstate));
+	state = palloc0_object(Tuplesortstate);
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		pg_rusage_init(&state->ru_start);
-#endif
 
 	state->base.sortopt = sortopt;
 	state->base.tuples = true;
@@ -702,10 +600,6 @@ tuplesort_begin_common(int workMem, SortCoordinate coordinate, int sortopt)
 	state->base.sortcontext = sortcontext;
 	state->base.maincontext = maincontext;
 
-	/*
-	 * Initial size of array must be more than ALLOCSET_SEPARATE_THRESHOLD;
-	 * see comments in grow_memtuples().
-	 */
 	state->memtupsize = INITIAL_MEMTUPSIZE;
 	state->memtuples = NULL;
 
@@ -770,18 +664,18 @@ tuplesort_begin_batch(Tuplesortstate *state)
 	 * in the parent context, not this context, because there is no need to
 	 * free memtuples early.  For bounded sorts, tuples may be pfreed in any
 	 * order, so we use a regular aset.c context so that it can make use of
-	 * free'd memory.  When the sort is not bounded, we make use of a
-	 * generation.c context as this keeps allocations more compact with less
-	 * wastage.  Allocations are also slightly more CPU efficient.
+	 * free'd memory.  When the sort is not bounded, we make use of a bump.c
+	 * context as this keeps allocations more compact with less wastage.
+	 * Allocations are also slightly more CPU efficient.
 	 */
-	if (state->base.sortopt & TUPLESORT_ALLOWBOUNDED)
+	if (TupleSortUseBumpTupleCxt(state->base.sortopt))
+		state->base.tuplecontext = BumpContextCreate(state->base.sortcontext,
+													 "Caller tuples",
+													 ALLOCSET_DEFAULT_SIZES);
+	else
 		state->base.tuplecontext = AllocSetContextCreate(state->base.sortcontext,
 														 "Caller tuples",
 														 ALLOCSET_DEFAULT_SIZES);
-	else
-		state->base.tuplecontext = GenerationContextCreate(state->base.sortcontext,
-														   "Caller tuples",
-														   ALLOCSET_DEFAULT_SIZES);
 
 
 	state->status = TSS_INITIAL;
@@ -794,10 +688,6 @@ tuplesort_begin_batch(Tuplesortstate *state)
 
 	state->memtupcount = 0;
 
-	/*
-	 * Initial size of array must be more than ALLOCSET_SEPARATE_THRESHOLD;
-	 * see comments in grow_memtuples().
-	 */
 	state->growmemtuples = true;
 	state->slabAllocatorUsed = false;
 	if (state->memtuples != NULL && state->memtupsize != INITIAL_MEMTUPSIZE)
@@ -904,21 +794,15 @@ tuplesort_free(Tuplesortstate *state)
 {
 	/* context swap probably not needed, but let's be safe */
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->base.sortcontext);
-
-#ifdef TRACE_SORT
-	long		spaceUsed;
+	int64		spaceUsed;
 
 	if (state->tapeset)
 		spaceUsed = LogicalTapeSetBlocks(state->tapeset);
 	else
 		spaceUsed = (state->allowedMem - state->availMem + 1023) / 1024;
-#endif
 
 	/*
 	 * Delete temporary "tape" files, if any.
-	 *
-	 * Note: want to include this in reported total cost of sort, hence need
-	 * for two #ifdef TRACE_SORT sections.
 	 *
 	 * We don't bother to destroy the individual tapes here. They will go away
 	 * with the sortcontext.  (In TSS_FINALMERGE state, we have closed
@@ -927,28 +811,19 @@ tuplesort_free(Tuplesortstate *state)
 	if (state->tapeset)
 		LogicalTapeSetClose(state->tapeset);
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 	{
 		if (state->tapeset)
-			elog(LOG, "%s of worker %d ended, %ld disk blocks used: %s",
+			elog(LOG, "%s of worker %d ended, %" PRId64 " disk blocks used: %s",
 				 SERIAL(state) ? "external sort" : "parallel external sort",
 				 state->worker, spaceUsed, pg_rusage_show(&state->ru_start));
 		else
-			elog(LOG, "%s of worker %d ended, %ld KB used: %s",
+			elog(LOG, "%s of worker %d ended, %" PRId64 " KB used: %s",
 				 SERIAL(state) ? "internal sort" : "unperformed parallel sort",
 				 state->worker, spaceUsed, pg_rusage_show(&state->ru_start));
 	}
 
 	TRACE_POSTGRESQL_SORT_DONE(state->tapeset != NULL, spaceUsed);
-#else
-
-	/*
-	 * If you disabled TRACE_SORT, you can still probe sort__done, but you
-	 * ain't getting space-used stats.
-	 */
-	TRACE_POSTGRESQL_SORT_DONE(state->tapeset != NULL, 0L);
-#endif
 
 	FREESTATE(state);
 	MemoryContextSwitchTo(oldcontext);
@@ -1187,15 +1062,16 @@ noalloc:
  * Shared code for tuple and datum cases.
  */
 void
-tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple, bool useAbbrev)
+tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
+						  bool useAbbrev, Size tuplen)
 {
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->base.sortcontext);
 
 	Assert(!LEADER(state));
 
-	/* Count the size of the out-of-line data */
-	if (tuple->tuple != NULL)
-		USEMEM(state, GetMemoryChunkSpace(tuple->tuple));
+	/* account for the memory used for this tuple */
+	USEMEM(state, tuplen);
+	state->tupleMem += tuplen;
 
 	if (!useAbbrev)
 	{
@@ -1262,12 +1138,10 @@ tuplesort_puttuple_common(Tuplesortstate *state, SortTuple *tuple, bool useAbbre
 				(state->memtupcount > state->bound * 2 ||
 				 (state->memtupcount > state->bound && LACKMEM(state))))
 			{
-#ifdef TRACE_SORT
 				if (trace_sort)
 					elog(LOG, "switching to bounded heapsort at %d tuples: %s",
 						 state->memtupcount,
 						 pg_rusage_show(&state->ru_start));
-#endif
 				make_bounded_heap(state);
 				MemoryContextSwitchTo(oldcontext);
 				return;
@@ -1386,11 +1260,9 @@ tuplesort_performsort(Tuplesortstate *state)
 {
 	MemoryContext oldcontext = MemoryContextSwitchTo(state->base.sortcontext);
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "performsort of worker %d starting: %s",
 			 state->worker, pg_rusage_show(&state->ru_start));
-#endif
 
 	switch (state->status)
 	{
@@ -1402,7 +1274,7 @@ tuplesort_performsort(Tuplesortstate *state)
 			 */
 			if (SERIAL(state))
 			{
-				/* Just qsort 'em and we're done */
+				/* Sort in memory and we're done */
 				tuplesort_sort_memtuples(state);
 				state->status = TSS_SORTEDINMEM;
 			}
@@ -1469,7 +1341,6 @@ tuplesort_performsort(Tuplesortstate *state)
 			break;
 	}
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 	{
 		if (state->status == TSS_FINALMERGE)
@@ -1480,7 +1351,6 @@ tuplesort_performsort(Tuplesortstate *state)
 			elog(LOG, "performsort of worker %d done: %s",
 				 state->worker, pg_rusage_show(&state->ru_start));
 	}
-#endif
 
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -1904,11 +1774,9 @@ inittapes(Tuplesortstate *state, bool mergeruns)
 		state->maxTapes = MINORDER;
 	}
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "worker %d switching to external sort with %d tapes: %s",
 			 state->worker, state->maxTapes, pg_rusage_show(&state->ru_start));
-#endif
 
 	/* Create the tape set */
 	inittapestate(state, state->maxTapes);
@@ -2117,11 +1985,9 @@ mergeruns(Tuplesortstate *state)
 	 */
 	state->tape_buffer_mem = state->availMem;
 	USEMEM(state, state->tape_buffer_mem);
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "worker %d using %zu KB of memory for tape buffers",
 			 state->worker, state->tape_buffer_mem / 1024);
-#endif
 
 	for (;;)
 	{
@@ -2166,12 +2032,10 @@ mergeruns(Tuplesortstate *state)
 													   state->nInputRuns,
 													   state->maxTapes);
 
-#ifdef TRACE_SORT
 			if (trace_sort)
 				elog(LOG, "starting merge pass of %d input runs on %d tapes, " INT64_FORMAT " KB of memory for each input tape: %s",
 					 state->nInputRuns, state->nInputTapes, input_buffer_size / 1024,
 					 pg_rusage_show(&state->ru_start));
-#endif
 
 			/* Prepare the new input tapes for merge pass. */
 			for (tapenum = 0; tapenum < state->nInputTapes; tapenum++)
@@ -2377,25 +2241,21 @@ dumptuples(Tuplesortstate *state, bool alltuples)
 
 	state->currentRun++;
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "worker %d starting quicksort of run %d: %s",
 			 state->worker, state->currentRun,
 			 pg_rusage_show(&state->ru_start));
-#endif
 
 	/*
 	 * Sort all tuples accumulated within the allowed amount of memory for
-	 * this run using quicksort
+	 * this run.
 	 */
 	tuplesort_sort_memtuples(state);
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "worker %d finished quicksort of run %d: %s",
 			 state->worker, state->currentRun,
 			 pg_rusage_show(&state->ru_start));
-#endif
 
 	memtupwrite = state->memtupcount;
 	for (i = 0; i < memtupwrite; i++)
@@ -2403,13 +2263,6 @@ dumptuples(Tuplesortstate *state, bool alltuples)
 		SortTuple  *stup = &state->memtuples[i];
 
 		WRITETUP(state, state->destTape, stup);
-
-		/*
-		 * Account for freeing the tuple, but no need to do the actual pfree
-		 * since the tuplecontext is being reset after the loop.
-		 */
-		if (stup->tuple != NULL)
-			FREEMEM(state, GetMemoryChunkSpace(stup->tuple));
 	}
 
 	state->memtupcount = 0;
@@ -2417,20 +2270,25 @@ dumptuples(Tuplesortstate *state, bool alltuples)
 	/*
 	 * Reset tuple memory.  We've freed all of the tuples that we previously
 	 * allocated.  It's important to avoid fragmentation when there is a stark
-	 * change in the sizes of incoming tuples.  Fragmentation due to
-	 * AllocSetFree's bucketing by size class might be particularly bad if
-	 * this step wasn't taken.
+	 * change in the sizes of incoming tuples.  In bounded sorts,
+	 * fragmentation due to AllocSetFree's bucketing by size class might be
+	 * particularly bad if this step wasn't taken.
 	 */
 	MemoryContextReset(state->base.tuplecontext);
 
+	/*
+	 * Now update the memory accounting to subtract the memory used by the
+	 * tuple.
+	 */
+	FREEMEM(state, state->tupleMem);
+	state->tupleMem = 0;
+
 	markrunend(state->destTape);
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG, "worker %d finished writing run %d to tape %d: %s",
 			 state->worker, state->currentRun, (state->currentRun - 1) % state->nOutputTapes + 1,
 			 pg_rusage_show(&state->ru_start));
-#endif
 }
 
 /*
@@ -2705,10 +2563,396 @@ sort_bounded_heap(Tuplesortstate *state)
 	state->boundUsed = true;
 }
 
+
+/* radix sort routines */
+
 /*
- * Sort all memtuples using specialized qsort() routines.
+ * Retrieve byte from datum, indexed by 'level': 0 for MSB, 7 for LSB
+ */
+static inline uint8
+current_byte(Datum key, int level)
+{
+	int			shift = (sizeof(Datum) - 1 - level) * BITS_PER_BYTE;
+
+	return (key >> shift) & 0xFF;
+}
+
+/*
+ * Normalize datum such that unsigned comparison is order-preserving,
+ * taking ASC/DESC into account as well.
+ */
+static inline Datum
+normalize_datum(Datum orig, SortSupport ssup)
+{
+	Datum		norm_datum1;
+
+	if (ssup->comparator == ssup_datum_signed_cmp)
+	{
+		norm_datum1 = orig + ((uint64) PG_INT64_MAX) + 1;
+	}
+	else if (ssup->comparator == ssup_datum_int32_cmp)
+	{
+		/*
+		 * First truncate to uint32. Technically, we don't need to do this,
+		 * but it forces the upper half of the datum to be zero regardless of
+		 * sign.
+		 */
+		uint32		u32 = DatumGetUInt32(orig) + ((uint32) PG_INT32_MAX) + 1;
+
+		norm_datum1 = UInt32GetDatum(u32);
+	}
+	else
+	{
+		Assert(ssup->comparator == ssup_datum_unsigned_cmp);
+		norm_datum1 = orig;
+	}
+
+	if (ssup->ssup_reverse)
+		norm_datum1 = ~norm_datum1;
+
+	return norm_datum1;
+}
+
+/*
+ * radix_sort_recursive
  *
- * Quicksort is used for small in-memory sorts, and external sort runs.
+ * Radix sort by (pass-by-value) datum1, diverting to qsort_tuple()
+ * for tiebreaks.
+ *
+ * This is a modification of
+ * ska_byte_sort() from https://github.com/skarupke/ska_sort
+ * The original copyright notice follows:
+ *
+ * Copyright Malte Skarupke 2016.
+ * Distributed under the Boost Software License, Version 1.0.
+ *
+ * Boost Software License - Version 1.0 - August 17th, 2003
+ *
+ * Permission is hereby granted, free of charge, to any person or organization
+ * obtaining a copy of the software and accompanying documentation covered by
+ * this license (the "Software") to use, reproduce, display, distribute,
+ * execute, and transmit the Software, and to prepare derivative works of the
+ * Software, and to permit third-parties to whom the Software is furnished to
+ * do so, all subject to the following:
+ *
+ * The copyright notices in the Software and this entire statement, including
+ * the above license grant, this restriction and the following disclaimer,
+ * must be included in all copies of the Software, in whole or in part, and
+ * all derivative works of the Software, unless such copies or derivative
+ * works are solely in the form of machine-executable object code generated by
+ * a source language processor.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
+ * SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
+ * FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+static void
+radix_sort_recursive(SortTuple *begin, size_t n_elems, int level, Tuplesortstate *state)
+{
+	RadixSortInfo partitions[256] = {0};
+	uint8		remaining_partitions[256];
+	size_t		total = 0;
+	int			num_partitions = 0;
+	int			num_remaining;
+	SortSupport ssup = &state->base.sortKeys[0];
+	size_t		start_offset = 0;
+	SortTuple  *partition_begin = begin;
+
+	/* count number of occurrences of each byte */
+	for (SortTuple *st = begin; st < begin + n_elems; st++)
+	{
+		uint8		this_partition;
+
+		/* extract the byte for this level from the normalized datum */
+		this_partition = current_byte(normalize_datum(st->datum1, ssup),
+									  level);
+
+		/* save it for the permutation step */
+		st->curbyte = this_partition;
+
+		partitions[this_partition].count++;
+
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	/* compute partition offsets */
+	for (int i = 0; i < 256; i++)
+	{
+		size_t		count = partitions[i].count;
+
+		if (count != 0)
+		{
+			partitions[i].offset = total;
+			total += count;
+			remaining_partitions[num_partitions] = i;
+			num_partitions++;
+		}
+		partitions[i].next_offset = total;
+	}
+
+	/*
+	 * Swap tuples to correct partition.
+	 *
+	 * In traditional American flag sort, a swap sends the current element to
+	 * the correct partition, but the array pointer only advances if the
+	 * partner of the swap happens to be an element that belongs in the
+	 * current partition. That only requires one pass through the array, but
+	 * the disadvantage is we don't know if the pointer can advance until the
+	 * swap completes. Here lies the most interesting innovation from the
+	 * upstream ska_byte_sort: After initiating the swap, we immediately
+	 * proceed to the next element. This makes better use of CPU pipelining,
+	 * but also means that we will often need multiple iterations of this
+	 * loop. ska_byte_sort() maintains a separate list of which partitions
+	 * haven't finished, which is updated every loop iteration. Here we simply
+	 * check each partition during every iteration.
+	 *
+	 * If we started with a single partition, there is nothing to do. If a
+	 * previous loop iteration results in only one partition that hasn't been
+	 * counted as sorted, we know it's actually sorted and can exit the loop.
+	 */
+	num_remaining = num_partitions;
+	while (num_remaining > 1)
+	{
+		/* start the count over */
+		num_remaining = num_partitions;
+
+		for (int i = 0; i < num_partitions; i++)
+		{
+			uint8		idx = remaining_partitions[i];
+
+			for (SortTuple *st = begin + partitions[idx].offset;
+				 st < begin + partitions[idx].next_offset;
+				 st++)
+			{
+				size_t		offset = partitions[st->curbyte].offset++;
+				SortTuple	tmp;
+
+				/* swap current tuple with destination position */
+				Assert(offset < n_elems);
+				tmp = *st;
+				*st = begin[offset];
+				begin[offset] = tmp;
+
+				CHECK_FOR_INTERRUPTS();
+			};
+
+			/* Is this partition sorted? */
+			if (partitions[idx].offset == partitions[idx].next_offset)
+				num_remaining--;
+		}
+	}
+
+	/* recurse */
+	for (uint8 *rp = remaining_partitions;
+		 rp < remaining_partitions + num_partitions;
+		 rp++)
+	{
+		size_t		end_offset = partitions[*rp].next_offset;
+		SortTuple  *partition_end = begin + end_offset;
+		size_t		num_elements = end_offset - start_offset;
+
+		if (num_elements > 1)
+		{
+			if (level < sizeof(Datum) - 1)
+			{
+				if (num_elements < QSORT_THRESHOLD)
+				{
+					qsort_tuple(partition_begin,
+								num_elements,
+								state->base.comparetup,
+								state);
+				}
+				else
+				{
+					radix_sort_recursive(partition_begin,
+										 num_elements,
+										 level + 1,
+										 state);
+				}
+			}
+			else if (state->base.onlyKey == NULL)
+			{
+				/*
+				 * We've finished radix sort on all bytes of the pass-by-value
+				 * datum (possibly abbreviated), now sort using the tiebreak
+				 * comparator.
+				 */
+				qsort_tuple(partition_begin,
+							num_elements,
+							state->base.comparetup_tiebreak,
+							state);
+			}
+		}
+
+		start_offset = end_offset;
+		partition_begin = partition_end;
+	}
+}
+
+/*
+ * Entry point for radix_sort_recursive
+ *
+ * Partition tuples by isnull1, then sort both partitions, using
+ * radix sort on the NOT NULL partition if it's large enough.
+ */
+static void
+radix_sort_tuple(SortTuple *data, size_t n, Tuplesortstate *state)
+{
+	bool		nulls_first = state->base.sortKeys[0].ssup_nulls_first;
+	SortTuple  *null_start;
+	SortTuple  *not_null_start;
+	size_t		d1 = 0,
+				d2,
+				null_count,
+				not_null_count;
+
+	/*
+	 * Find the first NOT NULL if NULLS FIRST, or first NULL if NULLS LAST.
+	 * This also serves as a quick check for the common case where all tuples
+	 * are NOT NULL in the first sort key.
+	 */
+	while (d1 < n && data[d1].isnull1 == nulls_first)
+	{
+		d1++;
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	/*
+	 * If we have more than one tuple left after the quick check, partition
+	 * the remainder using branchless cyclic permutation, based on
+	 * https://orlp.net/blog/branchless-lomuto-partitioning/
+	 */
+	Assert(n > 0);
+	if (d1 < n - 1)
+	{
+		size_t		i = d1,
+					j = d1;
+		SortTuple	tmp = data[d1]; /* create gap at front */
+
+		while (j < n - 1)
+		{
+			/* gap is at j, move i's element to gap */
+			data[j] = data[i];
+			/* advance j to the first unknown element */
+			j += 1;
+			/* move the first unknown element back to i */
+			data[i] = data[j];
+			/* advance i if this element belongs in the left partition */
+			i += (data[i].isnull1 == nulls_first);
+
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		/* place gap between left and right partitions */
+		data[j] = data[i];
+		/* restore the saved element */
+		data[i] = tmp;
+		/* assign it to the correct partition */
+		i += (data[i].isnull1 == nulls_first);
+
+		/* d1 is now the number of elements in the left partition */
+		d1 = i;
+	}
+
+	d2 = n - d1;
+
+	/* set pointers and counts for each partition */
+	if (nulls_first)
+	{
+		null_start = data;
+		null_count = d1;
+		not_null_start = data + d1;
+		not_null_count = d2;
+	}
+	else
+	{
+		not_null_start = data;
+		not_null_count = d1;
+		null_start = data + d1;
+		null_count = d2;
+	}
+
+	for (SortTuple *st = null_start;
+		 st < null_start + null_count;
+		 st++)
+		Assert(st->isnull1 == true);
+	for (SortTuple *st = not_null_start;
+		 st < not_null_start + not_null_count;
+		 st++)
+		Assert(st->isnull1 == false);
+
+	/*
+	 * Sort the NULL partition using tiebreak comparator, if necessary.
+	 */
+	if (state->base.onlyKey == NULL && null_count > 1)
+	{
+		qsort_tuple(null_start,
+					null_count,
+					state->base.comparetup_tiebreak,
+					state);
+	}
+
+	/*
+	 * Sort the NOT NULL partition, using radix sort if large enough,
+	 * otherwise fall back to quicksort.
+	 */
+	if (not_null_count < QSORT_THRESHOLD)
+	{
+		qsort_tuple(not_null_start,
+					not_null_count,
+					state->base.comparetup,
+					state);
+	}
+	else
+	{
+		bool		presorted = true;
+
+		for (SortTuple *st = not_null_start + 1;
+			 st < not_null_start + not_null_count;
+			 st++)
+		{
+			if (COMPARETUP(state, st - 1, st) > 0)
+			{
+				presorted = false;
+				break;
+			}
+
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		if (presorted)
+			return;
+		else
+		{
+			radix_sort_recursive(not_null_start,
+								 not_null_count,
+								 0,
+								 state);
+		}
+	}
+}
+
+/* Verify in-memory sort using standard comparator. */
+static void
+verify_memtuples_sorted(Tuplesortstate *state)
+{
+#ifdef USE_ASSERT_CHECKING
+	for (SortTuple *st = state->memtuples + 1;
+		 st < state->memtuples + state->memtupcount;
+		 st++)
+		Assert(COMPARETUP(state, st - 1, st) <= 0);
+#endif
+}
+
+/*
+ * Sort all memtuples using specialized routines.
+ *
+ * Quicksort or radix sort is used for small in-memory sorts,
+ * and external sort runs.
  */
 static void
 tuplesort_sort_memtuples(Tuplesortstate *state)
@@ -2718,32 +2962,22 @@ tuplesort_sort_memtuples(Tuplesortstate *state)
 	if (state->memtupcount > 1)
 	{
 		/*
-		 * Do we have the leading column's value or abbreviation in datum1,
-		 * and is there a specialization for its comparator?
+		 * Do we have the leading column's value or abbreviation in datum1?
 		 */
 		if (state->base.haveDatum1 && state->base.sortKeys)
 		{
-			if (state->base.sortKeys[0].comparator == ssup_datum_unsigned_cmp)
+			SortSupport ssup = &state->base.sortKeys[0];
+
+			/* Does it compare as an integer? */
+			if (state->memtupcount >= QSORT_THRESHOLD &&
+				(ssup->comparator == ssup_datum_unsigned_cmp ||
+				 ssup->comparator == ssup_datum_signed_cmp ||
+				 ssup->comparator == ssup_datum_int32_cmp))
 			{
-				qsort_tuple_unsigned(state->memtuples,
-									 state->memtupcount,
-									 state);
-				return;
-			}
-#if SIZEOF_DATUM >= 8
-			else if (state->base.sortKeys[0].comparator == ssup_datum_signed_cmp)
-			{
-				qsort_tuple_signed(state->memtuples,
-								   state->memtupcount,
-								   state);
-				return;
-			}
-#endif
-			else if (state->base.sortKeys[0].comparator == ssup_datum_int32_cmp)
-			{
-				qsort_tuple_int32(state->memtuples,
-								  state->memtupcount,
-								  state);
+				radix_sort_tuple(state->memtuples,
+								 state->memtupcount,
+								 state);
+				verify_memtuples_sorted(state);
 				return;
 			}
 		}
@@ -3184,7 +3418,6 @@ ssup_datum_unsigned_cmp(Datum x, Datum y, SortSupport ssup)
 		return 0;
 }
 
-#if SIZEOF_DATUM >= 8
 int
 ssup_datum_signed_cmp(Datum x, Datum y, SortSupport ssup)
 {
@@ -3198,7 +3431,6 @@ ssup_datum_signed_cmp(Datum x, Datum y, SortSupport ssup)
 	else
 		return 0;
 }
-#endif
 
 int
 ssup_datum_int32_cmp(Datum x, Datum y, SortSupport ssup)

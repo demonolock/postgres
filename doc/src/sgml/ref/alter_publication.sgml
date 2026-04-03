@@ -23,15 +23,24 @@ PostgreSQL documentation
 <synopsis>
 ALTER PUBLICATION <replaceable class="parameter">name</replaceable> ADD <replaceable class="parameter">publication_object</replaceable> [, ...]
 ALTER PUBLICATION <replaceable class="parameter">name</replaceable> SET <replaceable class="parameter">publication_object</replaceable> [, ...]
-ALTER PUBLICATION <replaceable class="parameter">name</replaceable> DROP <replaceable class="parameter">publication_object</replaceable> [, ...]
+ALTER PUBLICATION <replaceable class="parameter">name</replaceable> DROP <replaceable class="parameter">publication_drop_object</replaceable> [, ...]
 ALTER PUBLICATION <replaceable class="parameter">name</replaceable> SET ( <replaceable class="parameter">publication_parameter</replaceable> [= <replaceable class="parameter">value</replaceable>] [, ... ] )
 ALTER PUBLICATION <replaceable class="parameter">name</replaceable> OWNER TO { <replaceable>new_owner</replaceable> | CURRENT_ROLE | CURRENT_USER | SESSION_USER }
 ALTER PUBLICATION <replaceable class="parameter">name</replaceable> RENAME TO <replaceable>new_name</replaceable>
 
 <phrase>where <replaceable class="parameter">publication_object</replaceable> is one of:</phrase>
 
-    TABLE [ ONLY ] <replaceable class="parameter">table_name</replaceable> [ * ] [ ( <replaceable class="parameter">column_name</replaceable> [, ... ] ) ] [ WHERE ( <replaceable class="parameter">expression</replaceable> ) ] [, ... ]
+    TABLE <replaceable class="parameter">table_and_columns</replaceable> [, ... ]
     TABLES IN SCHEMA { <replaceable class="parameter">schema_name</replaceable> | CURRENT_SCHEMA } [, ... ]
+
+<phrase>and <replaceable class="parameter">publication_drop_object</replaceable> is one of:</phrase>
+
+    TABLE [ ONLY ] <replaceable class="parameter">table_name</replaceable> [ * ] [, ... ]
+    TABLES IN SCHEMA { <replaceable class="parameter">schema_name</replaceable> | CURRENT_SCHEMA } [, ... ]
+
+<phrase>and <replaceable class="parameter">table_and_columns</replaceable> is:</phrase>
+
+    [ ONLY ] <replaceable class="parameter">table_name</replaceable> [ * ] [ ( <replaceable class="parameter">column_name</replaceable> [, ... ] ) ] [ WHERE ( <replaceable class="parameter">expression</replaceable> ) ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -51,13 +60,13 @@ ALTER PUBLICATION <replaceable class="parameter">name</replaceable> RENAME TO <r
    <literal>ADD</literal> and <literal>DROP</literal> clauses will add and
    remove one or more tables/schemas from the publication.  Note that adding
    tables/schemas to a publication that is already subscribed to will require an
-   <literal>ALTER SUBSCRIPTION ... REFRESH PUBLICATION</literal> action on the
+   <link linkend="sql-altersubscription-params-refresh-publication">
+   <literal>ALTER SUBSCRIPTION ... REFRESH PUBLICATION</literal></link> action on the
    subscribing side in order to become effective. Note also that
    <literal>DROP TABLES IN SCHEMA</literal> will not drop any schema tables
    that were specified using
-   <link linkend="sql-createpublication-for-table"><literal>FOR TABLE</literal></link>/
-   <literal>ADD TABLE</literal>, and the combination of <literal>DROP</literal>
-   with a <literal>WHERE</literal> clause is not allowed.
+   <link linkend="sql-createpublication-params-for-table"><literal>FOR TABLE</literal></link>/
+   <literal>ADD TABLE</literal>.
   </para>
 
   <para>
@@ -81,8 +90,9 @@ ALTER PUBLICATION <replaceable class="parameter">name</replaceable> RENAME TO <r
    new owning role, and that role must have <literal>CREATE</literal>
    privilege on the database.
    Also, the new owner of a
-   <link linkend="sql-createpublication-for-all-tables"><literal>FOR ALL TABLES</literal></link>
-   or <link linkend="sql-createpublication-for-tables-in-schema"><literal>FOR TABLES IN SCHEMA</literal></link>
+   <link linkend="sql-createpublication-params-for-tables-in-schema"><literal>FOR TABLES IN SCHEMA</literal></link>
+   or <link linkend="sql-createpublication-params-for-all-tables"><literal>FOR ALL TABLES</literal></link>
+   or <link linkend="sql-createpublication-params-for-all-sequences"><literal>FOR ALL SEQUENCES</literal></link>
    publication must be a superuser. However, a superuser can
    change the ownership of a publication regardless of these restrictions.
   </para>
@@ -152,7 +162,23 @@ ALTER PUBLICATION <replaceable class="parameter">name</replaceable> RENAME TO <r
      <para>
       This clause alters publication parameters originally set by
       <xref linkend="sql-createpublication"/>.  See there for more information.
+      This clause is not applicable to sequences.
      </para>
+     <caution>
+      <para>
+       Altering the <literal>publish_via_partition_root</literal> parameter can
+       lead to data loss or duplication at the subscriber because it changes
+       the identity and schema of the published tables. Note this happens only
+       when a partition root table is specified as the replication target.
+      </para>
+      <para>
+       This problem can be avoided by refraining from modifying partition leaf
+       tables after the <command>ALTER PUBLICATION ... SET</command> until the
+       <link linkend="sql-altersubscription"><command>ALTER SUBSCRIPTION ... REFRESH PUBLICATION</command></link>
+       is executed and by only refreshing using the <literal>copy_data = off</literal>
+       option.
+      </para>
+     </caution>
     </listitem>
    </varlistentry>
 

@@ -545,23 +545,23 @@ RESET enable_seqscan;
 -- do some inequality tests for varlena data types
 CREATE TABLE brin_test_multi_2 (a UUID) WITH (fillfactor=10);
 INSERT INTO brin_test_multi_2
-SELECT v::uuid FROM (SELECT row_number() OVER (ORDER BY v) c, v FROM (SELECT md5((i/13)::text) AS v FROM generate_series(1,1000) s(i)) foo) bar ORDER BY c + 25 * random();
+SELECT v::uuid FROM (SELECT row_number() OVER (ORDER BY v) c, v FROM (SELECT fipshash((i/13)::text) AS v FROM generate_series(1,1000) s(i)) foo) bar ORDER BY c + 25 * random();
 
 CREATE INDEX brin_test_multi_2_idx ON brin_test_multi_2 USING brin (a uuid_minmax_multi_ops) WITH (pages_per_range=5);
 
 SET enable_seqscan=off;
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a < '33e75ff0-9dd6-01bb-e69f-351039152189';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a < '3d914f93-48c9-cc0f-f8a7-9716700b9fcd';
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a > '33e75ff0-9dd6-01bb-e69f-351039152189';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a > '3d914f93-48c9-cc0f-f8a7-9716700b9fcd';
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a <= 'f457c545-a9de-d88f-18ec-ee47145a72c0';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a <= 'f369cb89-fc62-7e66-8987-007d121ed1ea';
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a >= 'c51ce410-c124-a10e-0db5-e4b97fc2af39';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a >= 'aea92132-c4cb-eb26-3e6a-c2bf6c183b5d';
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a = 'cfcd2084-95d5-65ef-66e7-dff9f98764da';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a = '5feceb66-ffc8-6f38-d952-786c6d696c79';
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a = 'aab32389-22bc-c25a-6f60-6eb525ffdc56';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a = '86e50149-6586-6131-2a9e-0b35558d84f6';
 
 
 -- now do the same, but insert the rows with the indexes already created
@@ -570,19 +570,137 @@ SELECT COUNT(*) FROM brin_test_multi_2 WHERE a = 'aab32389-22bc-c25a-6f60-6eb525
 
 TRUNCATE brin_test_multi_2;
 INSERT INTO brin_test_multi_2
-SELECT v::uuid FROM (SELECT row_number() OVER (ORDER BY v) c, v FROM (SELECT md5((i/13)::text) AS v FROM generate_series(1,1000) s(i)) foo) bar ORDER BY c + 25 * random();
+SELECT v::uuid FROM (SELECT row_number() OVER (ORDER BY v) c, v FROM (SELECT fipshash((i/13)::text) AS v FROM generate_series(1,1000) s(i)) foo) bar ORDER BY c + 25 * random();
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a < '33e75ff0-9dd6-01bb-e69f-351039152189';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a < '3d914f93-48c9-cc0f-f8a7-9716700b9fcd';
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a > '33e75ff0-9dd6-01bb-e69f-351039152189';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a > '3d914f93-48c9-cc0f-f8a7-9716700b9fcd';
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a <= 'f457c545-a9de-d88f-18ec-ee47145a72c0';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a <= 'f369cb89-fc62-7e66-8987-007d121ed1ea';
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a >= 'c51ce410-c124-a10e-0db5-e4b97fc2af39';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a >= 'aea92132-c4cb-eb26-3e6a-c2bf6c183b5d';
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a = 'cfcd2084-95d5-65ef-66e7-dff9f98764da';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a = '5feceb66-ffc8-6f38-d952-786c6d696c79';
 
-SELECT COUNT(*) FROM brin_test_multi_2 WHERE a = 'aab32389-22bc-c25a-6f60-6eb525ffdc56';
+SELECT COUNT(*) FROM brin_test_multi_2 WHERE a = '86e50149-6586-6131-2a9e-0b35558d84f6';
 
 DROP TABLE brin_test_multi_2;
 RESET enable_seqscan;
+
+-- test overflows during CREATE INDEX with extreme timestamp values
+CREATE TABLE brin_timestamp_test(a TIMESTAMPTZ);
+
+SET datestyle TO iso;
+
+-- values close to timestamp minimum
+INSERT INTO brin_timestamp_test
+SELECT '4713-01-01 00:00:01 BC'::timestamptz + (i || ' seconds')::interval
+  FROM generate_series(1,30) s(i);
+
+-- values close to timestamp maximum
+INSERT INTO brin_timestamp_test
+SELECT '294276-12-01 00:00:01'::timestamptz + (i || ' seconds')::interval
+  FROM generate_series(1,30) s(i);
+
+CREATE INDEX ON brin_timestamp_test USING brin (a timestamptz_minmax_multi_ops) WITH (pages_per_range=1);
+DROP TABLE brin_timestamp_test;
+
+-- test overflows during CREATE INDEX with extreme date values
+CREATE TABLE brin_date_test(a DATE);
+
+-- insert values close to date minimum
+INSERT INTO brin_date_test SELECT '4713-01-01 BC'::date + i FROM generate_series(1, 30) s(i);
+
+-- insert values close to date minimum
+INSERT INTO brin_date_test SELECT '5874897-12-01'::date + i FROM generate_series(1, 30) s(i);
+
+CREATE INDEX ON brin_date_test USING brin (a date_minmax_multi_ops) WITH (pages_per_range=1);
+
+SET enable_seqscan = off;
+
+-- make sure the ranges were built correctly and 2023-01-01 eliminates all
+EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM brin_date_test WHERE a = '2023-01-01'::date;
+
+DROP TABLE brin_date_test;
+RESET enable_seqscan;
+
+-- test handling of infinite timestamp values
+CREATE TABLE brin_timestamp_test(a TIMESTAMP);
+
+INSERT INTO brin_timestamp_test VALUES ('-infinity'), ('infinity');
+INSERT INTO brin_timestamp_test
+SELECT i FROM generate_series('2000-01-01'::timestamp, '2000-02-09'::timestamp, '1 day'::interval) s(i);
+
+CREATE INDEX ON brin_timestamp_test USING brin (a timestamp_minmax_multi_ops) WITH (pages_per_range=1);
+
+SET enable_seqscan = off;
+
+EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM brin_timestamp_test WHERE a = '2023-01-01'::timestamp;
+
+EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM brin_timestamp_test WHERE a = '1900-01-01'::timestamp;
+
+DROP TABLE brin_timestamp_test;
+RESET enable_seqscan;
+
+-- test handling of infinite date values
+CREATE TABLE brin_date_test(a DATE);
+
+INSERT INTO brin_date_test VALUES ('-infinity'), ('infinity');
+INSERT INTO brin_date_test SELECT '2000-01-01'::date + i FROM generate_series(1, 40) s(i);
+
+CREATE INDEX ON brin_date_test USING brin (a date_minmax_multi_ops) WITH (pages_per_range=1);
+
+SET enable_seqscan = off;
+
+EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM brin_date_test WHERE a = '2023-01-01'::date;
+
+EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM brin_date_test WHERE a = '1900-01-01'::date;
+
+DROP TABLE brin_date_test;
+RESET enable_seqscan;
+RESET datestyle;
+
+-- test handling of overflow for interval values
+CREATE TABLE brin_interval_test(a INTERVAL);
+
+INSERT INTO brin_interval_test SELECT (i || ' years')::interval FROM generate_series(-178000000, -177999980) s(i);
+
+INSERT INTO brin_interval_test SELECT (i || ' years')::interval FROM generate_series( 177999980,  178000000) s(i);
+
+CREATE INDEX ON brin_interval_test USING brin (a interval_minmax_multi_ops) WITH (pages_per_range=1);
+
+SET enable_seqscan = off;
+
+EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM brin_interval_test WHERE a = '-30 years'::interval;
+
+EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM brin_interval_test WHERE a = '30 years'::interval;
+
+DROP TABLE brin_interval_test;
+RESET enable_seqscan;
+
+-- test handling of infinite interval values
+CREATE TABLE brin_interval_test(a INTERVAL);
+
+INSERT INTO brin_interval_test VALUES ('-infinity'), ('infinity');
+INSERT INTO brin_interval_test SELECT (i || ' days')::interval FROM generate_series(100, 140) s(i);
+
+CREATE INDEX ON brin_interval_test USING brin (a interval_minmax_multi_ops) WITH (pages_per_range=1);
+
+SET enable_seqscan = off;
+
+EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM brin_interval_test WHERE a = '-30 years'::interval;
+
+EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM brin_interval_test WHERE a = '30 years'::interval;
+
+DROP TABLE brin_interval_test;
+RESET enable_seqscan;
+RESET datestyle;

@@ -4,7 +4,7 @@
  *	  PlaceHolderVar and PlaceHolderInfo manipulation routines
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -315,6 +315,33 @@ fix_placeholder_input_needed_levels(PlannerInfo *root)
 }
 
 /*
+ * rebuild_placeholder_attr_needed
+ *	  Put back attr_needed bits for Vars/PHVs needed in PlaceHolderVars.
+ *
+ * This is used to rebuild attr_needed/ph_needed sets after removal of a
+ * useless outer join.  It should match what
+ * fix_placeholder_input_needed_levels did, except that we call
+ * add_vars_to_attr_needed not add_vars_to_targetlist.
+ */
+void
+rebuild_placeholder_attr_needed(PlannerInfo *root)
+{
+	ListCell   *lc;
+
+	foreach(lc, root->placeholder_list)
+	{
+		PlaceHolderInfo *phinfo = (PlaceHolderInfo *) lfirst(lc);
+		List	   *vars = pull_var_clause((Node *) phinfo->ph_var->phexpr,
+										   PVC_RECURSE_AGGREGATES |
+										   PVC_RECURSE_WINDOWFUNCS |
+										   PVC_INCLUDE_PLACEHOLDERS);
+
+		add_vars_to_attr_needed(root, vars, phinfo->ph_eval_at);
+		list_free(vars);
+	}
+}
+
+/*
  * add_placeholders_to_base_rels
  *		Add any required PlaceHolderVars to base rels' targetlists.
  *
@@ -375,6 +402,7 @@ add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
 							SpecialJoinInfo *sjinfo)
 {
 	Relids		relids = joinrel->relids;
+	int64		tuple_width = joinrel->reltarget->width;
 	ListCell   *lc;
 
 	foreach(lc, root->placeholder_list)
@@ -419,7 +447,7 @@ add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
 					cost_qual_eval_node(&cost, (Node *) phv->phexpr, root);
 					joinrel->reltarget->cost.startup += cost.startup;
 					joinrel->reltarget->cost.per_tuple += cost.per_tuple;
-					joinrel->reltarget->width += phinfo->ph_width;
+					tuple_width += phinfo->ph_width;
 				}
 			}
 
@@ -443,6 +471,8 @@ add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
 								phinfo->ph_lateral);
 		}
 	}
+
+	joinrel->reltarget->width = clamp_width_est(tuple_width);
 }
 
 /*
@@ -514,4 +544,44 @@ contain_placeholder_references_walker(Node *node,
 	}
 	return expression_tree_walker(node, contain_placeholder_references_walker,
 								  context);
+}
+
+/*
+ * Compute the set of outer-join relids that can null a placeholder.
+ *
+ * This is analogous to RelOptInfo.nulling_relids for Vars, but we compute it
+ * on-the-fly rather than saving it somewhere.  Currently the value is needed
+ * at most once per query, so there's little value in doing otherwise.  If it
+ * ever gains more widespread use, perhaps we should cache the result in
+ * PlaceHolderInfo.
+ */
+Relids
+get_placeholder_nulling_relids(PlannerInfo *root, PlaceHolderInfo *phinfo)
+{
+	Relids		result = NULL;
+	int			relid = -1;
+
+	/*
+	 * Form the union of all potential nulling OJs for each baserel included
+	 * in ph_eval_at.
+	 */
+	while ((relid = bms_next_member(phinfo->ph_eval_at, relid)) > 0)
+	{
+		RelOptInfo *rel = root->simple_rel_array[relid];
+
+		/* ignore the RTE_GROUP RTE */
+		if (relid == root->group_rtindex)
+			continue;
+
+		if (rel == NULL)		/* must be an outer join */
+		{
+			Assert(bms_is_member(relid, root->outer_join_rels));
+			continue;
+		}
+		result = bms_add_members(result, rel->nulling_relids);
+	}
+
+	/* Now remove any OJs already included in ph_eval_at, and we're done. */
+	result = bms_del_members(result, phinfo->ph_eval_at);
+	return result;
 }

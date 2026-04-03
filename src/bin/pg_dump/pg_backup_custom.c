@@ -27,7 +27,6 @@
 
 #include "common/file_utils.h"
 #include "compress_io.h"
-#include "parallel.h"
 #include "pg_backup_utils.h"
 
 /*--------
@@ -137,12 +136,8 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
 	AH->WorkerJobRestorePtr = _WorkerJobRestoreCustom;
 
 	/* Set up a private area. */
-	ctx = (lclContext *) pg_malloc0(sizeof(lclContext));
-	AH->formatData = (void *) ctx;
-
-	/* Initialize LO buffering */
-	AH->lo_buf_size = LOBBUFSIZE;
-	AH->lo_buf = (void *) pg_malloc(LOBBUFSIZE);
+	ctx = pg_malloc0_object(lclContext);
+	AH->formatData = ctx;
 
 	/*
 	 * Now open the file
@@ -204,13 +199,13 @@ _ArchiveEntry(ArchiveHandle *AH, TocEntry *te)
 {
 	lclTocEntry *ctx;
 
-	ctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
+	ctx = pg_malloc0_object(lclTocEntry);
 	if (te->dataDumper)
 		ctx->dataState = K_OFFSET_POS_NOT_SET;
 	else
 		ctx->dataState = K_OFFSET_NO_DATA;
 
-	te->formatData = (void *) ctx;
+	te->formatData = ctx;
 }
 
 /*
@@ -245,8 +240,8 @@ _ReadExtraToc(ArchiveHandle *AH, TocEntry *te)
 
 	if (ctx == NULL)
 	{
-		ctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
-		te->formatData = (void *) ctx;
+		ctx = pg_malloc0_object(lclTocEntry);
+		te->formatData = ctx;
 	}
 
 	ctx->dataState = ReadOffset(AH, &(ctx->dataPos));
@@ -342,7 +337,7 @@ _EndData(ArchiveHandle *AH, TocEntry *te)
 }
 
 /*
- * Called by the archiver when starting to save all BLOB DATA (not schema).
+ * Called by the archiver when starting to save BLOB DATA (not schema).
  * This routine should save whatever format-specific information is needed
  * to read the LOs back into memory.
  *
@@ -402,7 +397,7 @@ _EndLO(ArchiveHandle *AH, TocEntry *te, Oid oid)
 }
 
 /*
- * Called by the archiver when finishing saving all BLOB DATA.
+ * Called by the archiver when finishing saving BLOB DATA.
  *
  * Optional.
  */
@@ -629,12 +624,19 @@ _skipData(ArchiveHandle *AH)
 	lclContext *ctx = (lclContext *) AH->formatData;
 	size_t		blkLen;
 	char	   *buf = NULL;
-	int			buflen = 0;
+	size_t		buflen = 0;
 
 	blkLen = ReadInt(AH);
 	while (blkLen != 0)
 	{
-		if (ctx->hasSeek)
+		/*
+		 * Seeks of less than stdio's buffer size are less efficient than just
+		 * reading the data, at least on common platforms.  We don't know the
+		 * buffer size for sure, but 4kB is the usual value.  (While pg_dump
+		 * currently tries to avoid producing such short data blocks, older
+		 * dump files often contain them.)
+		 */
+		if (ctx->hasSeek && blkLen >= 4 * 1024)
 		{
 			if (fseeko(AH->FH, blkLen, SEEK_CUR) != 0)
 				pg_fatal("error during file seek: %m");
@@ -644,8 +646,8 @@ _skipData(ArchiveHandle *AH)
 			if (blkLen > buflen)
 			{
 				free(buf);
-				buf = (char *) pg_malloc(blkLen);
-				buflen = blkLen;
+				buflen = Max(blkLen, 4 * 1024);
+				buf = (char *) pg_malloc(buflen);
 			}
 			if (fread(buf, 1, blkLen, AH->FH) != blkLen)
 			{
@@ -760,9 +762,11 @@ _CloseArchive(ArchiveHandle *AH)
 		 * If possible, re-write the TOC in order to update the data offset
 		 * information.  This is not essential, as pg_restore can cope in most
 		 * cases without it; but it can make pg_restore significantly faster
-		 * in some situations (especially parallel restore).
+		 * in some situations (especially parallel restore).  We can skip this
+		 * step if we're not dumping any data; there are no offsets to update
+		 * in that case.
 		 */
-		if (ctx->hasSeek &&
+		if (ctx->hasSeek && AH->public.dopt->dumpData &&
 			fseeko(AH->FH, tpos, SEEK_SET) == 0)
 			WriteToc(AH);
 	}
@@ -889,7 +893,7 @@ _Clone(ArchiveHandle *AH)
 	/*
 	 * Each thread must have private lclContext working state.
 	 */
-	AH->formatData = (lclContext *) pg_malloc(sizeof(lclContext));
+	AH->formatData = pg_malloc_object(lclContext);
 	memcpy(AH->formatData, ctx, sizeof(lclContext));
 	ctx = (lclContext *) AH->formatData;
 
@@ -902,9 +906,6 @@ _Clone(ArchiveHandle *AH)
 	 * share knowledge about where the data blocks are across threads.
 	 * _PrintTocData has to be careful about the order of operations on that
 	 * state, though.
-	 *
-	 * Note: we do not make a local lo_buf because we expect at most one BLOBS
-	 * entry per archive, so no parallelism is possible.
 	 */
 }
 

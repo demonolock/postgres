@@ -3,7 +3,7 @@
  * clausesel.c
  *	  Routines to compute clause selectivities
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,10 +14,8 @@
  */
 #include "postgres.h"
 
-#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
-#include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/plancat.h"
@@ -497,7 +495,7 @@ addRangeClause(RangeQueryClause **rqlist, Node *clause,
 	}
 
 	/* No matching var found, so make a new clause-pair data structure */
-	rqelem = (RangeQueryClause *) palloc(sizeof(RangeQueryClause));
+	rqelem = palloc_object(RangeQueryClause);
 	rqelem->var = var;
 	if (is_lobound)
 	{
@@ -876,6 +874,10 @@ clause_selectivity_ext(PlannerInfo *root,
 								  varRelid,
 								  jointype,
 								  sjinfo);
+
+		/* If no support, fall back on boolvarsel */
+		if (s1 < 0)
+			s1 = boolvarsel(root, clause, varRelid);
 	}
 	else if (IsA(clause, ScalarArrayOpExpr))
 	{

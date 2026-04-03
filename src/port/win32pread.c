@@ -3,7 +3,7 @@
  * win32pread.c
  *	  Implementation of pread(2) for Windows.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/port/win32pread.c
@@ -17,7 +17,7 @@
 #include <windows.h>
 
 ssize_t
-pg_pread(int fd, void *buf, size_t size, off_t offset)
+pg_pread(int fd, void *buf, size_t size, pgoff_t offset)
 {
 	OVERLAPPED	overlapped = {0};
 	HANDLE		handle;
@@ -30,8 +30,13 @@ pg_pread(int fd, void *buf, size_t size, off_t offset)
 		return -1;
 	}
 
+	/* Avoid overflowing DWORD. */
+	size = Min(size, 1024 * 1024 * 1024);
+
 	/* Note that this changes the file position, despite not using it. */
-	overlapped.Offset = offset;
+	overlapped.Offset = (DWORD) offset;
+	overlapped.OffsetHigh = (DWORD) (offset >> 32);
+
 	if (!ReadFile(handle, buf, size, &result, &overlapped))
 	{
 		if (GetLastError() == ERROR_HANDLE_EOF)

@@ -2,7 +2,11 @@
  *
  * plpython.h - Python as a procedural language for PostgreSQL
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Note: this file is #include'd by each of the sub-module header files
+ * (plpy_elog.h, etc).  It's therefore unnecessary for any plpython *.c
+ * files to include it directly.
+ *
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/pl/plpython/plpython.h
@@ -20,35 +24,18 @@
 #endif
 
 /*
- * Python versions <= 3.8 otherwise define a replacement, causing macro
- * redefinition warnings.
+ * Enable Python Limited API
  */
-#define HAVE_SNPRINTF 1
+#define Py_LIMITED_API 0x03020000
 
-#if defined(_MSC_VER) && defined(_DEBUG)
-/* Python uses #pragma to bring in a non-default libpython on VC++ if
- * _DEBUG is defined */
-#undef _DEBUG
-/* Also hide away errcode, since we load Python.h before postgres.h */
-#define errcode __msvc_errcode
-#include <Python.h>
-#undef errcode
-#define _DEBUG
-#elif defined (_MSC_VER)
-#define errcode __msvc_errcode
-#include <Python.h>
-#undef errcode
-#else
-#include <Python.h>
-#endif
+/*
+ * Pull in Python headers via a wrapper header, to control the scope of
+ * the system_header pragma therein.
+ */
+#include "plpython_system.h"
 
 /* define our text domain for translations */
 #undef TEXTDOMAIN
 #define TEXTDOMAIN PG_TEXTDOMAIN("plpython")
-
-/*
- * Used throughout, so it's easier to just include it everywhere.
- */
-#include "plpy_util.h"
 
 #endif							/* PLPYTHON_H */

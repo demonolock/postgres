@@ -1,10 +1,10 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Test SCRAM authentication and TLS channel binding types
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -20,7 +20,7 @@ if ($ENV{with_ssl} ne 'openssl')
 {
 	plan skip_all => 'OpenSSL not supported by this build';
 }
-elsif ($ENV{PG_TEST_EXTRA} !~ /\bssl\b/)
+if (!$ENV{PG_TEST_EXTRA} || $ENV{PG_TEST_EXTRA} !~ /\bssl\b/)
 {
 	plan skip_all =>
 	  'Potentially unsafe test SSL not enabled in PG_TEST_EXTRA';
@@ -44,10 +44,16 @@ my $SERVERHOSTADDR = '127.0.0.1';
 # This is the pattern to use in pg_hba.conf to match incoming connections.
 my $SERVERHOSTCIDR = '127.0.0.1/32';
 
+# Determine whether this build uses OpenSSL or LibreSSL.
+my $libressl = $ssl_server->is_libressl;
+
 # Determine whether build supports detection of hash algorithms for
 # RSA-PSS certificates.
 my $supports_rsapss_certs =
   check_pg_config("#define HAVE_X509_GET_SIGNATURE_INFO 1");
+
+# As of 5/2025, LibreSSL doesn't actually work for RSA-PSS certificates.
+$supports_rsapss_certs = 0 if $libressl;
 
 # Allocation of base connection string shared among multiple tests.
 my $common_connstr;
@@ -64,12 +70,15 @@ $ENV{PGHOST} = $node->host;
 $ENV{PGPORT} = $node->port;
 $node->start;
 
+# could fail in FIPS mode
+my $md5_works = ($node->psql('postgres', "select md5('')") == 0);
+
 # Configure server for SSL connections, with password handling.
 $ssl_server->configure_test_server_for_ssl(
 	$node, $SERVERHOSTADDR, $SERVERHOSTCIDR,
 	"scram-sha-256",
-	'password' => "pass",
-	'password_enc' => "scram-sha-256");
+	password => "pass",
+	password_enc => "scram-sha-256");
 switch_server_cert($node, certfile => 'server-cn-only');
 $ENV{PGPASSWORD} = "pass";
 $common_connstr =
@@ -91,12 +100,16 @@ $node->connect_ok("$common_connstr user=ssltestuser channel_binding=require",
 	"SCRAM with SSL and channel_binding=require");
 
 # Now test when the user has an MD5-encrypted password; should fail
-$node->connect_fails(
-	"$common_connstr user=md5testuser channel_binding=require",
-	"MD5 with SSL and channel_binding=require",
-	expected_stderr =>
-	  qr/channel binding required but not supported by server's authentication request/
-);
+SKIP:
+{
+	skip "MD5 not supported" unless $md5_works;
+	$node->connect_fails(
+		"$common_connstr user=md5testuser channel_binding=require",
+		"MD5 with SSL and channel_binding=require",
+		expected_stderr =>
+		  qr/channel binding required but not supported by server's authentication request/
+	);
+}
 
 # Now test with auth method 'cert' by connecting to 'certdb'. Should fail,
 # because channel binding is not performed.  Note that ssl/client.key may
@@ -130,12 +143,16 @@ $node->connect_ok(
 	"$common_connstr user=ssltestuser channel_binding=disable require_auth=scram-sha-256",
 	"SCRAM with SSL, channel_binding=disable, and require_auth=scram-sha-256"
 );
-$node->connect_fails(
-	"$common_connstr user=md5testuser require_auth=md5 channel_binding=require",
-	"channel_binding can fail even when require_auth succeeds",
-	expected_stderr =>
-	  qr/channel binding required but not supported by server's authentication request/
-);
+SKIP:
+{
+	skip "MD5 not supported" unless $md5_works;
+	$node->connect_fails(
+		"$common_connstr user=md5testuser require_auth=md5 channel_binding=require",
+		"channel_binding can fail even when require_auth succeeds",
+		expected_stderr =>
+		  qr/channel binding required but not supported by server's authentication request/
+	);
+}
 $node->connect_ok(
 	"$common_connstr user=ssltestuser channel_binding=require require_auth=scram-sha-256",
 	"SCRAM with SSL, channel_binding=require, and require_auth=scram-sha-256"

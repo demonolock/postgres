@@ -4,7 +4,7 @@
  *	  definitions for run-time statistics collection
  *
  *
- * Copyright (c) 2001-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * src/include/executor/instrument.h
  *
@@ -33,8 +33,10 @@ typedef struct BufferUsage
 	int64		local_blks_written; /* # of local disk blocks written */
 	int64		temp_blks_read; /* # of temp blocks read */
 	int64		temp_blks_written;	/* # of temp blocks written */
-	instr_time	blk_read_time;	/* time spent reading blocks */
-	instr_time	blk_write_time; /* time spent writing blocks */
+	instr_time	shared_blk_read_time;	/* time spent reading shared blocks */
+	instr_time	shared_blk_write_time;	/* time spent writing shared blocks */
+	instr_time	local_blk_read_time;	/* time spent reading local blocks */
+	instr_time	local_blk_write_time;	/* time spent writing local blocks */
 	instr_time	temp_blk_read_time; /* time spent reading temp blocks */
 	instr_time	temp_blk_write_time;	/* time spent writing temp blocks */
 } BufferUsage;
@@ -51,6 +53,8 @@ typedef struct WalUsage
 	int64		wal_records;	/* # of WAL records produced */
 	int64		wal_fpi;		/* # of WAL full page images produced */
 	uint64		wal_bytes;		/* size of WAL records produced */
+	uint64		wal_fpi_bytes;	/* size of WAL full page images produced */
+	int64		wal_buffers_full;	/* # of times the WAL buffers became full */
 } WalUsage;
 
 /* Flag bits included in InstrAlloc's instrument_options bitmask */
@@ -74,13 +78,13 @@ typedef struct Instrumentation
 	bool		running;		/* true if we've completed first tuple */
 	instr_time	starttime;		/* start time of current iteration of node */
 	instr_time	counter;		/* accumulated runtime for this node */
-	double		firsttuple;		/* time for first tuple of this cycle */
+	instr_time	firsttuple;		/* time for first tuple of this cycle */
 	double		tuplecount;		/* # of tuples emitted so far this cycle */
 	BufferUsage bufusage_start; /* buffer usage at start */
 	WalUsage	walusage_start; /* WAL usage at start */
 	/* Accumulated statistics across all completed cycles: */
-	double		startup;		/* total startup time (in seconds) */
-	double		total;			/* total time (in seconds) */
+	instr_time	startup;		/* total startup time */
+	instr_time	total;			/* total time */
 	double		ntuples;		/* total tuples produced */
 	double		ntuples2;		/* secondary node-specific tuple counter */
 	double		nloops;			/* # of run cycles for this node */

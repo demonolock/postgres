@@ -3,7 +3,7 @@
  *
  *	database server functions
  *
- *	Copyright (c) 2010-2023, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/server.c
  */
 
@@ -71,6 +71,8 @@ get_db_conn(ClusterInfo *cluster, const char *db_name)
 		appendPQExpBufferStr(&conn_opts, " host=");
 		appendConnStrVal(&conn_opts, cluster->sockdir);
 	}
+	if (!protocol_negotiation_supported(cluster))
+		appendPQExpBufferStr(&conn_opts, " max_protocol_version=3.0");
 
 	conn = PQconnectdb(conn_opts.data);
 	termPQExpBuffer(&conn_opts);
@@ -148,45 +150,6 @@ executeQueryOrDie(PGconn *conn, const char *fmt,...)
 }
 
 
-/*
- * get_major_server_version()
- *
- * gets the version (in unsigned int form) for the given datadir. Assumes
- * that datadir is an absolute path to a valid pgdata directory. The version
- * is retrieved by reading the PG_VERSION file.
- */
-uint32
-get_major_server_version(ClusterInfo *cluster)
-{
-	FILE	   *version_fd;
-	char		ver_filename[MAXPGPATH];
-	int			v1 = 0,
-				v2 = 0;
-
-	snprintf(ver_filename, sizeof(ver_filename), "%s/PG_VERSION",
-			 cluster->pgdata);
-	if ((version_fd = fopen(ver_filename, "r")) == NULL)
-		pg_fatal("could not open version file \"%s\": %m", ver_filename);
-
-	if (fscanf(version_fd, "%63s", cluster->major_version_str) == 0 ||
-		sscanf(cluster->major_version_str, "%d.%d", &v1, &v2) < 1)
-		pg_fatal("could not parse version file \"%s\"", ver_filename);
-
-	fclose(version_fd);
-
-	if (v1 < 10)
-	{
-		/* old style, e.g. 9.6.1 */
-		return v1 * 10000 + v2 * 100;
-	}
-	else
-	{
-		/* new style, e.g. 10.1 */
-		return v1 * 10000;
-	}
-}
-
-
 static void
 stop_postmaster_atexit(void)
 {
@@ -201,6 +164,7 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	PGconn	   *conn;
 	bool		pg_ctl_return = false;
 	char		socket_string[MAXPGPATH + 200];
+	PQExpBufferData pgoptions;
 
 	static bool exit_hook_registered = false;
 
@@ -227,22 +191,32 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 				 cluster->sockdir);
 #endif
 
+	initPQExpBuffer(&pgoptions);
+
 	/*
-	 * Use -b to disable autovacuum.
+	 * Construct a parameter string which is passed to the server process.
 	 *
 	 * Turn off durability requirements to improve object creation speed, and
 	 * we only modify the new cluster, so only use it there.  If there is a
 	 * crash, the new cluster has to be recreated anyway.  fsync=off is a big
 	 * win on ext4.
 	 */
+	if (cluster == &new_cluster)
+		appendPQExpBufferStr(&pgoptions, " -c synchronous_commit=off -c fsync=off -c full_page_writes=off");
+
+	/*
+	 * Use -b to disable autovacuum and logical replication launcher
+	 * (effective in PG17 or later for the latter).
+	 */
 	snprintf(cmd, sizeof(cmd),
 			 "\"%s/pg_ctl\" -w -l \"%s/%s\" -D \"%s\" -o \"-p %d -b%s %s%s\" start",
 			 cluster->bindir,
 			 log_opts.logdir,
 			 SERVER_LOG_FILE, cluster->pgconfig, cluster->port,
-			 (cluster == &new_cluster) ?
-			 " -c synchronous_commit=off -c fsync=off -c full_page_writes=off" : "",
+			 pgoptions.data,
 			 cluster->pgopts ? cluster->pgopts : "", socket_string);
+
+	termPQExpBuffer(&pgoptions);
 
 	/*
 	 * Don't throw an error right away, let connecting throw the error because

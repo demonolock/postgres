@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Test streaming of transaction containing multiple subtransactions and rollbacks
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -130,12 +130,12 @@ sub test_streaming
 my $node_publisher = PostgreSQL::Test::Cluster->new('publisher');
 $node_publisher->init(allows_streaming => 'logical');
 $node_publisher->append_conf('postgresql.conf',
-	'logical_replication_mode = immediate');
+	'debug_logical_replication_streaming = immediate');
 $node_publisher->start;
 
 # Create subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+$node_subscriber->init;
 $node_subscriber->start;
 
 # Create some preexisting content on publisher
@@ -203,7 +203,7 @@ test_streaming($node_publisher, $node_subscriber, $appname, 1);
 # Test serializing changes to files and notify the parallel apply worker to
 # apply them at the end of the transaction.
 $node_subscriber->append_conf('postgresql.conf',
-	'logical_replication_mode = immediate');
+	'debug_logical_replication_streaming = immediate');
 # Reset the log_min_messages to default.
 $node_subscriber->append_conf('postgresql.conf',
 	"log_min_messages = warning");

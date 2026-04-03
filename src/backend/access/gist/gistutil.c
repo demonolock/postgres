@@ -4,7 +4,7 @@
  *	  utilities routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,12 +18,12 @@
 #include "access/gist_private.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
-#include "catalog/pg_opclass.h"
 #include "common/pg_prng.h"
 #include "storage/indexfsm.h"
-#include "storage/lmgr.h"
 #include "utils/float.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
@@ -44,10 +44,10 @@ gistfillbuffer(Page page, IndexTuple *itup, int len, OffsetNumber off)
 		Size		sz = IndexTupleSize(itup[i]);
 		OffsetNumber l;
 
-		l = PageAddItem(page, (Item) itup[i], sz, off, false, false);
+		l = PageAddItem(page, itup[i], sz, off, false, false);
 		if (l == InvalidOffsetNumber)
-			elog(ERROR, "failed to add item to GiST index page, item %d out of %d, size %d bytes",
-				 i, len, (int) sz);
+			elog(ERROR, "failed to add item to GiST index page, item %d out of %d, size %zu bytes",
+				 i, len, sz);
 		off++;
 	}
 }
@@ -100,7 +100,7 @@ gistextractpage(Page page, int *len /* out */ )
 
 	maxoff = PageGetMaxOffsetNumber(page);
 	*len = maxoff;
-	itvec = palloc(sizeof(IndexTuple) * maxoff);
+	itvec = palloc_array(IndexTuple, maxoff);
 	for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
 		itvec[i - FirstOffsetNumber] = (IndexTuple) PageGetItem(page, PageGetItemId(page, i));
 
@@ -113,7 +113,7 @@ gistextractpage(Page page, int *len /* out */ )
 IndexTuple *
 gistjoinvector(IndexTuple *itvec, int *len, IndexTuple *additvec, int addlen)
 {
-	itvec = (IndexTuple *) repalloc(itvec, sizeof(IndexTuple) * ((*len) + addlen));
+	itvec = repalloc_array(itvec, IndexTuple, (*len) + addlen);
 	memmove(&itvec[*len], additvec, sizeof(IndexTuple) * addlen);
 	*len += addlen;
 	return itvec;
@@ -157,7 +157,7 @@ gistMakeUnionItVec(GISTSTATE *giststate, IndexTuple *itvec, int len,
 {
 	int			i;
 	GistEntryVector *evec;
-	int			attrsize;
+	int			attrsize = 0;	/* silence compiler warning */
 
 	evec = (GistEntryVector *) palloc((len + 2) * sizeof(GISTENTRY) + GEVHDRSZ);
 
@@ -242,7 +242,7 @@ gistMakeUnionKey(GISTSTATE *giststate, int attno,
 		char		padding[2 * sizeof(GISTENTRY) + GEVHDRSZ];
 	}			storage;
 	GistEntryVector *evec = &storage.gev;
-	int			dstsize;
+	int			dstsize = 0;	/* silence compiler warning */
 
 	evec->n = 2;
 
@@ -573,7 +573,7 @@ gistdentryinit(GISTSTATE *giststate, int nkey, GISTENTRY *e,
 
 IndexTuple
 gistFormTuple(GISTSTATE *giststate, Relation r,
-			  Datum *attdata, bool *isnull, bool isleaf)
+			  const Datum *attdata, const bool *isnull, bool isleaf)
 {
 	Datum		compatt[INDEX_MAX_KEYS];
 	IndexTuple	res;
@@ -594,7 +594,7 @@ gistFormTuple(GISTSTATE *giststate, Relation r,
 
 void
 gistCompressValues(GISTSTATE *giststate, Relation r,
-				   Datum *attdata, bool *isnull, bool isleaf, Datum *compatt)
+				   const Datum *attdata, const bool *isnull, bool isleaf, Datum *compatt)
 {
 	int			i;
 
@@ -877,7 +877,7 @@ gistNewBuffer(Relation r, Relation heaprel)
 	}
 
 	/* Must extend the file */
-	buffer = ExtendBufferedRel(EB_REL(r), MAIN_FORKNUM, NULL,
+	buffer = ExtendBufferedRel(BMR_REL(r), MAIN_FORKNUM, NULL,
 							   EB_LOCK_FIRST);
 
 	return buffer;
@@ -1040,7 +1040,7 @@ gistGetFakeLSN(Relation rel)
 		Assert(!RelationNeedsWAL(rel));
 
 		/* No need for an actual record if we already have a distinct LSN */
-		if (!XLogRecPtrIsInvalid(lastlsn) && lastlsn == currlsn)
+		if (XLogRecPtrIsValid(lastlsn) && lastlsn == currlsn)
 			currlsn = gistXLogAssignLSN();
 
 		lastlsn = currlsn;
@@ -1055,4 +1055,57 @@ gistGetFakeLSN(Relation rel)
 		Assert(rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED);
 		return GetFakeLSNForUnloggedRel();
 	}
+}
+
+/*
+ * This is a stratnum translation support function for GiST opclasses that use
+ * the RT*StrategyNumber constants.
+ */
+Datum
+gist_translate_cmptype_common(PG_FUNCTION_ARGS)
+{
+	CompareType cmptype = PG_GETARG_INT32(0);
+
+	switch (cmptype)
+	{
+		case COMPARE_EQ:
+			PG_RETURN_UINT16(RTEqualStrategyNumber);
+		case COMPARE_LT:
+			PG_RETURN_UINT16(RTLessStrategyNumber);
+		case COMPARE_LE:
+			PG_RETURN_UINT16(RTLessEqualStrategyNumber);
+		case COMPARE_GT:
+			PG_RETURN_UINT16(RTGreaterStrategyNumber);
+		case COMPARE_GE:
+			PG_RETURN_UINT16(RTGreaterEqualStrategyNumber);
+		case COMPARE_OVERLAP:
+			PG_RETURN_UINT16(RTOverlapStrategyNumber);
+		case COMPARE_CONTAINED_BY:
+			PG_RETURN_UINT16(RTContainedByStrategyNumber);
+		default:
+			PG_RETURN_UINT16(InvalidStrategy);
+	}
+}
+
+/*
+ * Returns the opclass's private stratnum used for the given compare type.
+ *
+ * Calls the opclass's GIST_TRANSLATE_CMPTYPE_PROC support function, if any,
+ * and returns the result.  Returns InvalidStrategy if the function is not
+ * defined.
+ */
+StrategyNumber
+gisttranslatecmptype(CompareType cmptype, Oid opfamily)
+{
+	Oid			funcid;
+	Datum		result;
+
+	/* Check whether the function is provided. */
+	funcid = get_opfamily_proc(opfamily, ANYOID, ANYOID, GIST_TRANSLATE_CMPTYPE_PROC);
+	if (!OidIsValid(funcid))
+		return InvalidStrategy;
+
+	/* Ask the translation function */
+	result = OidFunctionCall1Coll(funcid, InvalidOid, Int32GetDatum(cmptype));
+	return DatumGetUInt16(result);
 }

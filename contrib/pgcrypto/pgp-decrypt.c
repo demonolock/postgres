@@ -224,7 +224,7 @@ pgp_create_pkt_reader(PullFilter **pf_p, PullFilter *src, int len,
 					  int pkttype, PGP_Context *ctx)
 {
 	int			res;
-	struct PktData *pkt = palloc(sizeof(*pkt));
+	struct PktData *pkt = palloc_object(struct PktData);
 
 	pkt->type = pkttype;
 	pkt->len = len;
@@ -250,7 +250,8 @@ prefix_init(void **priv_p, void *arg, PullFilter *src)
 	uint8		tmpbuf[PGP_MAX_BLOCK + 2];
 
 	len = pgp_get_cipher_block_size(ctx->cipher_algo);
-	if (len > sizeof(tmpbuf))
+	/* Make sure we have space for prefix */
+	if (len > PGP_MAX_BLOCK)
 		return PXE_BUG;
 
 	res = pullf_read_max(src, len + 2, &buf, tmpbuf);
@@ -447,7 +448,7 @@ mdcbuf_init(void **priv_p, void *arg, PullFilter *src)
 	PGP_Context *ctx = arg;
 	struct MDCBufData *st;
 
-	st = palloc0(sizeof(*st));
+	st = palloc0_object(struct MDCBufData);
 	st->buflen = sizeof(st->buf);
 	st->ctx = ctx;
 	*priv_p = st;

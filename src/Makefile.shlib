@@ -126,17 +126,17 @@ ifeq ($(PORTNAME), darwin)
     ifneq ($(SO_MAJOR_VERSION), 0)
       version_link	= -compatibility_version $(SO_MAJOR_VERSION) -current_version $(SO_MAJOR_VERSION).$(SO_MINOR_VERSION)
     endif
-    LINK.shared		= $(COMPILER) -dynamiclib -install_name '$(libdir)/lib$(NAME).$(SO_MAJOR_VERSION)$(DLSUFFIX)' $(version_link) $(exported_symbols_list) -multiply_defined suppress
+    LINK.shared		= $(COMPILER) -dynamiclib -install_name '$(libdir)/lib$(NAME).$(SO_MAJOR_VERSION)$(DLSUFFIX)' $(version_link)
     shlib		= lib$(NAME).$(SO_MAJOR_VERSION)$(DLSUFFIX)
     shlib_major		= lib$(NAME).$(SO_MAJOR_VERSION)$(DLSUFFIX)
   else
     # loadable module
-    LINK.shared		= $(COMPILER) -bundle -multiply_defined suppress
+    LINK.shared		= $(COMPILER) -bundle
   endif
   BUILD.exports		= $(AWK) '/^[^\#]/ {printf "_%s\n",$$1}' $< >$@
   exports_file		= $(SHLIB_EXPORTS:%.txt=%.list)
   ifneq (,$(exports_file))
-    exported_symbols_list = -exported_symbols_list $(exports_file)
+    LINK.shared		+= -exported_symbols_list $(exports_file)
   endif
 endif
 
@@ -183,6 +183,11 @@ endif
 ifeq ($(PORTNAME), linux)
   LINK.shared		= $(COMPILER) -shared
   ifdef soname
+    ifneq (,$(findstring linux-android,$(host_os)))
+      # Android uses unversioned shared libraries
+      shlib		= $(shlib_bare)
+      soname		= $(shlib_bare)
+    endif
     LINK.shared		+= -Wl,-soname,$(soname)
   endif
   BUILD.exports		= ( echo '{ global:'; $(AWK) '/^[^\#]/ {printf "%s;\n",$$1}' $<; echo ' local: *; };' ) >$@
@@ -263,7 +268,7 @@ $(stlib): $(OBJS) | $(SHLIB_PREREQS)
 	touch $@
 endif #haslibarule
 
-# AIX wraps shared libraries inside a static library, can be used both
+# AIX wraps shared libraries inside a static library, which can be used both
 # for static and shared linking
 ifeq ($(PORTNAME), aix)
 $(stlib): $(shlib)

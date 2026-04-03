@@ -3,7 +3,7 @@
  *
  * Functions for WAL recovery and standby mode
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/xlogrecovery.h
@@ -27,7 +27,7 @@ typedef enum
 	RECOVERY_TARGET_TIME,
 	RECOVERY_TARGET_NAME,
 	RECOVERY_TARGET_LSN,
-	RECOVERY_TARGET_IMMEDIATE
+	RECOVERY_TARGET_IMMEDIATE,
 } RecoveryTargetType;
 
 /*
@@ -37,15 +37,25 @@ typedef enum
 {
 	RECOVERY_TARGET_TIMELINE_CONTROLFILE,
 	RECOVERY_TARGET_TIMELINE_LATEST,
-	RECOVERY_TARGET_TIMELINE_NUMERIC
+	RECOVERY_TARGET_TIMELINE_NUMERIC,
 } RecoveryTargetTimeLineGoal;
+
+/*
+ * Recovery target action.
+ */
+typedef enum
+{
+	RECOVERY_TARGET_ACTION_PAUSE,
+	RECOVERY_TARGET_ACTION_PROMOTE,
+	RECOVERY_TARGET_ACTION_SHUTDOWN,
+}			RecoveryTargetAction;
 
 /* Recovery pause states */
 typedef enum RecoveryPauseState
 {
 	RECOVERY_NOT_PAUSED,		/* pause not requested */
 	RECOVERY_PAUSE_REQUESTED,	/* pause requested, but not yet paused */
-	RECOVERY_PAUSED				/* recovery is paused */
+	RECOVERY_PAUSED,			/* recovery is paused */
 } RecoveryPauseState;
 
 /* User-settable GUC parameters */

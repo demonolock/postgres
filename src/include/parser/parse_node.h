@@ -4,7 +4,7 @@
  *		Internal definitions for parser
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/parse_node.h
@@ -61,7 +61,8 @@ typedef enum ParseExprKind
 	EXPR_KIND_DISTINCT_ON,		/* DISTINCT ON */
 	EXPR_KIND_LIMIT,			/* LIMIT */
 	EXPR_KIND_OFFSET,			/* OFFSET */
-	EXPR_KIND_RETURNING,		/* RETURNING */
+	EXPR_KIND_RETURNING,		/* RETURNING in INSERT/UPDATE/DELETE */
+	EXPR_KIND_MERGE_RETURNING,	/* RETURNING in MERGE */
 	EXPR_KIND_VALUES,			/* VALUES */
 	EXPR_KIND_VALUES_SINGLE,	/* single-row VALUES (in INSERT only) */
 	EXPR_KIND_CHECK_CONSTRAINT, /* CHECK constraint for a table */
@@ -150,9 +151,7 @@ typedef Node *(*CoerceParamHook) (ParseState *pstate, Param *param,
  *
  * p_target_nsitem: target relation's ParseNamespaceItem.
  *
- * p_is_insert: true to process assignment expressions like INSERT, false
- * to process them like UPDATE.  (Note this can change intra-statement, for
- * cases like INSERT ON CONFLICT UPDATE.)
+ * p_grouping_nsitem: the ParseNamespaceItem that represents the grouping step.
  *
  * p_windowdefs: list of WindowDefs representing WINDOW and OVER clauses.
  * We collect these while transforming expressions and then transform them
@@ -205,7 +204,7 @@ struct ParseState
 	CommonTableExpr *p_parent_cte;	/* this query's containing CTE */
 	Relation	p_target_relation;	/* INSERT/UPDATE/DELETE/MERGE target rel */
 	ParseNamespaceItem *p_target_nsitem;	/* target rel's NSItem, or NULL */
-	bool		p_is_insert;	/* process assignment like INSERT not UPDATE */
+	ParseNamespaceItem *p_grouping_nsitem;	/* NSItem for grouping, or NULL */
 	List	   *p_windowdefs;	/* raw representations of window clauses */
 	ParseExprKind p_expr_kind;	/* what kind of expression we're parsing */
 	int			p_next_resno;	/* next targetlist resno to assign */
@@ -275,6 +274,11 @@ struct ParseState
  * of SQL:2008 requires us to do it this way.  We also use p_lateral_ok to
  * forbid LATERAL references to an UPDATE/DELETE target table.
  *
+ * While processing the RETURNING clause, special namespace items are added to
+ * refer to the OLD and NEW state of the result relation.  These namespace
+ * items have p_returning_type set appropriately, for use when creating Vars.
+ * For convenience, this information is duplicated on each namespace column.
+ *
  * At no time should a namespace list contain two entries that conflict
  * according to the rules in checkNameSpaceConflicts; but note that those
  * are more complicated than "must have different alias names", so in practice
@@ -292,6 +296,7 @@ struct ParseNamespaceItem
 	bool		p_cols_visible; /* Column names visible as unqualified refs? */
 	bool		p_lateral_only; /* Is only visible to LATERAL expressions? */
 	bool		p_lateral_ok;	/* If so, does join type allow use? */
+	VarReturningType p_returning_type;	/* Is OLD/NEW for use in RETURNING? */
 };
 
 /*
@@ -322,6 +327,7 @@ struct ParseNamespaceColumn
 	Oid			p_vartype;		/* pg_type OID */
 	int32		p_vartypmod;	/* type modifier value */
 	Oid			p_varcollid;	/* OID of collation, or InvalidOid */
+	VarReturningType p_varreturningtype;	/* for RETURNING OLD/NEW */
 	Index		p_varnosyn;		/* rangetable index of syntactic referent */
 	AttrNumber	p_varattnosyn;	/* attribute number of syntactic referent */
 	bool		p_dontexpand;	/* not included in star expansion */

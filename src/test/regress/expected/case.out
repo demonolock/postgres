@@ -266,27 +266,30 @@ SELECT *
 -- Tests for constant subexpression simplification
 explain (costs off)
 SELECT * FROM CASE_TBL WHERE NULLIF(1, 2) = 2;
-        QUERY PLAN        
---------------------------
+          QUERY PLAN          
+------------------------------
  Result
+   Replaces: Scan on case_tbl
    One-Time Filter: false
-(2 rows)
+(3 rows)
 
 explain (costs off)
 SELECT * FROM CASE_TBL WHERE NULLIF(1, 1) IS NOT NULL;
-        QUERY PLAN        
---------------------------
+          QUERY PLAN          
+------------------------------
  Result
+   Replaces: Scan on case_tbl
    One-Time Filter: false
-(2 rows)
+(3 rows)
 
 explain (costs off)
 SELECT * FROM CASE_TBL WHERE NULLIF(1, null) = 2;
-        QUERY PLAN        
---------------------------
+          QUERY PLAN          
+------------------------------
  Result
+   Replaces: Scan on case_tbl
    One-Time Filter: false
-(2 rows)
+(3 rows)
 
 --
 -- Examples of updates involving tables
@@ -395,6 +398,14 @@ SELECT CASE make_ad(1,2)
  case  
 -------
  right
+(1 row)
+
+-- While we're here, also test handling of a NULLIF arg that is a read/write
+-- object (bug #18722)
+SELECT NULLIF(make_ad(1,2), array[2,3]::arrdomain);
+ nullif 
+--------
+ {1,2}
 (1 row)
 
 ROLLBACK;

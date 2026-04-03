@@ -399,6 +399,13 @@ FROM pg_proc p1 JOIN pg_namespace pn
 WHERE nspname = 'pg_catalog' AND proleakproof
 ORDER BY 1;
 
+-- Check that functions without argument are not marked as leakproof.
+SELECT p1.oid::regprocedure
+FROM pg_proc p1 JOIN pg_namespace pn
+     ON pronamespace = pn.oid
+WHERE nspname = 'pg_catalog' AND proleakproof AND pronargs = 0
+ORDER BY 1;
+
 -- restore normal output mode
 \a\t
 
@@ -840,7 +847,7 @@ WHERE aggfnoid = 0 OR aggtransfn = 0 OR
     (aggkind = 'n' AND aggnumdirectargs > 0) OR
     aggfinalmodify NOT IN ('r', 's', 'w') OR
     aggmfinalmodify NOT IN ('r', 's', 'w') OR
-    aggtranstype = 0 OR aggtransspace < 0 OR aggmtransspace < 0;
+    aggtranstype = 0 OR aggmtransspace < 0;
 
 -- Make sure the matching pg_proc entry is sensible, too.
 
@@ -1223,7 +1230,7 @@ WHERE p1.oid = a1.amhandler AND a1.amtype = 'i' AND
 
 SELECT a1.oid, a1.amname, p1.oid, p1.proname
 FROM pg_am AS a1, pg_proc AS p1
-WHERE p1.oid = a1.amhandler AND a1.amtype = 's' AND
+WHERE p1.oid = a1.amhandler AND a1.amtype = 't' AND
     (p1.prorettype != 'table_am_handler'::regtype
      OR p1.proretset
      OR p1.pronargs != 1

@@ -3,7 +3,7 @@
  * be-fsstubs.c
  *	  Builtin functions for open/close/read/write operations on large objects
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -43,7 +43,7 @@
 #include <unistd.h>
 
 #include "access/xact.h"
-#include "catalog/pg_largeobject_metadata.h"
+#include "catalog/pg_largeobject.h"
 #include "libpq/be-fsstubs.h"
 #include "libpq/libpq-fs.h"
 #include "miscadmin.h"
@@ -317,13 +317,18 @@ be_lo_unlink(PG_FUNCTION_ARGS)
 
 	PreventCommandIfReadOnly("lo_unlink()");
 
+	if (!LargeObjectExists(lobjId))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("large object %u does not exist", lobjId)));
+
 	/*
 	 * Must be owner of the large object.  It would be cleaner to check this
 	 * in inv_drop(), but we want to throw the error before not after closing
 	 * relevant FDs.
 	 */
 	if (!lo_compat_privileges &&
-		!object_ownercheck(LargeObjectMetadataRelationId, lobjId, GetUserId()))
+		!object_ownercheck(LargeObjectRelationId, lobjId, GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be owner of large object %u", lobjId)));
@@ -859,18 +864,6 @@ be_lo_put(PG_FUNCTION_ARGS)
 
 	lo_cleanup_needed = true;
 	loDesc = inv_open(loOid, INV_WRITE, CurrentMemoryContext);
-
-	/* Permission check */
-	if (!lo_compat_privileges &&
-		pg_largeobject_aclcheck_snapshot(loDesc->id,
-										 GetUserId(),
-										 ACL_UPDATE,
-										 loDesc->snapshot) != ACLCHECK_OK)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied for large object %u",
-						loDesc->id)));
-
 	inv_seek(loDesc, offset, SEEK_SET);
 	written = inv_write(loDesc, VARDATA_ANY(str), VARSIZE_ANY_EXHDR(str));
 	Assert(written == VARSIZE_ANY_EXHDR(str));

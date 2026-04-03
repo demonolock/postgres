@@ -179,8 +179,8 @@ CREATE VIEW v12_temp AS SELECT true FROM v11_temp;
 -- a view should also be temporary if it references a temporary sequence
 CREATE SEQUENCE seq1;
 CREATE TEMPORARY SEQUENCE seq1_temp;
-CREATE VIEW v9 AS SELECT seq1.is_called FROM seq1;
-CREATE VIEW v13_temp AS SELECT seq1_temp.is_called FROM seq1_temp;
+CREATE VIEW v9 AS SELECT nextval('seq1');
+CREATE VIEW v13_temp AS SELECT nextval('seq1_temp');
 
 SELECT relname FROM pg_class
     WHERE relname LIKE 'v_'
@@ -372,6 +372,22 @@ ALTER TABLE tmp1 RENAME TO tx1;
 \d+ aliased_view_2
 \d+ aliased_view_3
 \d+ aliased_view_4
+
+-- Test correct deparsing of ORDER BY when there is an output name conflict
+
+create view aliased_order_by as
+select x1 as x2, x2 as x1, x3 from tt1
+  order by x2;  -- this is interpreted per SQL92, so really ordering by x1
+
+\d+ aliased_order_by
+
+alter view aliased_order_by rename column x1 to x0;
+
+\d+ aliased_order_by
+
+alter view aliased_order_by rename column x3 to x1;
+
+\d+ aliased_order_by
 
 -- Test aliasing of joins
 
@@ -812,6 +828,15 @@ select x + y + z as c1,
        (x,y) <= ANY (values(1,2),(3,4)) as c11
 from (values(1,2,3)) v(x,y,z);
 select pg_get_viewdef('tt26v', true);
+
+-- test restriction on non-system view expansion.
+create table tt27v_tbl (a int);
+create view tt27v as select a from tt27v_tbl;
+set restrict_nonsystem_relation_kind to 'view';
+select a from tt27v where a > 0; -- Error
+insert into tt27v values (1); -- Error
+select viewname from pg_views where viewname = 'tt27v'; -- Ok to access a system view.
+reset restrict_nonsystem_relation_kind;
 
 -- clean up all the random objects we made above
 DROP SCHEMA temp_view_test CASCADE;

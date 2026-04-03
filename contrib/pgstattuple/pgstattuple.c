@@ -36,10 +36,12 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
-#include "utils/builtins.h"
 #include "utils/varlena.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pgstattuple",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(pgstattuple);
 PG_FUNCTION_INFO_V1(pgstattuple_v1_5);
@@ -259,6 +261,13 @@ pgstat_relation(Relation rel, FunctionCallInfo fcinfo)
 	}
 	else if (rel->rd_rel->relkind == RELKIND_INDEX)
 	{
+		/* see pgstatindex_impl */
+		if (!rel->rd_index->indisvalid)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("index \"%s\" is not valid",
+							RelationGetRelationName(rel))));
+
 		switch (rel->rd_rel->relam)
 		{
 			case BTREE_AM_OID:
@@ -316,7 +325,11 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 	pgstattuple_type stat = {0};
 	SnapshotData SnapshotDirty;
 
-	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+	/*
+	 * Sequences always use heap AM, but they don't show that in the catalogs.
+	 */
+	if (rel->rd_rel->relkind != RELKIND_SEQUENCE &&
+		rel->rd_rel->relam != HEAP_TABLE_AM_OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("only heap AM is supported")));
@@ -365,7 +378,7 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 			buffer = ReadBufferExtended(rel, MAIN_FORKNUM, block,
 										RBM_NORMAL, hscan->rs_strategy);
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
-			stat.free_space += PageGetHeapFreeSpace((Page) BufferGetPage(buffer));
+			stat.free_space += PageGetExactFreeSpace(BufferGetPage(buffer));
 			UnlockReleaseBuffer(buffer);
 			block++;
 		}
@@ -378,7 +391,7 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, block,
 									RBM_NORMAL, hscan->rs_strategy);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
-		stat.free_space += PageGetHeapFreeSpace((Page) BufferGetPage(buffer));
+		stat.free_space += PageGetExactFreeSpace(BufferGetPage(buffer));
 		UnlockReleaseBuffer(buffer);
 		block++;
 	}
@@ -411,7 +424,7 @@ pgstat_btree_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno,
 		/* fully empty page */
 		stat->free_space += BLCKSZ;
 	}
-	else
+	else if (PageGetSpecialSize(page) == MAXALIGN(sizeof(BTPageOpaqueData)))
 	{
 		BTPageOpaque opaque;
 
@@ -445,10 +458,16 @@ pgstat_hash_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno,
 	Buffer		buf;
 	Page		page;
 
-	buf = _hash_getbuf_with_strategy(rel, blkno, HASH_READ, 0, bstrategy);
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, bstrategy);
+	LockBuffer(buf, HASH_READ);
 	page = BufferGetPage(buf);
 
-	if (PageGetSpecialSize(page) == MAXALIGN(sizeof(HashPageOpaqueData)))
+	if (PageIsNew(page))
+	{
+		/* fully empty page */
+		stat->free_space += BLCKSZ;
+	}
+	else if (PageGetSpecialSize(page) == MAXALIGN(sizeof(HashPageOpaqueData)))
 	{
 		HashPageOpaque opaque;
 
@@ -489,17 +508,23 @@ pgstat_gist_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno,
 
 	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, bstrategy);
 	LockBuffer(buf, GIST_SHARE);
-	gistcheckpage(rel, buf);
 	page = BufferGetPage(buf);
-
-	if (GistPageIsLeaf(page))
+	if (PageIsNew(page))
 	{
-		pgstat_index_page(stat, page, FirstOffsetNumber,
-						  PageGetMaxOffsetNumber(page));
+		/* fully empty page */
+		stat->free_space += BLCKSZ;
 	}
-	else
+	else if (PageGetSpecialSize(page) == MAXALIGN(sizeof(GISTPageOpaqueData)))
 	{
-		/* root or node */
+		if (GistPageIsLeaf(page))
+		{
+			pgstat_index_page(stat, page, FirstOffsetNumber,
+							  PageGetMaxOffsetNumber(page));
+		}
+		else
+		{
+			/* root or node */
+		}
 	}
 
 	UnlockReleaseBuffer(buf);
@@ -558,7 +583,7 @@ pgstat_index_page(pgstattuple_type *stat, Page page,
 {
 	OffsetNumber i;
 
-	stat->free_space += PageGetFreeSpace(page);
+	stat->free_space += PageGetExactFreeSpace(page);
 
 	for (i = minoff; i <= maxoff; i = OffsetNumberNext(i))
 	{

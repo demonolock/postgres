@@ -13,9 +13,6 @@
 #ifndef CHAR_BIT
 #include <limits.h>
 #endif
-#ifdef LOCALE_T_IN_XLOCALE
-#include <xlocale.h>
-#endif
 
 enum COMPAT_MODE
 {
@@ -80,7 +77,7 @@ struct statement
 	locale_t	oldlocale;
 #else
 	char	   *oldlocale;
-#ifdef HAVE__CONFIGTHREADLOCALE
+#ifdef WIN32
 	int			oldthreadlocale;
 #endif
 #endif
@@ -169,9 +166,7 @@ bool		ecpg_get_data(const PGresult *, int, int, int, enum ECPGttype type,
 						  enum ECPGttype, char *, char *, long, long, long,
 						  enum ARRAY_TYPE, enum COMPAT_MODE, bool);
 
-#ifdef ENABLE_THREAD_SAFETY
 void		ecpg_pthreads_init(void);
-#endif
 struct connection *ecpg_get_connection(const char *connection_name);
 char	   *ecpg_alloc(long size, int lineno);
 char	   *ecpg_auto_alloc(long size, int lineno);
@@ -180,7 +175,7 @@ void		ecpg_free(void *ptr);
 bool		ecpg_init(const struct connection *con,
 					  const char *connection_name,
 					  const int lineno);
-char	   *ecpg_strdup(const char *string, int lineno);
+char	   *ecpg_strdup(const char *string, int lineno, bool *alloc_failed);
 const char *ecpg_type_name(enum ECPGttype typ);
 int			ecpg_dynamic_type(Oid type);
 int			sqlda_dynamic_type(Oid type, enum COMPAT_MODE compat);

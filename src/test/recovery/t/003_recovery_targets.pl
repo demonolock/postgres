@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Test for recovery targets: name, timestamp, XID
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -57,7 +57,7 @@ $node_primary->init(has_archiving => 1, allows_streaming => 1);
 
 # Bump the transaction ID epoch.  This is useful to stress the portability
 # of recovery_target_xid parsing.
-system_or_bail('pg_resetwal', '--epoch', '1', $node_primary->data_dir);
+system_or_bail('pg_resetwal', '--epoch' => '1', $node_primary->data_dir);
 
 # Start it
 $node_primary->start;
@@ -147,13 +147,17 @@ recovery_target_time = '$recovery_time'");
 
 my $res = run_log(
 	[
-		'pg_ctl', '-D', $node_standby->data_dir, '-l',
-		$node_standby->logfile, 'start'
+		'pg_ctl',
+		'--pgdata' => $node_standby->data_dir,
+		'--log' => $node_standby->logfile,
+		'start',
 	]);
 ok(!$res, 'invalid recovery startup fails');
 
 my $logfile = slurp_file($node_standby->logfile());
-ok($logfile =~ qr/multiple recovery targets specified/,
+like(
+	$logfile,
+	qr/multiple recovery targets specified/,
 	'multiple conflicting settings');
 
 # Check behavior when recovery ends before target is reached
@@ -168,8 +172,10 @@ $node_standby->append_conf('postgresql.conf',
 
 run_log(
 	[
-		'pg_ctl', '-D', $node_standby->data_dir, '-l',
-		$node_standby->logfile, 'start'
+		'pg_ctl',
+		'--pgdata' => $node_standby->data_dir,
+		'--log' => $node_standby->logfile,
+		'start',
 	]);
 
 # wait for postgres to terminate
@@ -179,8 +185,59 @@ foreach my $i (0 .. 10 * $PostgreSQL::Test::Utils::timeout_default)
 	usleep(100_000);
 }
 $logfile = slurp_file($node_standby->logfile());
-ok( $logfile =~
-	  qr/FATAL: .* recovery ended before configured recovery target was reached/,
+like(
+	$logfile,
+	qr/FATAL: .* recovery ended before configured recovery target was reached/,
 	'recovery end before target reached is a fatal error');
+
+# Invalid timeline target
+$node_standby = PostgreSQL::Test::Cluster->new('standby_9');
+$node_standby->init_from_backup($node_primary, 'my_backup',
+	has_restoring => 1);
+$node_standby->append_conf('postgresql.conf',
+	"recovery_target_timeline = 'bogus'");
+
+$res = run_log(
+	[
+		'pg_ctl',
+		'--pgdata' => $node_standby->data_dir,
+		'--log' => $node_standby->logfile,
+		'start',
+	]);
+ok(!$res, 'invalid timeline target (bogus value)');
+
+my $log_start = $node_standby->wait_for_log("is not a valid number");
+
+# Timeline target out of min range
+$node_standby->append_conf('postgresql.conf',
+	"recovery_target_timeline = '0'");
+
+$res = run_log(
+	[
+		'pg_ctl',
+		'--pgdata' => $node_standby->data_dir,
+		'--log' => $node_standby->logfile,
+		'start',
+	]);
+ok(!$res, 'invalid timeline target (lower bound check)');
+
+$log_start =
+  $node_standby->wait_for_log("must be between 1 and 4294967295", $log_start);
+
+# Timeline target out of max range
+$node_standby->append_conf('postgresql.conf',
+	"recovery_target_timeline = '4294967296'");
+
+$res = run_log(
+	[
+		'pg_ctl',
+		'--pgdata' => $node_standby->data_dir,
+		'--log' => $node_standby->logfile,
+		'start',
+	]);
+ok(!$res, 'invalid timeline target (upper bound check)');
+
+$log_start =
+  $node_standby->wait_for_log("must be between 1 and 4294967295", $log_start);
 
 done_testing();

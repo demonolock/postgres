@@ -3,7 +3,7 @@
  * pg_publication.h
  *	  definition of the "publication" system catalog (pg_publication)
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_publication.h
@@ -19,13 +19,15 @@
 
 #include "catalog/genbki.h"
 #include "catalog/objectaddress.h"
-#include "catalog/pg_publication_d.h"
+#include "catalog/pg_publication_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_publication definition.  cpp turns this into
  *		typedef struct FormData_pg_publication
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_publication,6104,PublicationRelationId)
 {
 	Oid			oid;			/* oid */
@@ -39,6 +41,12 @@ CATALOG(pg_publication,6104,PublicationRelationId)
 	 * tables in the database (except for the unlogged and temp ones)
 	 */
 	bool		puballtables;
+
+	/*
+	 * indicates that this is special publication which should encompass all
+	 * sequences in the database (except for the unlogged and temp ones)
+	 */
+	bool		puballsequences;
 
 	/* true if inserts are published */
 	bool		pubinsert;
@@ -54,7 +62,15 @@ CATALOG(pg_publication,6104,PublicationRelationId)
 
 	/* true if partition changes are published using root schema */
 	bool		pubviaroot;
+
+	/*
+	 * 'n'(none) if generated column data should not be published. 's'(stored)
+	 * if stored generated column data should be published.
+	 */
+	char		pubgencols;
 } FormData_pg_publication;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_publication corresponds to a pointer to a tuple with
@@ -63,8 +79,11 @@ CATALOG(pg_publication,6104,PublicationRelationId)
  */
 typedef FormData_pg_publication *Form_pg_publication;
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_publication_oid_index, 6110, PublicationObjectIndexId, on pg_publication using btree(oid oid_ops));
-DECLARE_UNIQUE_INDEX(pg_publication_pubname_index, 6111, PublicationNameIndexId, on pg_publication using btree(pubname name_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_publication_oid_index, 6110, PublicationObjectIndexId, pg_publication, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_publication_pubname_index, 6111, PublicationNameIndexId, pg_publication, btree(pubname name_ops));
+
+MAKE_SYSCACHE(PUBLICATIONOID, pg_publication_oid_index, 8);
+MAKE_SYSCACHE(PUBLICATIONNAME, pg_publication_pubname_index, 8);
 
 typedef struct PublicationActions
 {
@@ -92,14 +111,37 @@ typedef struct PublicationDesc
 	 */
 	bool		cols_valid_for_update;
 	bool		cols_valid_for_delete;
+
+	/*
+	 * true if all generated columns that are part of replica identity are
+	 * published or the publication actions do not include UPDATE or DELETE.
+	 */
+	bool		gencols_valid_for_update;
+	bool		gencols_valid_for_delete;
 } PublicationDesc;
+
+#ifdef EXPOSE_TO_CLIENT_CODE
+
+typedef enum PublishGencolsType
+{
+	/* Generated columns present should not be replicated. */
+	PUBLISH_GENCOLS_NONE = 'n',
+
+	/* Generated columns present should be replicated. */
+	PUBLISH_GENCOLS_STORED = 's',
+
+} PublishGencolsType;
+
+#endif							/* EXPOSE_TO_CLIENT_CODE */
 
 typedef struct Publication
 {
 	Oid			oid;
 	char	   *name;
 	bool		alltables;
+	bool		allsequences;
 	bool		pubviaroot;
+	PublishGencolsType pubgencols_type;
 	PublicationActions pubactions;
 } Publication;
 
@@ -115,7 +157,7 @@ extern Publication *GetPublicationByName(const char *pubname, bool missing_ok);
 extern List *GetRelationPublications(Oid relid);
 
 /*---------
- * Expected values for pub_partopt parameter of GetRelationPublications(),
+ * Expected values for pub_partopt parameter of GetPublicationRelations(),
  * which allows callers to specify which partitions of partitioned tables
  * mentioned in the publication they expect to see.
  *
@@ -132,7 +174,7 @@ typedef enum PublicationPartOpt
 
 extern List *GetPublicationRelations(Oid pubid, PublicationPartOpt pub_partopt);
 extern List *GetAllTablesPublications(void);
-extern List *GetAllTablesPublicationRelations(bool pubviaroot);
+extern List *GetAllPublicationRelations(char relkind, bool pubviaroot);
 extern List *GetPublicationSchemas(Oid pubid);
 extern List *GetSchemaPublications(Oid schemaid);
 extern List *GetSchemaPublicationRelations(Oid schemaid,
@@ -147,12 +189,17 @@ extern Oid	GetTopMostAncestorInPublication(Oid puboid, List *ancestors,
 
 extern bool is_publishable_relation(Relation rel);
 extern bool is_schema_publication(Oid pubid);
+extern bool check_and_fetch_column_list(Publication *pub, Oid relid,
+										MemoryContext mcxt, Bitmapset **cols);
 extern ObjectAddress publication_add_relation(Oid pubid, PublicationRelInfo *pri,
 											  bool if_not_exists);
+extern Bitmapset *pub_collist_validate(Relation targetrel, List *columns);
 extern ObjectAddress publication_add_schema(Oid pubid, Oid schemaid,
 											bool if_not_exists);
 
 extern Bitmapset *pub_collist_to_bitmapset(Bitmapset *columns, Datum pubcols,
 										   MemoryContext mcxt);
+extern Bitmapset *pub_form_cols_map(Relation relation,
+									PublishGencolsType include_gencols_type);
 
 #endif							/* PG_PUBLICATION_H */

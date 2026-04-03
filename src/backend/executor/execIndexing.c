@@ -54,9 +54,9 @@
  * ---------------------
  *
  * Speculative insertion is a two-phase mechanism used to implement
- * INSERT ... ON CONFLICT DO UPDATE/NOTHING.  The tuple is first inserted
- * to the heap and update the indexes as usual, but if a constraint is
- * violated, we can still back out the insertion without aborting the whole
+ * INSERT ... ON CONFLICT.  The tuple is first inserted into the heap
+ * and the indexes are updated as usual, but if a constraint is violated,
+ * we can still back out of the insertion without aborting the whole
  * transaction.  In an INSERT ... ON CONFLICT statement, if a conflict is
  * detected, the inserted tuple is backed out and the ON CONFLICT action is
  * executed instead.
@@ -95,7 +95,7 @@
  * with the higher XID backs out.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -114,6 +114,9 @@
 #include "executor/executor.h"
 #include "nodes/nodeFuncs.h"
 #include "storage/lmgr.h"
+#include "utils/injection_point.h"
+#include "utils/multirangetypes.h"
+#include "utils/rangetypes.h"
 #include "utils/snapmgr.h"
 
 /* waitMode argument to check_exclusion_or_unique_constraint() */
@@ -121,26 +124,28 @@ typedef enum
 {
 	CEOUC_WAIT,
 	CEOUC_NOWAIT,
-	CEOUC_LIVELOCK_PREVENTING_WAIT
+	CEOUC_LIVELOCK_PREVENTING_WAIT,
 } CEOUC_WAIT_MODE;
 
 static bool check_exclusion_or_unique_constraint(Relation heap, Relation index,
 												 IndexInfo *indexInfo,
-												 ItemPointer tupleid,
-												 Datum *values, bool *isnull,
+												 const ItemPointerData *tupleid,
+												 const Datum *values, const bool *isnull,
 												 EState *estate, bool newIndex,
 												 CEOUC_WAIT_MODE waitMode,
 												 bool violationOK,
 												 ItemPointer conflictTid);
 
-static bool index_recheck_constraint(Relation index, Oid *constr_procs,
-									 Datum *existing_values, bool *existing_isnull,
-									 Datum *new_values);
+static bool index_recheck_constraint(Relation index, const Oid *constr_procs,
+									 const Datum *existing_values, const bool *existing_isnull,
+									 const Datum *new_values);
 static bool index_unchanged_by_update(ResultRelInfo *resultRelInfo,
 									  EState *estate, IndexInfo *indexInfo,
 									  Relation indexRelation);
 static bool index_expression_changed_walker(Node *node,
 											Bitmapset *allUpdatedCols);
+static void ExecWithoutOverlapsNotEmpty(Relation rel, NameData attname, Datum attval,
+										char typtype, Oid atttypid);
 
 /* ----------------------------------------------------------------
  *		ExecOpenIndices
@@ -177,11 +182,14 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 	if (len == 0)
 		return;
 
+	/* This Assert will fail if ExecOpenIndices is called twice */
+	Assert(resultRelInfo->ri_IndexRelationDescs == NULL);
+
 	/*
 	 * allocate space for result arrays
 	 */
-	relationDescs = (RelationPtr) palloc(len * sizeof(Relation));
-	indexInfoArray = (IndexInfo **) palloc(len * sizeof(IndexInfo *));
+	relationDescs = palloc_array(Relation, len);
+	indexInfoArray = palloc_array(IndexInfo *, len);
 
 	resultRelInfo->ri_NumIndices = len;
 	resultRelInfo->ri_IndexRelationDescs = relationDescs;
@@ -210,7 +218,7 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 		 * If the indexes are to be used for speculative insertion, add extra
 		 * information required by unique index entries.
 		 */
-		if (speculative && ii->ii_Unique)
+		if (speculative && ii->ii_Unique && !indexDesc->rd_index->indisexclusion)
 			BuildSpeculativeIndexInfo(indexDesc, ii);
 
 		relationDescs[i] = indexDesc;
@@ -233,22 +241,31 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
 	int			i;
 	int			numIndices;
 	RelationPtr indexDescs;
+	IndexInfo **indexInfos;
 
 	numIndices = resultRelInfo->ri_NumIndices;
 	indexDescs = resultRelInfo->ri_IndexRelationDescs;
+	indexInfos = resultRelInfo->ri_IndexRelationInfo;
 
 	for (i = 0; i < numIndices; i++)
 	{
-		if (indexDescs[i] == NULL)
-			continue;			/* shouldn't happen? */
+		/* This Assert will fail if ExecCloseIndices is called twice */
+		Assert(indexDescs[i] != NULL);
+
+		/* Give the index a chance to do some post-insert cleanup */
+		index_insert_cleanup(indexDescs[i], indexInfos[i]);
 
 		/* Drop lock acquired by ExecOpenIndices */
 		index_close(indexDescs[i], RowExclusiveLock);
+
+		/* Mark the index as closed */
+		indexDescs[i] = NULL;
 	}
 
 	/*
-	 * XXX should free indexInfo array here too?  Currently we assume that
-	 * such stuff will be cleaned up automatically in FreeExecutorState.
+	 * We don't attempt to free the IndexInfo data structures or the arrays,
+	 * instead assuming that such stuff will be cleaned up automatically in
+	 * FreeExecutorState.
 	 */
 }
 
@@ -259,45 +276,43 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *		into all the relations indexing the result relation
  *		when a heap tuple is inserted into the result relation.
  *
- *		When 'update' is true and 'onlySummarizing' is false,
+ *		When EIIT_IS_UPDATE is set and EIIT_ONLY_SUMMARIZING isn't,
  *		executor is performing an UPDATE that could not use an
  *		optimization like heapam's HOT (in more general terms a
  *		call to table_tuple_update() took place and set
- *		'update_indexes' to TUUI_All).  Receiving this hint makes
+ *		'update_indexes' to TU_All).  Receiving this hint makes
  *		us consider if we should pass down the 'indexUnchanged'
  *		hint in turn.  That's something that we figure out for
- *		each index_insert() call iff 'update' is true.
- *		(When 'update' is false we already know not to pass the
+ *		each index_insert() call iff EIIT_IS_UPDATE is set.
+ *		(When that flag is not set we already know not to pass the
  *		hint to any index.)
  *
- *		If onlySummarizing is set, an equivalent optimization to
+ *		If EIIT_ONLY_SUMMARIZING is set, an equivalent optimization to
  *		HOT has been applied and any updated columns are indexed
  *		only by summarizing indexes (or in more general terms a
  *		call to table_tuple_update() took place and set
- *		'update_indexes' to TUUI_Summarizing). We can (and must)
+ *		'update_indexes' to TU_Summarizing). We can (and must)
  *		therefore only update the indexes that have
  *		'amsummarizing' = true.
  *
  *		Unique and exclusion constraints are enforced at the same
  *		time.  This returns a list of index OIDs for any unique or
  *		exclusion constraints that are deferred and that had
- *		potential (unconfirmed) conflicts.  (if noDupErr == true,
+ *		potential (unconfirmed) conflicts.  (if EIIT_NO_DUPE_ERROR,
  *		the same is done for non-deferred constraints, but report
  *		if conflict was speculative or deferred conflict to caller)
  *
- *		If 'arbiterIndexes' is nonempty, noDupErr applies only to
- *		those indexes.  NIL means noDupErr applies to all indexes.
+ *		If 'arbiterIndexes' is nonempty, EIIT_NO_DUPE_ERROR applies only to
+ *		those indexes.  NIL means EIIT_NO_DUPE_ERROR applies to all indexes.
  * ----------------------------------------------------------------
  */
 List *
 ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
-					  TupleTableSlot *slot,
 					  EState *estate,
-					  bool update,
-					  bool noDupErr,
-					  bool *specConflict,
+					  bits32 flags,
+					  TupleTableSlot *slot,
 					  List *arbiterIndexes,
-					  bool onlySummarizing)
+					  bool *specConflict)
 {
 	ItemPointer tupleid = &slot->tts_tid;
 	List	   *result = NIL;
@@ -357,7 +372,7 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 		 * Skip processing of non-summarizing indexes if we only update
 		 * summarizing indexes
 		 */
-		if (onlySummarizing && !indexInfo->ii_Summarizing)
+		if ((flags & EIIT_ONLY_SUMMARIZING) && !indexInfo->ii_Summarizing)
 			continue;
 
 		/* Check for partial index */
@@ -392,7 +407,7 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 					   isnull);
 
 		/* Check whether to apply noDupErr to this index */
-		applyNoDupErr = noDupErr &&
+		applyNoDupErr = (flags & EIIT_NO_DUPE_ERROR) &&
 			(arbiterIndexes == NIL ||
 			 list_member_oid(arbiterIndexes,
 							 indexRelation->rd_index->indexrelid));
@@ -424,10 +439,11 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 		 * index.  If we're being called as part of an UPDATE statement,
 		 * consider if the 'indexUnchanged' = true hint should be passed.
 		 */
-		indexUnchanged = update && index_unchanged_by_update(resultRelInfo,
-															 estate,
-															 indexInfo,
-															 indexRelation);
+		indexUnchanged = ((flags & EIIT_IS_UPDATE) &&
+						  index_unchanged_by_update(resultRelInfo,
+													estate,
+													indexInfo,
+													indexRelation));
 
 		satisfiesConstraint =
 			index_insert(indexRelation, /* index relation */
@@ -514,14 +530,18 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
  *
  *		Note that this doesn't lock the values in any way, so it's
  *		possible that a conflicting tuple is inserted immediately
- *		after this returns.  But this can be used for a pre-check
- *		before insertion.
+ *		after this returns.  This can be used for either a pre-check
+ *		before insertion or a re-check after finding a conflict.
+ *
+ *		'tupleid' should be the TID of the tuple that has been recently
+ *		inserted (or can be invalid if we haven't inserted a new tuple yet).
+ *		This tuple will be excluded from conflict checking.
  * ----------------------------------------------------------------
  */
 bool
 ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 						  EState *estate, ItemPointer conflictTid,
-						  List *arbiterIndexes)
+						  const ItemPointerData *tupleid, List *arbiterIndexes)
 {
 	int			i;
 	int			numIndices;
@@ -624,7 +644,7 @@ ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 
 		satisfiesConstraint =
 			check_exclusion_or_unique_constraint(heapRelation, indexRelation,
-												 indexInfo, &invalidItemPtr,
+												 indexInfo, tupleid,
 												 values, isnull, estate, false,
 												 CEOUC_WAIT, true,
 												 conflictTid);
@@ -683,8 +703,8 @@ ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 static bool
 check_exclusion_or_unique_constraint(Relation heap, Relation index,
 									 IndexInfo *indexInfo,
-									 ItemPointer tupleid,
-									 Datum *values, bool *isnull,
+									 const ItemPointerData *tupleid,
+									 const Datum *values, const bool *isnull,
 									 EState *estate, bool newIndex,
 									 CEOUC_WAIT_MODE waitMode,
 									 bool violationOK,
@@ -713,6 +733,32 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 	{
 		constr_procs = indexInfo->ii_UniqueProcs;
 		constr_strats = indexInfo->ii_UniqueStrats;
+	}
+
+	/*
+	 * If this is a WITHOUT OVERLAPS constraint, we must also forbid empty
+	 * ranges/multiranges. This must happen before we look for NULLs below, or
+	 * a UNIQUE constraint could insert an empty range along with a NULL
+	 * scalar part.
+	 */
+	if (indexInfo->ii_WithoutOverlaps)
+	{
+		/*
+		 * Look up the type from the heap tuple, but check the Datum from the
+		 * index tuple.
+		 */
+		AttrNumber	attno = indexInfo->ii_IndexAttrNumbers[indnkeyatts - 1];
+
+		if (!isnull[indnkeyatts - 1])
+		{
+			TupleDesc	tupdesc = RelationGetDescr(heap);
+			Form_pg_attribute att = TupleDescAttr(tupdesc, attno - 1);
+			TypeCacheEntry *typcache = lookup_type_cache(att->atttypid, 0);
+
+			ExecWithoutOverlapsNotEmpty(heap, att->attname,
+										values[indnkeyatts - 1],
+										typcache->typtype, att->atttypid);
+		}
 	}
 
 	/*
@@ -769,7 +815,7 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 retry:
 	conflict = false;
 	found_self = false;
-	index_scan = index_beginscan(heap, index, &DirtySnapshot, indnkeyatts, 0);
+	index_scan = index_beginscan(heap, index, &DirtySnapshot, NULL, indnkeyatts, 0);
 	index_rescan(index_scan, scankeys, indnkeyatts, NULL, 0);
 
 	while (index_getnext_slot(index_scan, ForwardScanDirection, existing_slot))
@@ -897,6 +943,11 @@ retry:
 
 	ExecDropSingleTupleTableSlot(existing_slot);
 
+#ifdef USE_INJECTION_POINTS
+	if (!conflict)
+		INJECTION_POINT("check-exclusion-or-unique-constraint-no-conflict", NULL);
+#endif
+
 	return !conflict;
 }
 
@@ -909,8 +960,8 @@ retry:
 void
 check_exclusion_constraint(Relation heap, Relation index,
 						   IndexInfo *indexInfo,
-						   ItemPointer tupleid,
-						   Datum *values, bool *isnull,
+						   const ItemPointerData *tupleid,
+						   const Datum *values, const bool *isnull,
 						   EState *estate, bool newIndex)
 {
 	(void) check_exclusion_or_unique_constraint(heap, index, indexInfo, tupleid,
@@ -924,9 +975,9 @@ check_exclusion_constraint(Relation heap, Relation index,
  * exclusion condition against the new_values.  Returns true if conflict.
  */
 static bool
-index_recheck_constraint(Relation index, Oid *constr_procs,
-						 Datum *existing_values, bool *existing_isnull,
-						 Datum *new_values)
+index_recheck_constraint(Relation index, const Oid *constr_procs,
+						 const Datum *existing_values, const bool *existing_isnull,
+						 const Datum *new_values)
 {
 	int			indnkeyatts = IndexRelationGetNumberOfKeyAttributes(index);
 	int			i;
@@ -1090,5 +1141,39 @@ index_expression_changed_walker(Node *node, Bitmapset *allUpdatedCols)
 	}
 
 	return expression_tree_walker(node, index_expression_changed_walker,
-								  (void *) allUpdatedCols);
+								  allUpdatedCols);
+}
+
+/*
+ * ExecWithoutOverlapsNotEmpty - raise an error if the tuple has an empty
+ * range or multirange in the given attribute.
+ */
+static void
+ExecWithoutOverlapsNotEmpty(Relation rel, NameData attname, Datum attval, char typtype, Oid atttypid)
+{
+	bool		isempty;
+	RangeType  *r;
+	MultirangeType *mr;
+
+	switch (typtype)
+	{
+		case TYPTYPE_RANGE:
+			r = DatumGetRangeTypeP(attval);
+			isempty = RangeIsEmpty(r);
+			break;
+		case TYPTYPE_MULTIRANGE:
+			mr = DatumGetMultirangeTypeP(attval);
+			isempty = MultirangeIsEmpty(mr);
+			break;
+		default:
+			elog(ERROR, "WITHOUT OVERLAPS column \"%s\" is not a range or multirange",
+				 NameStr(attname));
+	}
+
+	/* Report a CHECK_VIOLATION */
+	if (isempty)
+		ereport(ERROR,
+				(errcode(ERRCODE_CHECK_VIOLATION),
+				 errmsg("empty WITHOUT OVERLAPS value found in column \"%s\" in relation \"%s\"",
+						NameStr(attname), RelationGetRelationName(rel))));
 }

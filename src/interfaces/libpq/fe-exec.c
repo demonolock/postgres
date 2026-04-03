@@ -3,7 +3,7 @@
  * fe-exec.c
  *	  functions related to sending a query down to the backend
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,6 +24,7 @@
 #include <unistd.h>
 #endif
 
+#include "common/int.h"
 #include "libpq-fe.h"
 #include "libpq-int.h"
 #include "mb/pg_wchar.h"
@@ -41,7 +42,8 @@ char	   *const pgresStatus[] = {
 	"PGRES_COPY_BOTH",
 	"PGRES_SINGLE_TUPLE",
 	"PGRES_PIPELINE_SYNC",
-	"PGRES_PIPELINE_ABORTED"
+	"PGRES_PIPELINE_ABORTED",
+	"PGRES_TUPLES_CHUNK"
 };
 
 /* We return this if we're unable to make a PGresult at all */
@@ -81,6 +83,7 @@ static int	PQsendTypedCommand(PGconn *conn, char command, char type,
 							   const char *target);
 static int	check_field_number(const PGresult *res, int field_num);
 static void pqPipelineProcessQueue(PGconn *conn);
+static int	pqPipelineSyncInternal(PGconn *conn, bool immediate_flush);
 static int	pqPipelineFlush(PGconn *conn);
 
 
@@ -199,6 +202,7 @@ PQmakeEmptyPGresult(PGconn *conn, ExecStatusType status)
 			case PGRES_COPY_IN:
 			case PGRES_COPY_BOTH:
 			case PGRES_SINGLE_TUPLE:
+			case PGRES_TUPLES_CHUNK:
 				/* non-error cases */
 				break;
 			default:
@@ -508,7 +512,7 @@ PQsetvalue(PGresult *res, int tup_num, int field_num, char *value, int len)
 	}
 	else
 	{
-		attval->value = (char *) pqResultAlloc(res, len + 1, true);
+		attval->value = (char *) pqResultAlloc(res, (size_t) len + 1, true);
 		if (!attval->value)
 			goto fail;
 		attval->len = len;
@@ -600,8 +604,13 @@ pqResultAlloc(PGresult *res, size_t nBytes, bool isBinary)
 	 */
 	if (nBytes >= PGRESULT_SEP_ALLOC_THRESHOLD)
 	{
-		size_t		alloc_size = nBytes + PGRESULT_BLOCK_OVERHEAD;
+		size_t		alloc_size;
 
+		/* Don't wrap around with overly large requests. */
+		if (nBytes > SIZE_MAX - PGRESULT_BLOCK_OVERHEAD)
+			return NULL;
+
+		alloc_size = nBytes + PGRESULT_BLOCK_OVERHEAD;
 		block = (PGresult_data *) malloc(alloc_size);
 		if (!block)
 			return NULL;
@@ -770,7 +779,7 @@ PQclear(PGresult *res)
 /*
  * Handy subroutine to deallocate any partially constructed async result.
  *
- * Any "next" result gets cleared too.
+ * Any "saved" result gets cleared too.
  */
 void
 pqClearAsyncResult(PGconn *conn)
@@ -778,8 +787,8 @@ pqClearAsyncResult(PGconn *conn)
 	PQclear(conn->result);
 	conn->result = NULL;
 	conn->error_result = false;
-	PQclear(conn->next_result);
-	conn->next_result = NULL;
+	PQclear(conn->saved_result);
+	conn->saved_result = NULL;
 }
 
 /*
@@ -841,6 +850,8 @@ pqSaveWriteError(PGconn *conn)
  * using whatever is in conn->errorMessage.  In any case, clear the async
  * result storage, and update our notion of how much error text has been
  * returned to the application.
+ *
+ * Note that in no case (not even OOM) do we return NULL.
  */
 PGresult *
 pqPrepareAsyncResult(PGconn *conn)
@@ -908,14 +919,14 @@ pqPrepareAsyncResult(PGconn *conn)
 	}
 
 	/*
-	 * Replace conn->result with next_result, if any.  In the normal case
-	 * there isn't a next result and we're just dropping ownership of the
-	 * current result.  In single-row mode this restores the situation to what
-	 * it was before we created the current single-row result.
+	 * Replace conn->result with saved_result, if any.  In the normal case
+	 * there isn't a saved result and we're just dropping ownership of the
+	 * current result.  In partial-result mode this restores the situation to
+	 * what it was before we created the current partial result.
 	 */
-	conn->result = conn->next_result;
-	conn->error_result = false; /* next_result is never an error */
-	conn->next_result = NULL;
+	conn->result = conn->saved_result;
+	conn->error_result = false; /* saved_result is never an error */
+	conn->saved_result = NULL;
 
 	return res;
 }
@@ -1071,8 +1082,12 @@ pqSaveMessageField(PGresult *res, char code, const char *value)
 
 /*
  * pqSaveParameterStatus - remember parameter status sent by backend
+ *
+ * Returns 1 on success, 0 on out-of-memory.  (Note that on out-of-memory, we
+ * have already released the old value of the parameter, if any.  The only
+ * really safe way to recover is to terminate the connection.)
  */
-void
+int
 pqSaveParameterStatus(PGconn *conn, const char *name, const char *value)
 {
 	pgParameterStatus *pstatus;
@@ -1113,6 +1128,11 @@ pqSaveParameterStatus(PGconn *conn, const char *name, const char *value)
 		strcpy(ptr, value);
 		pstatus->next = conn->pstatus;
 		conn->pstatus = pstatus;
+	}
+	else
+	{
+		/* out of memory */
+		return 0;
 	}
 
 	/*
@@ -1185,6 +1205,8 @@ pqSaveParameterStatus(PGconn *conn, const char *name, const char *value)
 	{
 		conn->scram_sha_256_iterations = atoi(value);
 	}
+
+	return 1;
 }
 
 
@@ -1196,11 +1218,6 @@ pqSaveParameterStatus(PGconn *conn, const char *name, const char *value)
  * On error, *errmsgp can be set to an error string to be returned.
  * (Such a string should already be translated via libpq_gettext().)
  * If it is left NULL, the error is presumed to be "out of memory".
- *
- * In single-row mode, we create a new result holding just the current row,
- * stashing the previous result in conn->next_result so that it becomes
- * active again after pqPrepareAsyncResult().  This allows the result metadata
- * (column descriptions) to be carried forward to each result row.
  */
 int
 pqRowProcessor(PGconn *conn, const char **errmsgp)
@@ -1212,11 +1229,14 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 	int			i;
 
 	/*
-	 * In single-row mode, make a new PGresult that will hold just this one
-	 * row; the original conn->result is left unchanged so that it can be used
-	 * again as the template for future rows.
+	 * In partial-result mode, if we don't already have a partial PGresult
+	 * then make one by cloning conn->result (which should hold the correct
+	 * result metadata by now).  Then the original conn->result is moved over
+	 * to saved_result so that we can re-use it as a reference for future
+	 * partial results.  The saved result will become active again after
+	 * pqPrepareAsyncResult() returns the partial result to the application.
 	 */
-	if (conn->singleRowMode)
+	if (conn->partialResMode && conn->saved_result == NULL)
 	{
 		/* Copy everything that should be in the result at this point */
 		res = PQcopyResult(res,
@@ -1224,6 +1244,11 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 						   PG_COPYRES_NOTICEHOOKS);
 		if (!res)
 			return 0;
+		/* Change result status to appropriate special value */
+		res->resultStatus = (conn->singleRowMode ? PGRES_SINGLE_TUPLE : PGRES_TUPLES_CHUNK);
+		/* And stash it as the active result */
+		conn->saved_result = conn->result;
+		conn->result = res;
 	}
 
 	/*
@@ -1238,7 +1263,7 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 	tup = (PGresAttValue *)
 		pqResultAlloc(res, nfields * sizeof(PGresAttValue), true);
 	if (tup == NULL)
-		goto fail;
+		return 0;
 
 	for (i = 0; i < nfields; i++)
 	{
@@ -1255,9 +1280,9 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 			bool		isbinary = (res->attDescs[i].format != 0);
 			char	   *val;
 
-			val = (char *) pqResultAlloc(res, clen + 1, isbinary);
+			val = (char *) pqResultAlloc(res, (size_t) clen + 1, isbinary);
 			if (val == NULL)
-				goto fail;
+				return 0;
 
 			/* copy and zero-terminate the data (even if it's binary) */
 			memcpy(val, columns[i].value, clen);
@@ -1270,30 +1295,16 @@ pqRowProcessor(PGconn *conn, const char **errmsgp)
 
 	/* And add the tuple to the PGresult's tuple array */
 	if (!pqAddTuple(res, tup, errmsgp))
-		goto fail;
+		return 0;
 
 	/*
-	 * Success.  In single-row mode, make the result available to the client
-	 * immediately.
+	 * Success.  In partial-result mode, if we have enough rows then make the
+	 * result available to the client immediately.
 	 */
-	if (conn->singleRowMode)
-	{
-		/* Change result status to special single-row value */
-		res->resultStatus = PGRES_SINGLE_TUPLE;
-		/* Stash old result for re-use later */
-		conn->next_result = conn->result;
-		conn->result = res;
-		/* And mark the result ready to return */
+	if (conn->partialResMode && res->ntups >= conn->maxChunkSize)
 		conn->asyncStatus = PGASYNC_READY_MORE;
-	}
 
 	return 1;
-
-fail:
-	/* release locally allocated PGresult, if we made one */
-	if (res != conn->result)
-		PQclear(res);
-	return 0;
 }
 
 
@@ -1458,7 +1469,7 @@ PQsendQueryInternal(PGconn *conn, const char *query, bool newQuery)
 
 	/* Send the query message(s) */
 	/* construct the outgoing Query message */
-	if (pqPutMsgStart('Q', conn) < 0 ||
+	if (pqPutMsgStart(PqMsg_Query, conn) < 0 ||
 		pqPuts(query, conn) < 0 ||
 		pqPutMsgEnd(conn) < 0)
 	{
@@ -1571,7 +1582,7 @@ PQsendPrepare(PGconn *conn,
 		return 0;				/* error msg already set */
 
 	/* construct the Parse message */
-	if (pqPutMsgStart('P', conn) < 0 ||
+	if (pqPutMsgStart(PqMsg_Parse, conn) < 0 ||
 		pqPuts(stmtName, conn) < 0 ||
 		pqPuts(query, conn) < 0)
 		goto sendFailed;
@@ -1599,7 +1610,7 @@ PQsendPrepare(PGconn *conn,
 	/* Add a Sync, unless in pipeline mode. */
 	if (conn->pipelineStatus == PQ_PIPELINE_OFF)
 	{
-		if (pqPutMsgStart('S', conn) < 0 ||
+		if (pqPutMsgStart(PqMsg_Sync, conn) < 0 ||
 			pqPutMsgEnd(conn) < 0)
 			goto sendFailed;
 	}
@@ -1742,8 +1753,10 @@ PQsendQueryStart(PGconn *conn, bool newQuery)
 		 */
 		pqClearAsyncResult(conn);
 
-		/* reset single-row processing mode */
+		/* reset partial-result mode */
+		conn->partialResMode = false;
 		conn->singleRowMode = false;
+		conn->maxChunkSize = 0;
 	}
 
 	/* ready to send command message */
@@ -1784,7 +1797,7 @@ PQsendQueryGuts(PGconn *conn,
 	if (command)
 	{
 		/* construct the Parse message */
-		if (pqPutMsgStart('P', conn) < 0 ||
+		if (pqPutMsgStart(PqMsg_Parse, conn) < 0 ||
 			pqPuts(stmtName, conn) < 0 ||
 			pqPuts(command, conn) < 0)
 			goto sendFailed;
@@ -1808,7 +1821,7 @@ PQsendQueryGuts(PGconn *conn,
 	}
 
 	/* Construct the Bind message */
-	if (pqPutMsgStart('B', conn) < 0 ||
+	if (pqPutMsgStart(PqMsg_Bind, conn) < 0 ||
 		pqPuts("", conn) < 0 ||
 		pqPuts(stmtName, conn) < 0)
 		goto sendFailed;
@@ -1874,14 +1887,14 @@ PQsendQueryGuts(PGconn *conn,
 		goto sendFailed;
 
 	/* construct the Describe Portal message */
-	if (pqPutMsgStart('D', conn) < 0 ||
+	if (pqPutMsgStart(PqMsg_Describe, conn) < 0 ||
 		pqPutc('P', conn) < 0 ||
 		pqPuts("", conn) < 0 ||
 		pqPutMsgEnd(conn) < 0)
 		goto sendFailed;
 
 	/* construct the Execute message */
-	if (pqPutMsgStart('E', conn) < 0 ||
+	if (pqPutMsgStart(PqMsg_Execute, conn) < 0 ||
 		pqPuts("", conn) < 0 ||
 		pqPutInt(0, 4, conn) < 0 ||
 		pqPutMsgEnd(conn) < 0)
@@ -1890,7 +1903,7 @@ PQsendQueryGuts(PGconn *conn,
 	/* construct the Sync message if not in pipeline mode */
 	if (conn->pipelineStatus == PQ_PIPELINE_OFF)
 	{
-		if (pqPutMsgStart('S', conn) < 0 ||
+		if (pqPutMsgStart(PqMsg_Sync, conn) < 0 ||
 			pqPutMsgEnd(conn) < 0)
 			goto sendFailed;
 	}
@@ -1923,29 +1936,60 @@ sendFailed:
 }
 
 /*
+ * Is it OK to change partial-result mode now?
+ */
+static bool
+canChangeResultMode(PGconn *conn)
+{
+	/*
+	 * Only allow changing the mode when we have launched a query and not yet
+	 * received any results.
+	 */
+	if (!conn)
+		return false;
+	if (conn->asyncStatus != PGASYNC_BUSY)
+		return false;
+	if (!conn->cmd_queue_head ||
+		(conn->cmd_queue_head->queryclass != PGQUERY_SIMPLE &&
+		 conn->cmd_queue_head->queryclass != PGQUERY_EXTENDED))
+		return false;
+	if (pgHavePendingResult(conn))
+		return false;
+	return true;
+}
+
+/*
  * Select row-by-row processing mode
  */
 int
 PQsetSingleRowMode(PGconn *conn)
 {
-	/*
-	 * Only allow setting the flag when we have launched a query and not yet
-	 * received any results.
-	 */
-	if (!conn)
+	if (canChangeResultMode(conn))
+	{
+		conn->partialResMode = true;
+		conn->singleRowMode = true;
+		conn->maxChunkSize = 1;
+		return 1;
+	}
+	else
 		return 0;
-	if (conn->asyncStatus != PGASYNC_BUSY)
-		return 0;
-	if (!conn->cmd_queue_head ||
-		(conn->cmd_queue_head->queryclass != PGQUERY_SIMPLE &&
-		 conn->cmd_queue_head->queryclass != PGQUERY_EXTENDED))
-		return 0;
-	if (pgHavePendingResult(conn))
-		return 0;
+}
 
-	/* OK, set flag */
-	conn->singleRowMode = true;
-	return 1;
+/*
+ * Select chunked results processing mode
+ */
+int
+PQsetChunkedRowsMode(PGconn *conn, int chunkSize)
+{
+	if (chunkSize > 0 && canChangeResultMode(conn))
+	{
+		conn->partialResMode = true;
+		conn->singleRowMode = false;
+		conn->maxChunkSize = chunkSize;
+		return 1;
+	}
+	else
+		return 0;
 }
 
 /*
@@ -2112,19 +2156,26 @@ PQgetResult(PGconn *conn)
 			break;
 
 		case PGASYNC_READY:
+			res = pqPrepareAsyncResult(conn);
 
 			/*
-			 * For any query type other than simple query protocol, we advance
-			 * the command queue here.  This is because for simple query
-			 * protocol we can get the READY state multiple times before the
-			 * command is actually complete, since the command string can
-			 * contain many queries.  In simple query protocol, the queue
-			 * advance is done by fe-protocol3 when it receives ReadyForQuery.
+			 * Normally pqPrepareAsyncResult will have left conn->result
+			 * empty.  Otherwise, "res" must be a not-full PGRES_TUPLES_CHUNK
+			 * result, which we want to return to the caller while staying in
+			 * PGASYNC_READY state.  Then the next call here will return the
+			 * empty PGRES_TUPLES_OK result that was restored from
+			 * saved_result, after which we can proceed.
 			 */
-			if (conn->cmd_queue_head &&
-				conn->cmd_queue_head->queryclass != PGQUERY_SIMPLE)
-				pqCommandQueueAdvance(conn);
-			res = pqPrepareAsyncResult(conn);
+			if (conn->result)
+			{
+				Assert(res->resultStatus == PGRES_TUPLES_CHUNK);
+				break;
+			}
+
+			/* Advance the queue as appropriate */
+			pqCommandQueueAdvance(conn, false,
+								  res->resultStatus == PGRES_PIPELINE_SYNC);
+
 			if (conn->pipelineStatus != PQ_PIPELINE_OFF)
 			{
 				/*
@@ -2144,7 +2195,7 @@ PQgetResult(PGconn *conn)
 				 * (In other words: we don't return a NULL after a pipeline
 				 * sync.)
 				 */
-				if (res && res->resultStatus == PGRES_PIPELINE_SYNC)
+				if (res->resultStatus == PGRES_PIPELINE_SYNC)
 					pqPipelineProcessQueue(conn);
 			}
 			else
@@ -2422,7 +2473,7 @@ PQdescribePrepared(PGconn *conn, const char *stmt)
 {
 	if (!PQexecStart(conn))
 		return NULL;
-	if (!PQsendTypedCommand(conn, 'D', 'S', stmt))
+	if (!PQsendTypedCommand(conn, PqMsg_Describe, 'S', stmt))
 		return NULL;
 	return PQexecFinish(conn);
 }
@@ -2441,7 +2492,7 @@ PQdescribePortal(PGconn *conn, const char *portal)
 {
 	if (!PQexecStart(conn))
 		return NULL;
-	if (!PQsendTypedCommand(conn, 'D', 'P', portal))
+	if (!PQsendTypedCommand(conn, PqMsg_Describe, 'P', portal))
 		return NULL;
 	return PQexecFinish(conn);
 }
@@ -2456,7 +2507,7 @@ PQdescribePortal(PGconn *conn, const char *portal)
 int
 PQsendDescribePrepared(PGconn *conn, const char *stmt)
 {
-	return PQsendTypedCommand(conn, 'D', 'S', stmt);
+	return PQsendTypedCommand(conn, PqMsg_Describe, 'S', stmt);
 }
 
 /*
@@ -2469,7 +2520,7 @@ PQsendDescribePrepared(PGconn *conn, const char *stmt)
 int
 PQsendDescribePortal(PGconn *conn, const char *portal)
 {
-	return PQsendTypedCommand(conn, 'D', 'P', portal);
+	return PQsendTypedCommand(conn, PqMsg_Describe, 'P', portal);
 }
 
 /*
@@ -2488,7 +2539,7 @@ PQclosePrepared(PGconn *conn, const char *stmt)
 {
 	if (!PQexecStart(conn))
 		return NULL;
-	if (!PQsendTypedCommand(conn, 'C', 'S', stmt))
+	if (!PQsendTypedCommand(conn, PqMsg_Close, 'S', stmt))
 		return NULL;
 	return PQexecFinish(conn);
 }
@@ -2506,7 +2557,7 @@ PQclosePortal(PGconn *conn, const char *portal)
 {
 	if (!PQexecStart(conn))
 		return NULL;
-	if (!PQsendTypedCommand(conn, 'C', 'P', portal))
+	if (!PQsendTypedCommand(conn, PqMsg_Close, 'P', portal))
 		return NULL;
 	return PQexecFinish(conn);
 }
@@ -2521,7 +2572,7 @@ PQclosePortal(PGconn *conn, const char *portal)
 int
 PQsendClosePrepared(PGconn *conn, const char *stmt)
 {
-	return PQsendTypedCommand(conn, 'C', 'S', stmt);
+	return PQsendTypedCommand(conn, PqMsg_Close, 'S', stmt);
 }
 
 /*
@@ -2534,7 +2585,7 @@ PQsendClosePrepared(PGconn *conn, const char *stmt)
 int
 PQsendClosePortal(PGconn *conn, const char *portal)
 {
-	return PQsendTypedCommand(conn, 'C', 'P', portal);
+	return PQsendTypedCommand(conn, PqMsg_Close, 'P', portal);
 }
 
 /*
@@ -2542,8 +2593,8 @@ PQsendClosePortal(PGconn *conn, const char *portal)
  *	 Common code to send a Describe or Close command
  *
  * Available options for "command" are
- *	 'C' for Close; or
- *	 'D' for Describe.
+ *	 PqMsg_Close for Close; or
+ *	 PqMsg_Describe for Describe.
  *
  * Available options for "type" are
  *	 'S' to run a command on a prepared statement; or
@@ -2577,23 +2628,23 @@ PQsendTypedCommand(PGconn *conn, char command, char type, const char *target)
 	/* construct the Sync message */
 	if (conn->pipelineStatus == PQ_PIPELINE_OFF)
 	{
-		if (pqPutMsgStart('S', conn) < 0 ||
+		if (pqPutMsgStart(PqMsg_Sync, conn) < 0 ||
 			pqPutMsgEnd(conn) < 0)
 			goto sendFailed;
 	}
 
 	/* remember if we are doing a Close or a Describe */
-	if (command == 'C')
+	if (command == PqMsg_Close)
 	{
 		entry->queryclass = PGQUERY_CLOSE;
 	}
-	else if (command == 'D')
+	else if (command == PqMsg_Describe)
 	{
 		entry->queryclass = PGQUERY_DESCRIBE;
 	}
 	else
 	{
-		libpq_append_conn_error(conn, "unknown command type provided");
+		libpq_append_conn_error(conn, "unrecognized message type \"%c\"", command);
 		goto sendFailed;
 	}
 
@@ -2696,7 +2747,7 @@ PQputCopyData(PGconn *conn, const char *buffer, int nbytes)
 				return pqIsnonblocking(conn) ? 0 : -1;
 		}
 		/* Send the data (too simple to delegate to fe-protocol files) */
-		if (pqPutMsgStart('d', conn) < 0 ||
+		if (pqPutMsgStart(PqMsg_CopyData, conn) < 0 ||
 			pqPutnchar(buffer, nbytes, conn) < 0 ||
 			pqPutMsgEnd(conn) < 0)
 			return -1;
@@ -2709,8 +2760,7 @@ PQputCopyData(PGconn *conn, const char *buffer, int nbytes)
  *
  * After calling this, use PQgetResult() to check command completion status.
  *
- * Returns 1 if successful, 0 if data could not be sent (only possible
- * in nonblock mode), or -1 if an error occurs.
+ * Returns 1 if successful, or -1 if an error occurs.
  */
 int
 PQputCopyEnd(PGconn *conn, const char *errormsg)
@@ -2731,7 +2781,7 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 	if (errormsg)
 	{
 		/* Send COPY FAIL */
-		if (pqPutMsgStart('f', conn) < 0 ||
+		if (pqPutMsgStart(PqMsg_CopyFail, conn) < 0 ||
 			pqPuts(errormsg, conn) < 0 ||
 			pqPutMsgEnd(conn) < 0)
 			return -1;
@@ -2739,7 +2789,7 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 	else
 	{
 		/* Send COPY DONE */
-		if (pqPutMsgStart('c', conn) < 0 ||
+		if (pqPutMsgStart(PqMsg_CopyDone, conn) < 0 ||
 			pqPutMsgEnd(conn) < 0)
 			return -1;
 	}
@@ -2751,7 +2801,7 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 	if (conn->cmd_queue_head &&
 		conn->cmd_queue_head->queryclass != PGQUERY_SIMPLE)
 	{
-		if (pqPutMsgStart('S', conn) < 0 ||
+		if (pqPutMsgStart(PqMsg_Sync, conn) < 0 ||
 			pqPutMsgEnd(conn) < 0)
 			return -1;
 	}
@@ -3089,18 +3139,44 @@ PQexitPipelineMode(PGconn *conn)
 
 /*
  * pqCommandQueueAdvance
- *		Remove one query from the command queue, when we receive
- *		all results from the server that pertain to it.
+ *		Remove one query from the command queue, if appropriate.
+ *
+ * If we have received all results corresponding to the head element
+ * in the command queue, remove it.
+ *
+ * In simple query protocol we must not advance the command queue until the
+ * ReadyForQuery message has been received.  This is because in simple mode a
+ * command can have multiple queries, and we must process result for all of
+ * them before moving on to the next command.
+ *
+ * Another consideration is synchronization during error processing in
+ * extended query protocol: we refuse to advance the queue past a SYNC queue
+ * element, unless the result we've received is also a SYNC.  In particular
+ * this protects us from advancing when an error is received at an
+ * inappropriate moment.
  */
 void
-pqCommandQueueAdvance(PGconn *conn)
+pqCommandQueueAdvance(PGconn *conn, bool isReadyForQuery, bool gotSync)
 {
 	PGcmdQueueEntry *prevquery;
 
 	if (conn->cmd_queue_head == NULL)
 		return;
 
-	/* delink from queue */
+	/*
+	 * If processing a query of simple query protocol, we only advance the
+	 * queue when we receive the ReadyForQuery message for it.
+	 */
+	if (conn->cmd_queue_head->queryclass == PGQUERY_SIMPLE && !isReadyForQuery)
+		return;
+
+	/*
+	 * If we're waiting for a SYNC, don't advance the queue until we get one.
+	 */
+	if (conn->cmd_queue_head->queryclass == PGQUERY_SYNC && !gotSync)
+		return;
+
+	/* delink element from queue */
 	prevquery = conn->cmd_queue_head;
 	conn->cmd_queue_head = conn->cmd_queue_head->next;
 
@@ -3108,7 +3184,7 @@ pqCommandQueueAdvance(PGconn *conn)
 	if (conn->cmd_queue_head == NULL)
 		conn->cmd_queue_tail = NULL;
 
-	/* and make it recyclable */
+	/* and make the queue element recyclable */
 	prevquery->next = NULL;
 	pqRecycleCmdQueueEntry(conn, prevquery);
 }
@@ -3152,10 +3228,12 @@ pqPipelineProcessQueue(PGconn *conn)
 	}
 
 	/*
-	 * Reset single-row processing mode.  (Client has to set it up for each
-	 * query, if desired.)
+	 * Reset partial-result mode.  (Client has to set it up for each query, if
+	 * desired.)
 	 */
+	conn->partialResMode = false;
 	conn->singleRowMode = false;
+	conn->maxChunkSize = 0;
 
 	/*
 	 * If there are no further commands to process in the queue, get us in
@@ -3206,25 +3284,31 @@ pqPipelineProcessQueue(PGconn *conn)
 /*
  * PQpipelineSync
  *		Send a Sync message as part of a pipeline, and flush to server
- *
- * It's legal to start submitting more commands in the pipeline immediately,
- * without waiting for the results of the current pipeline. There's no need to
- * end pipeline mode and start it again.
- *
- * If a command in a pipeline fails, every subsequent command up to and including
- * the result to the Sync message sent by PQpipelineSync gets set to
- * PGRES_PIPELINE_ABORTED state. If the whole pipeline is processed without
- * error, a PGresult with PGRES_PIPELINE_SYNC is produced.
- *
- * Queries can already have been sent before PQpipelineSync is called, but
- * PQpipelineSync need to be called before retrieving command results.
- *
- * The connection will remain in pipeline mode and unavailable for new
- * synchronous command execution functions until all results from the pipeline
- * are processed by the client.
  */
 int
 PQpipelineSync(PGconn *conn)
+{
+	return pqPipelineSyncInternal(conn, true);
+}
+
+/*
+ * PQsendPipelineSync
+ *		Send a Sync message as part of a pipeline, without flushing to server
+ */
+int
+PQsendPipelineSync(PGconn *conn)
+{
+	return pqPipelineSyncInternal(conn, false);
+}
+
+/*
+ * Workhorse function for PQpipelineSync and PQsendPipelineSync.
+ *
+ * immediate_flush controls if the flush happens immediately after sending the
+ * Sync message or not.
+ */
+static int
+pqPipelineSyncInternal(PGconn *conn, bool immediate_flush)
 {
 	PGcmdQueueEntry *entry;
 
@@ -3263,16 +3347,26 @@ PQpipelineSync(PGconn *conn)
 	entry->query = NULL;
 
 	/* construct the Sync message */
-	if (pqPutMsgStart('S', conn) < 0 ||
+	if (pqPutMsgStart(PqMsg_Sync, conn) < 0 ||
 		pqPutMsgEnd(conn) < 0)
 		goto sendFailed;
 
 	/*
 	 * Give the data a push.  In nonblock mode, don't complain if we're unable
 	 * to send it all; PQgetResult() will do any additional flushing needed.
+	 * If immediate_flush is disabled, the data is pushed if we are past the
+	 * size threshold.
 	 */
-	if (PQflush(conn) < 0)
-		goto sendFailed;
+	if (immediate_flush)
+	{
+		if (pqFlush(conn) < 0)
+			goto sendFailed;
+	}
+	else
+	{
+		if (pqPipelineFlush(conn) < 0)
+			goto sendFailed;
+	}
 
 	/* OK, it's launched! */
 	pqAppendCmdQueueEntry(conn, entry);
@@ -3311,11 +3405,19 @@ PQsendFlushRequest(PGconn *conn)
 		return 0;
 	}
 
-	if (pqPutMsgStart('H', conn) < 0 ||
+	if (pqPutMsgStart(PqMsg_Flush, conn) < 0 ||
 		pqPutMsgEnd(conn) < 0)
 	{
 		return 0;
 	}
+
+	/*
+	 * Give the data a push (in pipeline mode, only if we're past the size
+	 * threshold).  In nonblock mode, don't complain if we're unable to send
+	 * it all; PQgetResult() will do any additional flushing needed.
+	 */
+	if (pqPipelineFlush(conn) < 0)
+		return 0;
 
 	return 1;
 }
@@ -3906,11 +4008,7 @@ PQisnonblocking(const PGconn *conn)
 int
 PQisthreadsafe(void)
 {
-#ifdef ENABLE_THREAD_SAFETY
 	return true;
-#else
-	return false;
-#endif
 }
 
 
@@ -3994,15 +4092,16 @@ PQescapeStringInternal(PGconn *conn,
 {
 	const char *source = from;
 	char	   *target = to;
-	size_t		remaining = length;
+	size_t		remaining = strnlen(from, length);
+	bool		already_complained = false;
 
 	if (error)
 		*error = 0;
 
-	while (remaining > 0 && *source != '\0')
+	while (remaining > 0)
 	{
 		char		c = *source;
-		int			len;
+		int			charlen;
 		int			i;
 
 		/* Fast path for plain ASCII */
@@ -4019,38 +4118,69 @@ PQescapeStringInternal(PGconn *conn,
 		}
 
 		/* Slow path for possible multibyte characters */
-		len = pg_encoding_mblen(encoding, source);
+		charlen = pg_encoding_mblen_or_incomplete(encoding,
+												  source, remaining);
 
-		/* Copy the character */
-		for (i = 0; i < len; i++)
+		if (remaining < charlen ||
+			pg_encoding_verifymbchar(encoding, source, charlen) == -1)
 		{
-			if (remaining == 0 || *source == '\0')
-				break;
-			*target++ = *source++;
-			remaining--;
-		}
-
-		/*
-		 * If we hit premature end of string (ie, incomplete multibyte
-		 * character), try to pad out to the correct length with spaces. We
-		 * may not be able to pad completely, but we will always be able to
-		 * insert at least one pad space (since we'd not have quoted a
-		 * multibyte character).  This should be enough to make a string that
-		 * the server will error out on.
-		 */
-		if (i < len)
-		{
+			/*
+			 * Multibyte character is invalid.  It's important to verify that
+			 * as invalid multibyte characters could e.g. be used to "skip"
+			 * over quote characters, e.g. when parsing
+			 * character-by-character.
+			 *
+			 * Report an error if possible, and replace the character's first
+			 * byte with an invalid sequence. The invalid sequence ensures
+			 * that the escaped string will trigger an error on the
+			 * server-side, even if we can't directly report an error here.
+			 *
+			 * This isn't *that* crucial when we can report an error to the
+			 * caller; but if we can't or the caller ignores it, the caller
+			 * will use this string unmodified and it needs to be safe for
+			 * parsing.
+			 *
+			 * We know there's enough space for the invalid sequence because
+			 * the "to" buffer needs to be at least 2 * length + 1 long, and
+			 * at worst we're replacing a single input byte with two invalid
+			 * bytes.
+			 *
+			 * It would be a bit faster to verify the whole string the first
+			 * time we encounter a set highbit, but this way we can replace
+			 * just the invalid data, which probably makes it easier for users
+			 * to find the invalidly encoded portion of a larger string.
+			 */
 			if (error)
 				*error = 1;
-			if (conn)
-				libpq_append_conn_error(conn, "incomplete multibyte character");
-			for (; i < len; i++)
+			if (conn && !already_complained)
 			{
-				if (((size_t) (target - to)) / 2 >= length)
-					break;
-				*target++ = ' ';
+				if (remaining < charlen)
+					libpq_append_conn_error(conn, "incomplete multibyte character");
+				else
+					libpq_append_conn_error(conn, "invalid multibyte character");
+				/* Issue a complaint only once per string */
+				already_complained = true;
 			}
-			break;
+
+			pg_encoding_set_invalid(encoding, target);
+			target += 2;
+
+			/*
+			 * Handle the following bytes as if this byte didn't exist. That's
+			 * safer in case the subsequent bytes contain important characters
+			 * for the caller (e.g. '>' in html).
+			 */
+			source++;
+			remaining--;
+		}
+		else
+		{
+			/* Copy the character */
+			for (i = 0; i < charlen; i++)
+			{
+				*target++ = *source++;
+				remaining--;
+			}
 		}
 	}
 
@@ -4103,11 +4233,12 @@ PQescapeInternal(PGconn *conn, const char *str, size_t len, bool as_ident)
 	const char *s;
 	char	   *result;
 	char	   *rp;
-	int			num_quotes = 0; /* single or double, depending on as_ident */
-	int			num_backslashes = 0;
-	int			input_len;
-	int			result_size;
+	size_t		num_quotes = 0; /* single or double, depending on as_ident */
+	size_t		num_backslashes = 0;
+	size_t		input_len = strnlen(str, len);
+	size_t		result_size;
 	char		quote_char = as_ident ? '"' : '\'';
+	bool		validated_mb = false;
 
 	/* We must have a connection, else fail immediately. */
 	if (!conn)
@@ -4116,8 +4247,12 @@ PQescapeInternal(PGconn *conn, const char *str, size_t len, bool as_ident)
 	if (conn->cmd_queue_head == NULL)
 		pqClearConnErrorState(conn);
 
-	/* Scan the string for characters that must be escaped. */
-	for (s = str; (s - str) < len && *s != '\0'; ++s)
+	/*
+	 * Scan the string for characters that must be escaped and for invalidly
+	 * encoded data.
+	 */
+	s = str;
+	for (size_t remaining = input_len; remaining > 0; remaining--, s++)
 	{
 		if (*s == quote_char)
 			++num_quotes;
@@ -4128,25 +4263,58 @@ PQescapeInternal(PGconn *conn, const char *str, size_t len, bool as_ident)
 			int			charlen;
 
 			/* Slow path for possible multibyte characters */
-			charlen = pg_encoding_mblen(conn->client_encoding, s);
+			charlen = pg_encoding_mblen_or_incomplete(conn->client_encoding,
+													  s, remaining);
 
-			/* Multibyte character overruns allowable length. */
-			if ((s - str) + charlen > len || memchr(s, 0, charlen) != NULL)
+			if (charlen > remaining)
 			{
+				/* Multibyte character overruns allowable length. */
 				libpq_append_conn_error(conn, "incomplete multibyte character");
 				return NULL;
 			}
 
+			/*
+			 * If we haven't already, check that multibyte characters are
+			 * valid. It's important to verify that as invalid multi-byte
+			 * characters could e.g. be used to "skip" over quote characters,
+			 * e.g. when parsing character-by-character.
+			 *
+			 * We check validity once, for the whole remainder of the string,
+			 * when we first encounter any multi-byte character. Some
+			 * encodings have optimized implementations for longer strings.
+			 */
+			if (!validated_mb)
+			{
+				if (pg_encoding_verifymbstr(conn->client_encoding, s, remaining)
+					!= remaining)
+				{
+					libpq_append_conn_error(conn, "invalid multibyte character");
+					return NULL;
+				}
+				validated_mb = true;
+			}
+
 			/* Adjust s, bearing in mind that for loop will increment it. */
 			s += charlen - 1;
+			remaining -= charlen - 1;
 		}
 	}
 
-	/* Allocate output buffer. */
-	input_len = s - str;
-	result_size = input_len + num_quotes + 3;	/* two quotes, plus a NUL */
+	/*
+	 * Allocate output buffer. Protect against overflow, in case the caller
+	 * has allocated a large fraction of the available size_t.
+	 */
+	if (pg_add_size_overflow(input_len, num_quotes, &result_size) ||
+		pg_add_size_overflow(result_size, 3, &result_size)) /* two quotes plus a NUL */
+		goto overflow;
+
 	if (!as_ident && num_backslashes > 0)
-		result_size += num_backslashes + 2;
+	{
+		if (pg_add_size_overflow(result_size, num_backslashes, &result_size) ||
+			pg_add_size_overflow(result_size, 2, &result_size)) /* for " E" prefix */
+			goto overflow;
+	}
+
 	result = rp = (char *) malloc(result_size);
 	if (rp == NULL)
 	{
@@ -4188,7 +4356,8 @@ PQescapeInternal(PGconn *conn, const char *str, size_t len, bool as_ident)
 	}
 	else
 	{
-		for (s = str; s - str < input_len; ++s)
+		s = str;
+		for (size_t remaining = input_len; remaining > 0; remaining--, s++)
 		{
 			if (*s == quote_char || (!as_ident && *s == '\\'))
 			{
@@ -4206,6 +4375,7 @@ PQescapeInternal(PGconn *conn, const char *str, size_t len, bool as_ident)
 					*rp++ = *s;
 					if (--i == 0)
 						break;
+					remaining--;
 					++s;		/* for loop will provide the final increment */
 				}
 			}
@@ -4217,6 +4387,12 @@ PQescapeInternal(PGconn *conn, const char *str, size_t len, bool as_ident)
 	*rp = '\0';
 
 	return result;
+
+overflow:
+	libpq_append_conn_error(conn,
+							"escaped string size exceeds the maximum allowed (%zu)",
+							SIZE_MAX);
+	return NULL;
 }
 
 char *
@@ -4282,16 +4458,25 @@ PQescapeByteaInternal(PGconn *conn,
 	unsigned char *result;
 	size_t		i;
 	size_t		len;
-	size_t		bslash_len = (std_strings ? 1 : 2);
+	const size_t bslash_len = (std_strings ? 1 : 2);
 
 	/*
-	 * empty string has 1 char ('\0')
+	 * Calculate the escaped length, watching for overflow as we do with
+	 * PQescapeInternal(). The following code relies on a small constant
+	 * bslash_len so that small additions and multiplications don't need their
+	 * own overflow checks.
+	 *
+	 * Start with the empty string, which has 1 char ('\0').
 	 */
 	len = 1;
 
 	if (use_hex)
 	{
-		len += bslash_len + 1 + 2 * from_length;
+		/* We prepend "\x" and double each input character. */
+		if (pg_add_size_overflow(len, bslash_len + 1, &len) ||
+			pg_add_size_overflow(len, from_length, &len) ||
+			pg_add_size_overflow(len, from_length, &len))
+			goto overflow;
 	}
 	else
 	{
@@ -4299,13 +4484,25 @@ PQescapeByteaInternal(PGconn *conn,
 		for (i = from_length; i > 0; i--, vp++)
 		{
 			if (*vp < 0x20 || *vp > 0x7e)
-				len += bslash_len + 3;
+			{
+				if (pg_add_size_overflow(len, bslash_len + 3, &len))	/* octal "\ooo" */
+					goto overflow;
+			}
 			else if (*vp == '\'')
-				len += 2;
+			{
+				if (pg_add_size_overflow(len, 2, &len)) /* double each quote */
+					goto overflow;
+			}
 			else if (*vp == '\\')
-				len += bslash_len + bslash_len;
+			{
+				if (pg_add_size_overflow(len, bslash_len * 2, &len))	/* double each backslash */
+					goto overflow;
+			}
 			else
-				len++;
+			{
+				if (pg_add_size_overflow(len, 1, &len))
+					goto overflow;
+			}
 		}
 	}
 
@@ -4366,6 +4563,13 @@ PQescapeByteaInternal(PGconn *conn,
 	*rp = '\0';
 
 	return result;
+
+overflow:
+	if (conn)
+		libpq_append_conn_error(conn,
+								"escaped bytea size exceeds the maximum allowed (%zu)",
+								SIZE_MAX);
+	return NULL;
 }
 
 unsigned char *

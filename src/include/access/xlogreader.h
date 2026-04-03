@@ -3,7 +3,7 @@
  * xlogreader.h
  *		Definitions for the generic XLog reading facility
  *
- * Portions Copyright (c) 2013-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/include/access/xlogreader.h
@@ -145,7 +145,6 @@ typedef struct
 	bool		has_data;
 	char	   *data;
 	uint16		data_len;
-	uint16		data_bufsz;
 } DecodedBkpBlock;
 
 /*
@@ -164,7 +163,7 @@ typedef struct DecodedXLogRecord
 	XLogRecPtr	lsn;			/* location */
 	XLogRecPtr	next_lsn;		/* location of next record */
 	XLogRecord	header;			/* header */
-	RepOriginId record_origin;
+	ReplOriginId record_origin;
 	TransactionId toplevel_xid; /* XID of top-level transaction */
 	char	   *main_data;		/* record's main data portion */
 	uint32		main_data_len;	/* main data portion's length */
@@ -224,9 +223,9 @@ struct XLogReaderState
 	 * should not be accessed directly.
 	 * ----------------------------------------
 	 * Start and end point of the last record read and decoded by
-	 * XLogReadRecordInternal().  NextRecPtr is also used as the position to
-	 * decode next.  Calling XLogBeginRead() sets NextRecPtr and EndRecPtr to
-	 * the requested starting position.
+	 * XLogReadRecord().  NextRecPtr is also used as the position to decode
+	 * next.  Calling XLogBeginRead() sets NextRecPtr and EndRecPtr to the
+	 * requested starting position.
 	 */
 	XLogRecPtr	DecodeRecPtr;	/* start of last record decoded */
 	XLogRecPtr	NextRecPtr;		/* end+1 of last record decoded */
@@ -350,7 +349,7 @@ typedef enum XLogPageReadResult
 {
 	XLREAD_SUCCESS = 0,			/* record is successfully read */
 	XLREAD_FAIL = -1,			/* failed during reading a record */
-	XLREAD_WOULDBLOCK = -2		/* nonblocking mode only, no data */
+	XLREAD_WOULDBLOCK = -2,		/* nonblocking mode only, no data */
 } XLogPageReadResult;
 
 /* Read the next XLog record. Returns NULL on end-of-WAL or failure */

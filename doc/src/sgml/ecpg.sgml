@@ -75,9 +75,7 @@ EXEC SQL ...;
    Embedded <acronym>SQL</acronym> statements likewise use SQL rules, not
    C rules, for parsing quoted strings and identifiers.
    (See <xref linkend="sql-syntax-strings"/> and
-   <xref linkend="sql-syntax-identifiers"/> respectively.  Note that
-   ECPG assumes that <varname>standard_conforming_strings</varname>
-   is <literal>on</literal>.)
+   <xref linkend="sql-syntax-identifiers"/> respectively.)
    Of course, the C part of the program follows C quoting rules.
   </para>
 
@@ -409,12 +407,6 @@ EXEC SQL DISCONNECT <optional><replaceable>connection</replaceable></optional>;
     <listitem>
      <simpara>
       <literal><replaceable>connection-name</replaceable></literal>
-     </simpara>
-    </listitem>
-
-    <listitem>
-     <simpara>
-      <literal>DEFAULT</literal>
      </simpara>
     </listitem>
 
@@ -1506,9 +1498,9 @@ EXEC SQL TYPE serial_t IS long;
      </para>
 
      <para>
-      Any word you declare as a typedef cannot be used as an SQL keyword
-      in <literal>EXEC SQL</literal> commands later in the same program.
-      For example, this won't work:
+      Any word you declare as a <literal>typedef</literal> cannot be used as
+      an SQL keyword in <literal>EXEC SQL</literal> commands later in the same
+      program. For example, this won't work:
 <programlisting>
 EXEC SQL BEGIN DECLARE SECTION;
     typedef int start;
@@ -1829,11 +1821,11 @@ while (1)
      representation of that type is <literal>(%f,%f)</literal>,
      which is defined in the
      functions <function>complex_in()</function>
-     and <function>complex_out()</function> functions
+     and <function>complex_out()</function>
      in <xref linkend="xtypes"/>.  The following example inserts the
      complex type values <literal>(1,1)</literal>
      and <literal>(3,3)</literal> into the
-     columns <literal>a</literal> and <literal>b</literal>, and select
+     columns <structfield>a</structfield> and <structfield>b</structfield>, and select
      them from the table after that.
 
 <programlisting>
@@ -2048,7 +2040,7 @@ EXEC SQL EXECUTE mystmt INTO :v1, :v2, :v3 USING 37;
 EXEC SQL BEGIN DECLARE SECTION;
 char dbaname[128];
 char datname[128];
-char *stmt = "SELECT u.usename as dbaname, d.datname "
+char *stmt = "SELECT u.usename AS dbaname, d.datname "
              "  FROM pg_database d, pg_user u "
              "  WHERE d.datdba = u.usesysid";
 EXEC SQL END DECLARE SECTION;
@@ -2396,9 +2388,10 @@ int PGTYPESnumeric_to_long(numeric *nv, long *lp);
        The function converts the numeric value from the variable that
        <literal>nv</literal> points to into the long integer variable that
        <literal>lp</literal> points to. It returns 0 on success and -1 if an error
-       occurs, including overflow. On overflow, the global variable
+       occurs, including overflow and underflow. On overflow, the global variable
        <literal>errno</literal> will be set to <literal>PGTYPES_NUM_OVERFLOW</literal>
-       additionally.
+       and on underflow <literal>errno</literal> will be set to
+       <literal>PGTYPES_NUM_UNDERFLOW</literal>.
       </para>
      </listitem>
     </varlistentry>
@@ -3322,7 +3315,7 @@ int PGTYPEStimestamp_fmt_asc(timestamp *ts, char *output, int str_len, char *fmt
            <literal>%z</literal> - is replaced by the time zone offset from
            UTC; a leading plus sign stands for east of UTC, a minus sign for
            west of UTC, hours and minutes follow with two digits each and no
-           delimiter between them (common form for <ulink url="https://tools.ietf.org/html/rfc822">RFC 822</ulink> date headers).
+           delimiter between them (common form for <ulink url="https://datatracker.ietf.org/doc/html/rfc822">RFC 822</ulink> date headers).
           </para>
          </listitem>
          <listitem>
@@ -4769,6 +4762,7 @@ datdba = 10 (type: 1)
 encoding = 0 (type: 5)
 datistemplate = t (type: 1)
 datallowconn = t (type: 1)
+dathasloginevt = f (type: 1)
 datconnlimit = -1 (type: 5)
 datfrozenxid = 379 (type: 1)
 dattablespace = 1663 (type: 1)
@@ -4793,6 +4787,7 @@ datdba = 10 (type: 1)
 encoding = 0 (type: 5)
 datistemplate = f (type: 1)
 datallowconn = t (type: 1)
+dathasloginevt = f (type: 1)
 datconnlimit = -1 (type: 5)
 datfrozenxid = 379 (type: 1)
 dattablespace = 1663 (type: 1)
@@ -5796,6 +5791,14 @@ EXEC SQL UPDATE Tbl SET col = MYNUMBER;
     embedded SQL query because in this case the embedded SQL precompiler is not
     able to see this declaration.
    </para>
+
+   <para>
+    If multiple input files are named on the <command>ecpg</command>
+    preprocessor's command line, the effects of <literal>EXEC SQL
+    DEFINE</literal> and <literal>EXEC SQL UNDEF</literal> do not carry
+    across files: each file starts with only the symbols defined
+    by <option>-D</option> switches on the command line.
+   </para>
   </sect2>
 
   <sect2 id="ecpg-ifdef">
@@ -6680,7 +6683,7 @@ EXEC SQL CONNECT TO 'unix:postgresql://localhost/connectdb' AS main USER :user;
 EXEC SQL CONNECT TO :db AS :id;
 EXEC SQL CONNECT TO :db USER connectuser USING :pw;
 EXEC SQL CONNECT TO @localhost AS main USER connectdb;
-EXEC SQL CONNECT TO REGRESSDB1 as main;
+EXEC SQL CONNECT TO REGRESSDB1 AS main;
 EXEC SQL CONNECT TO AS main USER connectdb;
 EXEC SQL CONNECT TO connectdb AS :id;
 EXEC SQL CONNECT TO connectdb AS main USER connectuser/connectdb;
@@ -6954,7 +6957,7 @@ EXEC SQL [ AT <replaceable class="parameter">connection_name</replaceable> ] DEC
      The namespace of the declaration is the precompile unit, and multiple
      declarations to the same SQL statement identifier are not allowed.
      Note that if the precompiler runs in Informix compatibility mode and
-     some SQL statement is declared, "database" can not be used as a cursor
+     some SQL statement is declared, "database" cannot be used as a cursor
      name.
     </para>
    </refsect1>
@@ -7128,7 +7131,6 @@ EXEC SQL DEALLOCATE DESCRIPTOR mydesc;
 <synopsis>
 DISCONNECT <replaceable class="parameter">connection_name</replaceable>
 DISCONNECT [ CURRENT ]
-DISCONNECT DEFAULT
 DISCONNECT ALL
 </synopsis>
    </refsynopsisdiv>
@@ -7169,15 +7171,6 @@ DISCONNECT ALL
       </listitem>
      </varlistentry>
 
-     <varlistentry id="ecpg-sql-disconnect-default">
-      <term><literal>DEFAULT</literal></term>
-      <listitem>
-       <para>
-        Close the default connection.
-       </para>
-      </listitem>
-     </varlistentry>
-
      <varlistentry id="ecpg-sql-disconnect-all">
       <term><literal>ALL</literal></term>
       <listitem>
@@ -7196,13 +7189,11 @@ DISCONNECT ALL
 int
 main(void)
 {
-    EXEC SQL CONNECT TO testdb AS DEFAULT USER testuser;
     EXEC SQL CONNECT TO testdb AS con1 USER testuser;
     EXEC SQL CONNECT TO testdb AS con2 USER testuser;
     EXEC SQL CONNECT TO testdb AS con3 USER testuser;
 
     EXEC SQL DISCONNECT CURRENT;  /* close con3          */
-    EXEC SQL DISCONNECT DEFAULT;  /* close DEFAULT       */
     EXEC SQL DISCONNECT ALL;      /* close con2 and con1 */
 
     return 0;
@@ -7770,11 +7761,11 @@ SET CONNECTION [ TO | = ] <replaceable class="parameter">connection_name</replac
       </listitem>
      </varlistentry>
 
-     <varlistentry id="ecpg-sql-set-connection-default">
-      <term><literal>DEFAULT</literal></term>
+     <varlistentry id="ecpg-sql-set-connection-current">
+      <term><literal>CURRENT</literal></term>
       <listitem>
        <para>
-        Set the connection to the default connection.
+        Set the connection to the current connection (thus, nothing happens).
        </para>
       </listitem>
      </varlistentry>
@@ -8900,7 +8891,7 @@ int dectodbl(decimal *np, double *dblp);
       <term><function>dectoint</function></term>
       <listitem>
        <para>
-        Convert a variable to type decimal to an integer.
+        Convert a variable of type decimal to an integer.
 <synopsis>
 int dectoint(decimal *np, int *ip);
 </synopsis>
@@ -8926,7 +8917,7 @@ int dectoint(decimal *np, int *ip);
       <term><function>dectolong</function></term>
       <listitem>
        <para>
-        Convert a variable to type decimal to a long integer.
+        Convert a variable of type decimal to a long integer.
 <synopsis>
 int dectolong(decimal *np, long *lngp);
 </synopsis>

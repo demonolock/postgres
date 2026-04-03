@@ -5,7 +5,7 @@
  *	  clients and standalone backends are supported here).
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,12 +16,13 @@
 #include "postgres.h"
 
 #include "access/printtup.h"
-#include "libpq/libpq.h"
 #include "libpq/pqformat.h"
+#include "libpq/protocol.h"
 #include "tcop/pquery.h"
 #include "utils/lsyscache.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
+#include "varatt.h"
 
 
 static void printtup_startup(DestReceiver *self, int operation,
@@ -70,7 +71,7 @@ typedef struct
 DestReceiver *
 printtup_create_DR(CommandDest dest)
 {
-	DR_printtup *self = (DR_printtup *) palloc0(sizeof(DR_printtup));
+	DR_printtup *self = palloc0_object(DR_printtup);
 
 	self->pub.receiveSlot = printtup;	/* might get changed later */
 	self->pub.rStartup = printtup_startup;
@@ -171,7 +172,7 @@ SendRowDescriptionMessage(StringInfo buf, TupleDesc typeinfo,
 	ListCell   *tlist_item = list_head(targetlist);
 
 	/* tuple descriptor message type */
-	pq_beginmessage_reuse(buf, 'T');
+	pq_beginmessage_reuse(buf, PqMsg_RowDescription);
 	/* # of attrs in tuples */
 	pq_sendint16(buf, natts);
 
@@ -295,6 +296,9 @@ printtup_prepare_info(DR_printtup *myState, TupleDesc typeinfo, int numAttrs)
 
 /* ----------------
  *		printtup --- send a tuple to the client
+ *
+ * Note: if you change this function, see also serializeAnalyzeReceive
+ * in explain.c, which is meant to replicate the computations done here.
  * ----------------
  */
 static bool
@@ -318,9 +322,9 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	oldcontext = MemoryContextSwitchTo(myState->tmpcontext);
 
 	/*
-	 * Prepare a DataRow message (note buffer is in per-row context)
+	 * Prepare a DataRow message (note buffer is in per-query context)
 	 */
-	pq_beginmessage_reuse(buf, 'D');
+	pq_beginmessage_reuse(buf, PqMsg_DataRow);
 
 	pq_sendint16(buf, natts);
 
@@ -347,7 +351,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 		 */
 		if (thisState->typisvarlena)
 			VALGRIND_CHECK_MEM_IS_DEFINED(DatumGetPointer(attr),
-										  VARSIZE_ANY(attr));
+										  VARSIZE_ANY(DatumGetPointer(attr)));
 
 		if (thisState->format == 0)
 		{
@@ -355,7 +359,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 			char	   *outputstr;
 
 			outputstr = OutputFunctionCall(&thisState->finfo, attr);
-			pq_sendcountedtext(buf, outputstr, strlen(outputstr), false);
+			pq_sendcountedtext(buf, outputstr, strlen(outputstr));
 		}
 		else
 		{
@@ -427,7 +431,7 @@ printatt(unsigned attributeId,
 		   value != NULL ? " = \"" : "",
 		   value != NULL ? value : "",
 		   value != NULL ? "\"" : "",
-		   (unsigned int) (attributeP->atttypid),
+		   attributeP->atttypid,
 		   attributeP->attlen,
 		   attributeP->atttypmod,
 		   attributeP->attbyval ? 't' : 'f');

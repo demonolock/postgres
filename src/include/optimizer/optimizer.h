@@ -12,7 +12,7 @@
  * example.  For the most part, however, code outside the core planner
  * should not need to include any optimizer/ header except this one.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/optimizer.h
@@ -24,31 +24,22 @@
 
 #include "nodes/parsenodes.h"
 
+typedef struct ExplainState ExplainState;	/* defined in explain_state.h */
+
 /*
  * We don't want to include nodes/pathnodes.h here, because non-planner
  * code should generally treat PlannerInfo as an opaque typedef.
  * But we'd like such code to use that typedef name, so define the
- * typedef either here or in pathnodes.h, whichever is read first.
+ * typedef both here and in pathnodes.h.
  */
-#ifndef HAVE_PLANNERINFO_TYPEDEF
 typedef struct PlannerInfo PlannerInfo;
-#define HAVE_PLANNERINFO_TYPEDEF 1
-#endif
-
-/* Likewise for IndexOptInfo and SpecialJoinInfo. */
-#ifndef HAVE_INDEXOPTINFO_TYPEDEF
 typedef struct IndexOptInfo IndexOptInfo;
-#define HAVE_INDEXOPTINFO_TYPEDEF 1
-#endif
-#ifndef HAVE_SPECIALJOININFO_TYPEDEF
 typedef struct SpecialJoinInfo SpecialJoinInfo;
-#define HAVE_SPECIALJOININFO_TYPEDEF 1
-#endif
 
 /* It also seems best not to include plannodes.h, params.h, or htup.h here */
-struct PlannedStmt;
-struct ParamListInfoData;
-struct HeapTupleData;
+typedef struct PlannedStmt PlannedStmt;
+typedef struct ParamListInfoData *ParamListInfo;
+typedef struct HeapTupleData *HeapTuple;
 
 
 /* in path/clausesel.c: */
@@ -90,7 +81,7 @@ extern PGDLLIMPORT double recursive_worktable_factor;
 extern PGDLLIMPORT int effective_cache_size;
 
 extern double clamp_row_est(double nrows);
-extern long clamp_cardinality_to_long(Cardinality x);
+extern int32 clamp_width_est(int64 tuple_width);
 
 /* in path/indxpath.c: */
 
@@ -104,16 +95,18 @@ typedef enum
 {
 	DEBUG_PARALLEL_OFF,
 	DEBUG_PARALLEL_ON,
-	DEBUG_PARALLEL_REGRESS
+	DEBUG_PARALLEL_REGRESS,
 }			DebugParallelMode;
 
 /* GUC parameters */
 extern PGDLLIMPORT int debug_parallel_query;
 extern PGDLLIMPORT bool parallel_leader_participation;
+extern PGDLLIMPORT bool enable_distinct_reordering;
 
-extern struct PlannedStmt *planner(Query *parse, const char *query_string,
-								   int cursorOptions,
-								   struct ParamListInfoData *boundParams);
+extern PlannedStmt *planner(Query *parse, const char *query_string,
+							int cursorOptions,
+							ParamListInfo boundParams,
+							ExplainState *es);
 
 extern Expr *expression_planner(Expr *expr);
 extern Expr *expression_planner_with_deps(Expr *expr,
@@ -138,7 +131,9 @@ extern Expr *canonicalize_qual(Expr *qual, bool is_check);
 /* in util/clauses.c: */
 
 extern bool contain_mutable_functions(Node *clause);
+extern bool contain_mutable_functions_after_planning(Expr *expr);
 extern bool contain_volatile_functions(Node *clause);
+extern bool contain_volatile_functions_after_planning(Expr *expr);
 extern bool contain_volatile_functions_not_nextval(Node *clause);
 
 extern Node *eval_const_expressions(PlannerInfo *root, Node *node);
@@ -150,9 +145,19 @@ extern Node *estimate_expression_value(PlannerInfo *root, Node *node);
 extern Expr *evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
 						   Oid result_collation);
 
+extern bool var_is_nonnullable(PlannerInfo *root, Var *var, bool use_rel_info);
+
+extern bool expr_is_nonnullable(PlannerInfo *root, Expr *expr,
+								bool use_rel_info);
+
 extern List *expand_function_arguments(List *args, bool include_out_arguments,
 									   Oid result_type,
-									   struct HeapTupleData *func_tuple);
+									   HeapTuple func_tuple);
+
+extern ScalarArrayOpExpr *make_SAOP_expr(Oid oper, Node *leftexpr,
+										 Oid coltype, Oid arraycollid,
+										 Oid inputcollid, List *exprs,
+										 bool haveNonConst);
 
 /* in util/predtest.c: */
 
@@ -195,8 +200,10 @@ extern void pull_varattnos(Node *node, Index varno, Bitmapset **varattnos);
 extern List *pull_vars_of_level(Node *node, int levelsup);
 extern bool contain_var_clause(Node *node);
 extern bool contain_vars_of_level(Node *node, int levelsup);
+extern bool contain_vars_returning_old_or_new(Node *node);
 extern int	locate_var_of_level(Node *node, int levelsup);
 extern List *pull_var_clause(Node *node, int flags);
 extern Node *flatten_join_alias_vars(PlannerInfo *root, Query *query, Node *node);
+extern Node *flatten_group_exprs(PlannerInfo *root, Query *query, Node *node);
 
 #endif							/* OPTIMIZER_H */

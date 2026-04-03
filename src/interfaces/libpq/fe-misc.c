@@ -19,7 +19,7 @@
  * routines.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -54,8 +54,7 @@
 static int	pqPutMsgBytes(const void *buf, size_t len, PGconn *conn);
 static int	pqSendSome(PGconn *conn, int len);
 static int	pqSocketCheck(PGconn *conn, int forRead, int forWrite,
-						  time_t end_time);
-static int	pqSocketPoll(int sock, int forRead, int forWrite, time_t end_time);
+						  pg_usec_time_t end_time);
 
 /*
  * PQlibVersion: return the libpq version number
@@ -68,7 +67,7 @@ PQlibVersion(void)
 
 
 /*
- * pqGetc: get 1 character from the connection
+ * pqGetc: read 1 character from the connection
  *
  *	All these routines return 0 on success, EOF on error.
  *	Note that for the Get routines, EOF only means there is not enough
@@ -101,7 +100,7 @@ pqPutc(char c, PGconn *conn)
 
 /*
  * pqGets[_append]:
- * get a null-terminated string from the connection,
+ * read a null-terminated string from the connection,
  * and store it in an expansible PQExpBuffer.
  * If we run out of memory, all of the string is still read,
  * but the excess characters are silently discarded.
@@ -160,10 +159,10 @@ pqPuts(const char *s, PGconn *conn)
 
 /*
  * pqGetnchar:
- *	get a string of exactly len bytes in buffer s, no null termination
+ *	read exactly len bytes in buffer s, no null termination
  */
 int
-pqGetnchar(char *s, size_t len, PGconn *conn)
+pqGetnchar(void *s, size_t len, PGconn *conn)
 {
 	if (len > (size_t) (conn->inEnd - conn->inCursor))
 		return EOF;
@@ -200,7 +199,7 @@ pqSkipnchar(size_t len, PGconn *conn)
  *	write exactly len bytes to the current message
  */
 int
-pqPutnchar(const char *s, size_t len, PGconn *conn)
+pqPutnchar(const void *s, size_t len, PGconn *conn)
 {
 	if (pqPutMsgBytes(s, len, conn))
 		return EOF;
@@ -237,8 +236,8 @@ pqGetInt(int *result, size_t bytes, PGconn *conn)
 			break;
 		default:
 			pqInternalNotice(&conn->noticeHooks,
-							 "integer of size %lu not supported by pqGetInt",
-							 (unsigned long) bytes);
+							 "integer of size %zu not supported by pqGetInt",
+							 bytes);
 			return EOF;
 	}
 
@@ -270,8 +269,8 @@ pqPutInt(int value, size_t bytes, PGconn *conn)
 			break;
 		default:
 			pqInternalNotice(&conn->noticeHooks,
-							 "integer of size %lu not supported by pqPutInt",
-							 (unsigned long) bytes);
+							 "integer of size %zu not supported by pqPutInt",
+							 bytes);
 			return EOF;
 	}
 
@@ -437,6 +436,21 @@ pqCheckInBufferSpace(size_t bytes_needed, PGconn *conn)
 }
 
 /*
+ * pqParseDone: after a server-to-client message has successfully
+ * been parsed, advance conn->inStart to account for it.
+ */
+void
+pqParseDone(PGconn *conn, int newInStart)
+{
+	/* trace server-to-client message */
+	if (conn->Pfdebug)
+		pqTraceOutputMessage(conn, conn->inBuffer + conn->inStart, false);
+
+	/* Mark message as done */
+	conn->inStart = newInStart;
+}
+
+/*
  * pqPutMsgStart: begin construction of a message to the server
  *
  * msg_type is the message type byte, or 0 for a message without type byte
@@ -539,9 +553,35 @@ pqPutMsgEnd(PGconn *conn)
 	/* Make message eligible to send */
 	conn->outCount = conn->outMsgEnd;
 
+	/* If appropriate, try to push out some data */
 	if (conn->outCount >= 8192)
 	{
-		int			toSend = conn->outCount - (conn->outCount % 8192);
+		int			toSend = conn->outCount;
+
+		/*
+		 * On Unix-pipe connections, it seems profitable to prefer sending
+		 * pipe-buffer-sized packets not randomly-sized ones, so retain the
+		 * last partial-8K chunk in our buffer for now.  On TCP connections,
+		 * the advantage of that is far less clear.  Moreover, it flat out
+		 * isn't safe when using SSL or GSSAPI, because those code paths have
+		 * API stipulations that if they fail to send all the data that was
+		 * offered in the previous write attempt, we mustn't offer less data
+		 * in this write attempt.  The previous write attempt might've been
+		 * pqFlush attempting to send everything in the buffer, so we mustn't
+		 * offer less now.  (Presently, we won't try to use SSL or GSSAPI on
+		 * Unix connections, so those checks are just Asserts.  They'll have
+		 * to become part of the regular if-test if we ever change that.)
+		 */
+		if (conn->raddr.addr.ss_family == AF_UNIX)
+		{
+#ifdef USE_SSL
+			Assert(!conn->ssl_in_use);
+#endif
+#ifdef ENABLE_GSS
+			Assert(!conn->gssenc);
+#endif
+			toSend -= toSend % 8192;
+		}
 
 		if (pqSendSome(conn, toSend) < 0)
 			return EOF;
@@ -978,22 +1018,25 @@ pqFlush(PGconn *conn)
 int
 pqWait(int forRead, int forWrite, PGconn *conn)
 {
-	return pqWaitTimed(forRead, forWrite, conn, (time_t) -1);
+	return pqWaitTimed(forRead, forWrite, conn, -1);
 }
 
 /*
- * pqWaitTimed: wait, but not past finish_time.
- *
- * finish_time = ((time_t) -1) disables the wait limit.
+ * pqWaitTimed: wait, but not past end_time.
  *
  * Returns -1 on failure, 0 if the socket is readable/writable, 1 if it timed out.
+ *
+ * The timeout is specified by end_time, which is the int64 number of
+ * microseconds since the Unix epoch (that is, time_t times 1 million).
+ * Timeout is infinite if end_time is -1.  Timeout is immediate (no blocking)
+ * if end_time is 0 (or indeed, any time before now).
  */
 int
-pqWaitTimed(int forRead, int forWrite, PGconn *conn, time_t finish_time)
+pqWaitTimed(int forRead, int forWrite, PGconn *conn, pg_usec_time_t end_time)
 {
 	int			result;
 
-	result = pqSocketCheck(conn, forRead, forWrite, finish_time);
+	result = pqSocketCheck(conn, forRead, forWrite, end_time);
 
 	if (result < 0)
 		return -1;				/* errorMessage is already set */
@@ -1014,7 +1057,7 @@ pqWaitTimed(int forRead, int forWrite, PGconn *conn, time_t finish_time)
 int
 pqReadReady(PGconn *conn)
 {
-	return pqSocketCheck(conn, 1, 0, (time_t) 0);
+	return pqSocketCheck(conn, 1, 0, 0);
 }
 
 /*
@@ -1024,7 +1067,7 @@ pqReadReady(PGconn *conn)
 int
 pqWriteReady(PGconn *conn)
 {
-	return pqSocketCheck(conn, 0, 1, (time_t) 0);
+	return pqSocketCheck(conn, 0, 1, 0);
 }
 
 /*
@@ -1032,34 +1075,43 @@ pqWriteReady(PGconn *conn)
  * or both.  Returns >0 if one or more conditions are met, 0 if it timed
  * out, -1 if an error occurred.
  *
- * If SSL is in use, the SSL buffer is checked prior to checking the socket
- * for read data directly.
+ * If an altsock is set for asynchronous authentication, that will be used in
+ * preference to the "server" socket. Otherwise, if SSL is in use, the SSL
+ * buffer is checked prior to checking the socket for read data directly.
  */
 static int
-pqSocketCheck(PGconn *conn, int forRead, int forWrite, time_t end_time)
+pqSocketCheck(PGconn *conn, int forRead, int forWrite, pg_usec_time_t end_time)
 {
 	int			result;
+	pgsocket	sock;
 
 	if (!conn)
 		return -1;
-	if (conn->sock == PGINVALID_SOCKET)
+
+	if (conn->altsock != PGINVALID_SOCKET)
+		sock = conn->altsock;
+	else
 	{
-		libpq_append_conn_error(conn, "invalid socket");
-		return -1;
-	}
+		sock = conn->sock;
+		if (sock == PGINVALID_SOCKET)
+		{
+			libpq_append_conn_error(conn, "invalid socket");
+			return -1;
+		}
 
 #ifdef USE_SSL
-	/* Check for SSL library buffering read bytes */
-	if (forRead && conn->ssl_in_use && pgtls_read_pending(conn))
-	{
-		/* short-circuit the select */
-		return 1;
-	}
+		/* Check for SSL library buffering read bytes */
+		if (forRead && conn->ssl_in_use && pgtls_read_pending(conn))
+		{
+			/* short-circuit the select */
+			return 1;
+		}
 #endif
+	}
 
 	/* We will retry as long as we get EINTR */
 	do
-		result = pqSocketPoll(conn->sock, forRead, forWrite, end_time);
+		result = PQsocketPoll(sock, forRead, forWrite, end_time);
 	while (result < 0 && SOCK_ERRNO == EINTR);
 
 	if (result < 0)
@@ -1080,11 +1132,13 @@ pqSocketCheck(PGconn *conn, int forRead, int forWrite, time_t end_time)
  * condition (without waiting).  Return >0 if condition is met, 0
  * if a timeout occurred, -1 if an error or interrupt occurred.
  *
+ * The timeout is specified by end_time, which is the int64 number of
+ * microseconds since the Unix epoch (that is, time_t times 1 million).
  * Timeout is infinite if end_time is -1.  Timeout is immediate (no blocking)
  * if end_time is 0 (or indeed, any time before now).
  */
-static int
-pqSocketPoll(int sock, int forRead, int forWrite, time_t end_time)
+int
+PQsocketPoll(int sock, int forRead, int forWrite, pg_usec_time_t end_time)
 {
 	/* We use poll(2) if available, otherwise select(2) */
 #ifdef HAVE_POLL
@@ -1104,14 +1158,16 @@ pqSocketPoll(int sock, int forRead, int forWrite, time_t end_time)
 		input_fd.events |= POLLOUT;
 
 	/* Compute appropriate timeout interval */
-	if (end_time == ((time_t) -1))
+	if (end_time == -1)
 		timeout_ms = -1;
+	else if (end_time == 0)
+		timeout_ms = 0;
 	else
 	{
-		time_t		now = time(NULL);
+		pg_usec_time_t now = PQgetCurrentTimeUSec();
 
 		if (end_time > now)
-			timeout_ms = (end_time - now) * 1000;
+			timeout_ms = (end_time - now) / 1000;
 		else
 			timeout_ms = 0;
 	}
@@ -1139,23 +1195,49 @@ pqSocketPoll(int sock, int forRead, int forWrite, time_t end_time)
 	FD_SET(sock, &except_mask);
 
 	/* Compute appropriate timeout interval */
-	if (end_time == ((time_t) -1))
+	if (end_time == -1)
 		ptr_timeout = NULL;
+	else if (end_time == 0)
+	{
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 0;
+		ptr_timeout = &timeout;
+	}
 	else
 	{
-		time_t		now = time(NULL);
+		pg_usec_time_t now = PQgetCurrentTimeUSec();
 
 		if (end_time > now)
-			timeout.tv_sec = end_time - now;
+		{
+			timeout.tv_sec = (end_time - now) / 1000000;
+			timeout.tv_usec = (end_time - now) % 1000000;
+		}
 		else
+		{
 			timeout.tv_sec = 0;
-		timeout.tv_usec = 0;
+			timeout.tv_usec = 0;
+		}
 		ptr_timeout = &timeout;
 	}
 
 	return select(sock + 1, &input_mask, &output_mask,
 				  &except_mask, ptr_timeout);
 #endif							/* HAVE_POLL */
+}
+
+/*
+ * PQgetCurrentTimeUSec: get current time with microsecond precision
+ *
+ * This provides a platform-independent way of producing a reference
+ * value for PQsocketPoll's timeout parameter.
+ */
+pg_usec_time_t
+PQgetCurrentTimeUSec(void)
+{
+	struct timeval tval;
+
+	gettimeofday(&tval, NULL);
+	return (pg_usec_time_t) tval.tv_sec * 1000000 + tval.tv_usec;
 }
 
 
@@ -1165,13 +1247,9 @@ pqSocketPoll(int sock, int forRead, int forWrite, time_t end_time)
  */
 
 /*
- * Returns the byte length of the character beginning at s, using the
- * specified encoding.
- *
- * Caution: when dealing with text that is not certainly valid in the
- * specified encoding, the result may exceed the actual remaining
- * string length.  Callers that are not prepared to deal with that
- * should use PQmblenBounded() instead.
+ * Like pg_encoding_mblen().  Use this in callers that want the
+ * dynamically-linked libpq's stance on encodings, even if that means
+ * different behavior in different startups of the executable.
  */
 int
 PQmblen(const char *s, int encoding)
@@ -1180,8 +1258,9 @@ PQmblen(const char *s, int encoding)
 }
 
 /*
- * Returns the byte length of the character beginning at s, using the
- * specified encoding; but not more than the distance to end of string.
+ * Like pg_encoding_mblen_bounded().  Use this in callers that want the
+ * dynamically-linked libpq's stance on encodings, even if that means
+ * different behavior in different startups of the executable.
  */
 int
 PQmblenBounded(const char *s, int encoding)
@@ -1225,13 +1304,14 @@ static void
 libpq_binddomain(void)
 {
 	/*
-	 * If multiple threads come through here at about the same time, it's okay
-	 * for more than one of them to call bindtextdomain().  But it's not okay
-	 * for any of them to return to caller before bindtextdomain() is
-	 * complete, so don't set the flag till that's done.  Use "volatile" just
-	 * to be sure the compiler doesn't try to get cute.
+	 * At least on Windows, there are gettext implementations that fail if
+	 * multiple threads call bindtextdomain() concurrently.  Use a mutex and
+	 * flag variable to ensure that we call it just once per process.  It is
+	 * not known that similar bugs exist on non-Windows platforms, but we
+	 * might as well do it the same way everywhere.
 	 */
 	static volatile bool already_bound = false;
+	static pthread_mutex_t binddomain_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 	if (!already_bound)
 	{
@@ -1241,14 +1321,26 @@ libpq_binddomain(void)
 #else
 		int			save_errno = errno;
 #endif
-		const char *ldir;
 
-		/* No relocatable lookup here because the binary could be anywhere */
-		ldir = getenv("PGLOCALEDIR");
-		if (!ldir)
-			ldir = LOCALEDIR;
-		bindtextdomain(PG_TEXTDOMAIN("libpq"), ldir);
-		already_bound = true;
+		(void) pthread_mutex_lock(&binddomain_mutex);
+
+		if (!already_bound)
+		{
+			const char *ldir;
+
+			/*
+			 * No relocatable lookup here because the calling executable could
+			 * be anywhere
+			 */
+			ldir = getenv("PGLOCALEDIR");
+			if (!ldir)
+				ldir = LOCALEDIR;
+			bindtextdomain(PG_TEXTDOMAIN("libpq"), ldir);
+			already_bound = true;
+		}
+
+		(void) pthread_mutex_unlock(&binddomain_mutex);
+
 #ifdef WIN32
 		SetLastError(save_errno);
 #else
@@ -1330,4 +1422,22 @@ libpq_append_conn_error(PGconn *conn, const char *fmt,...)
 	} while (!done);
 
 	appendPQExpBufferChar(&conn->errorMessage, '\n');
+}
+
+/*
+ * For 19beta only, some protocol errors will have additional information
+ * appended to help with the "grease" campaign.
+ */
+void
+libpq_append_grease_info(PGconn *conn)
+{
+	/* translator: %s is a URL */
+	libpq_append_conn_error(conn,
+							"\tThis indicates a bug in either the server being contacted\n"
+							"\tor a proxy handling the connection. Please consider\n"
+							"\treporting this to the maintainers of that software.\n"
+							"\tFor more information, including instructions on how to\n"
+							"\twork around this issue for now, visit\n"
+							"\t\t%s",
+							"https://www.postgresql.org/docs/devel/libpq-connect.html#LIBPQ-CONNECT-MAX-PROTOCOL-VERSION");
 }

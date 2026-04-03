@@ -1,5 +1,8 @@
+
+# Copyright (c) 2024-2026, PostgreSQL Global Development Group
+
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use Getopt::Long;
 
 my $format;
@@ -28,7 +31,11 @@ open(my $output_handle, '>', $output)
   or die "$0: could not open output file '$output': $!\n";
 
 
-if ($format eq 'gnu')
+if ($format eq 'aix')
+{
+	print $output_handle "#!\n";
+}
+elsif ($format eq 'gnu')
 {
 	print $output_handle "{
   global:

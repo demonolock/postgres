@@ -1,8 +1,8 @@
 
-# Copyright (c) 2022, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use File::Copy;
 use FindBin;
 use PostgreSQL::Test::Utils;
@@ -12,15 +12,11 @@ use Test::More;
 use lib "$FindBin::RealBin/../../../ldap";
 use LdapServer;
 
-my ($slapd, $ldap_bin_dir, $ldap_schema_dir);
-
-$ldap_bin_dir = undef;    # usually in PATH
-
 if ($ENV{with_ldap} ne 'yes')
 {
 	plan skip_all => 'LDAP not supported by this build';
 }
-elsif ($ENV{PG_TEST_EXTRA} !~ /\bldap\b/)
+elsif (!$ENV{PG_TEST_EXTRA} || $ENV{PG_TEST_EXTRA} !~ /\bldap\b/)
 {
 	plan skip_all =>
 	  'Potentially unsafe test LDAP not enabled in PG_TEST_EXTRA';
@@ -46,7 +42,8 @@ note "setting up PostgreSQL instance";
 
 my $node = PostgreSQL::Test::Cluster->new('node');
 $node->init;
-$node->append_conf('postgresql.conf', "log_connections = on\n");
+$node->append_conf('postgresql.conf',
+	"log_connections = 'receipt,authentication,authorization'\n");
 $node->append_conf('postgresql.conf',
 	"shared_preload_libraries = 'ldap_password_func'");
 $node->start;

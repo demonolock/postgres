@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Test streaming of transaction with subtransactions, DDLs, DMLs, and
 # rollbacks
@@ -7,7 +7,7 @@
 # This file is mainly to test the DDL/DML interaction of the publisher side,
 # so we didn't add a parallel apply version for the tests in this file.
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -16,12 +16,12 @@ use Test::More;
 my $node_publisher = PostgreSQL::Test::Cluster->new('publisher');
 $node_publisher->init(allows_streaming => 'logical');
 $node_publisher->append_conf('postgresql.conf',
-	'logical_replication_mode = immediate');
+	'debug_logical_replication_streaming = immediate');
 $node_publisher->start;
 
 # Create subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+$node_subscriber->init;
 $node_subscriber->start;
 
 # Create some preexisting content on publisher
@@ -32,7 +32,8 @@ $node_publisher->safe_psql('postgres',
 
 # Setup structure on subscriber
 $node_subscriber->safe_psql('postgres',
-	"CREATE TABLE test_tab (a int primary key, b bytea, c INT, d INT, e INT)");
+	"CREATE TABLE test_tab (a int primary key, b bytea, c INT, d INT, e INT)"
+);
 
 # Setup logical replication
 my $publisher_connstr = $node_publisher->connstr . ' dbname=postgres';

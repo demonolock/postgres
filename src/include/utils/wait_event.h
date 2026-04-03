@@ -2,28 +2,13 @@
  * wait_event.h
  *	  Definitions related to wait event reporting
  *
- * Copyright (c) 2001-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * src/include/utils/wait_event.h
  * ----------
  */
 #ifndef WAIT_EVENT_H
 #define WAIT_EVENT_H
-
-
-/* ----------
- * Wait Classes
- * ----------
- */
-#define PG_WAIT_LWLOCK				0x01000000U
-#define PG_WAIT_LOCK				0x03000000U
-#define PG_WAIT_BUFFERPIN			0x04000000U
-#define PG_WAIT_ACTIVITY			0x05000000U
-#define PG_WAIT_CLIENT				0x06000000U
-#define PG_WAIT_EXTENSION			0x07000000U
-#define PG_WAIT_IPC					0x08000000U
-#define PG_WAIT_TIMEOUT				0x09000000U
-#define PG_WAIT_IO					0x0A000000U
 
 /* enums for wait events */
 #include "utils/wait_event_types.h"
@@ -37,6 +22,29 @@ extern void pgstat_reset_wait_event_storage(void);
 
 extern PGDLLIMPORT uint32 *my_wait_event_info;
 
+
+/*
+ * Wait Events - Extension, InjectionPoint
+ *
+ * Use InjectionPoint when the server process is waiting in an injection
+ * point.  Use Extension for other cases of the server process waiting for
+ * some condition defined by an extension module.
+ *
+ * Extensions can define their own wait events in these categories.  They
+ * should call one of these functions with a wait event string.  If the wait
+ * event associated to a string is already allocated, it returns the wait
+ * event information to use.  If not, it gets one wait event ID allocated from
+ * a shared counter, associates the string to the ID in the shared dynamic
+ * hash and returns the wait event information.
+ *
+ * The ID retrieved can be used with pgstat_report_wait_start() or equivalent.
+ */
+extern uint32 WaitEventExtensionNew(const char *wait_event_name);
+extern uint32 WaitEventInjectionPointNew(const char *wait_event_name);
+
+extern void WaitEventCustomShmemInit(void);
+extern Size WaitEventCustomShmemSize(void);
+extern char **GetWaitEventCustomNames(uint32 classId, int *nwaitevents);
 
 /* ----------
  * pgstat_report_wait_start() -

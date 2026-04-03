@@ -14,7 +14,7 @@
  * plenty of locality of access.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -59,7 +59,7 @@ struct HSpool
 HSpool *
 _h_spoolinit(Relation heap, Relation index, uint32 num_buckets)
 {
-	HSpool	   *hspool = (HSpool *) palloc0(sizeof(HSpool));
+	HSpool	   *hspool = palloc0_object(HSpool);
 
 	hspool->index = index;
 
@@ -106,7 +106,7 @@ _h_spooldestroy(HSpool *hspool)
  * spool an index entry into the sort file.
  */
 void
-_h_spool(HSpool *hspool, ItemPointer self, Datum *values, bool *isnull)
+_h_spool(HSpool *hspool, const ItemPointerData *self, const Datum *values, const bool *isnull)
 {
 	tuplesort_putindextuplevalues(hspool->sortstate, hspool->index,
 								  self, values, isnull);
@@ -147,6 +147,9 @@ _h_indexbuild(HSpool *hspool, Relation heapRel)
 
 		/* the tuples are sorted by hashkey, so pass 'sorted' as true */
 		_hash_doinsert(hspool->index, itup, heapRel, true);
+
+		/* allow insertion phase to be interrupted, and track progress */
+		CHECK_FOR_INTERRUPTS();
 
 		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
 									 ++tups_done);

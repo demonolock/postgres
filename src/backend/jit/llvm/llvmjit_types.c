@@ -16,7 +16,7 @@
  * bitcode.
  *
  *
- * Copyright (c) 2016-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/jit/llvm/llvmjit_types.c
@@ -47,8 +47,9 @@
  */
 PGFunction	TypePGFunction;
 size_t		TypeSizeT;
+Datum		TypeDatum;
 bool		TypeStorageBool;
-ExprStateEvalFunc TypeExprStateEvalFunc;
+
 ExecEvalSubroutine TypeExecEvalSubroutine;
 ExecEvalBoolSubroutine TypeExecEvalBoolSubroutine;
 
@@ -61,11 +62,14 @@ ExprEvalStep StructExprEvalStep;
 ExprState	StructExprState;
 FunctionCallInfoBaseData StructFunctionCallInfoData;
 HeapTupleData StructHeapTupleData;
+HeapTupleHeaderData StructHeapTupleHeaderData;
 MemoryContextData StructMemoryContextData;
 TupleTableSlot StructTupleTableSlot;
 HeapTupleTableSlot StructHeapTupleTableSlot;
 MinimalTupleTableSlot StructMinimalTupleTableSlot;
 TupleDescData StructTupleDescData;
+PlanState	StructPlanState;
+MinimalTupleData StructMinimalTupleData;
 
 
 /*
@@ -77,15 +81,46 @@ extern Datum AttributeTemplate(PG_FUNCTION_ARGS);
 Datum
 AttributeTemplate(PG_FUNCTION_ARGS)
 {
+	StaticAssertVariableIsOfType(&AttributeTemplate, PGFunction);
+
 	PG_RETURN_NULL();
 }
 
 /*
- * Clang represents stdbool.h style booleans that are returned by functions
- * differently (as i1) than stored ones (as i8). Therefore we do not just need
- * TypeBool (above), but also a way to determine the width of a returned
- * integer. This allows us to keep compatible with non-stdbool using
- * architectures.
+ * And some more "templates" to give us examples of function types
+ * corresponding to function pointer types.
+ */
+
+extern void ExecEvalSubroutineTemplate(ExprState *state,
+									   struct ExprEvalStep *op,
+									   ExprContext *econtext);
+void
+ExecEvalSubroutineTemplate(ExprState *state,
+						   struct ExprEvalStep *op,
+						   ExprContext *econtext)
+{
+	StaticAssertVariableIsOfType(&ExecEvalSubroutineTemplate,
+								 ExecEvalSubroutine);
+}
+
+extern bool ExecEvalBoolSubroutineTemplate(ExprState *state,
+										   struct ExprEvalStep *op,
+										   ExprContext *econtext);
+bool
+ExecEvalBoolSubroutineTemplate(ExprState *state,
+							   struct ExprEvalStep *op,
+							   ExprContext *econtext)
+{
+	StaticAssertVariableIsOfType(&ExecEvalBoolSubroutineTemplate,
+								 ExecEvalBoolSubroutine);
+
+	return false;
+}
+
+/*
+ * Clang represents bool returned by functions differently (as i1) than stored
+ * ones (as i8).  Therefore we do not just need TypeStorageBool (above), but
+ * also a way to determine the width of a returned integer.
  */
 extern bool FunctionReturningBool(void);
 bool
@@ -119,13 +154,16 @@ void	   *referenced_functions[] =
 	ExecEvalFuncExprFusage,
 	ExecEvalFuncExprStrictFusage,
 	ExecEvalGroupingFunc,
+	ExecEvalMergeSupportFunc,
 	ExecEvalMinMax,
 	ExecEvalNextValueExpr,
 	ExecEvalParamExec,
 	ExecEvalParamExtern,
+	ExecEvalParamSet,
 	ExecEvalRow,
 	ExecEvalRowNotNull,
 	ExecEvalRowNull,
+	ExecEvalCoerceViaIOSafe,
 	ExecEvalSQLValueFunction,
 	ExecEvalScalarArrayOp,
 	ExecEvalHashedScalarArrayOp,
@@ -135,9 +173,13 @@ void	   *referenced_functions[] =
 	ExecEvalXmlExpr,
 	ExecEvalJsonConstructor,
 	ExecEvalJsonIsPredicate,
+	ExecEvalJsonCoercion,
+	ExecEvalJsonCoercionFinish,
+	ExecEvalJsonExprPath,
 	MakeExpandedObjectReadOnlyInternal,
 	slot_getmissingattrs,
 	slot_getsomeattrs_int,
 	strlen,
 	varsize_any,
+	ExecInterpExprStillValid,
 };

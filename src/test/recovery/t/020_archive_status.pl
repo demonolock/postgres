@@ -1,11 +1,11 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 #
 # Tests related to WAL archiving and recovery.
 #
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -245,7 +245,9 @@ my $log_location = -s $standby2->logfile;
 
 $standby2->stop;
 my $logfile = slurp_file($standby2->logfile, $log_location);
-ok( $logfile =~ qr/archiver process shutting down/,
+like(
+	$logfile,
+	qr/archiver process shutting down/,
 	'check shutdown callback of shell archive module');
 
 # Test that we can enter and leave backup mode without crashes

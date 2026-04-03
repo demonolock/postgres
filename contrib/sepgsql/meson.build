@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 if not selinux.found()
   subdir_done()
@@ -31,13 +31,22 @@ sepgsql = shared_module('sepgsql',
 )
 contrib_targets += sepgsql
 
-custom_target('sepgsql.sql',
+contrib_targets += custom_target('sepgsql.sql',
   input: 'sepgsql.sql.in',
   output: 'sepgsql.sql',
   command: [sed, '-e', 's,MODULE_PATHNAME,$libdir/sepgsql,g', '@INPUT@'],
   capture: true,
   install: true,
-  install_dir: contrib_data_args['install_dir'],
+  install_dir: dir_data / 'contrib',
 )
 
-# TODO: implement sepgsql tests
+tests += {
+  'name': 'sepgsql',
+  'sd': meson.current_source_dir(),
+  'bd': meson.current_build_dir(),
+  'tap': {
+    'tests': [
+      't/001_sepgsql.pl',
+    ],
+  },
+}

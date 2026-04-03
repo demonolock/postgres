@@ -13,9 +13,13 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	attribute_stats.o \
 	dependencies.o \
 	extended_stats.o \
+	extended_stats_funcs.o \
 	mcv.o \
-	mvdistinct.o
+	mvdistinct.o \
+	relation_stats.o \
+	stat_utils.o
 
 include $(top_srcdir)/src/backend/common.mk

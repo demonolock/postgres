@@ -3,7 +3,7 @@
  * buf_init.c
  *	  buffer manager initialization routines
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,9 +14,10 @@
  */
 #include "postgres.h"
 
+#include "storage/aio.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
-#include "storage/proc.h"
+#include "storage/proclist.h"
 
 BufferDescPadded *BufferDescriptors;
 char	   *BufferBlocks;
@@ -65,7 +66,7 @@ CkptSortItem *CkptBufferIds;
  * postmaster, or in a standalone backend).
  */
 void
-InitBufferPool(void)
+BufferManagerShmemInit(void)
 {
 	bool		foundBufs,
 				foundDescs,
@@ -121,25 +122,16 @@ InitBufferPool(void)
 
 			ClearBufferTag(&buf->tag);
 
-			pg_atomic_init_u32(&buf->state, 0);
-			buf->wait_backend_pgprocno = INVALID_PGPROCNO;
+			pg_atomic_init_u64(&buf->state, 0);
+			buf->wait_backend_pgprocno = INVALID_PROC_NUMBER;
 
 			buf->buf_id = i;
 
-			/*
-			 * Initially link all the buffers together as unused. Subsequent
-			 * management of this list is done by freelist.c.
-			 */
-			buf->freeNext = i + 1;
+			pgaio_wref_clear(&buf->io_wref);
 
-			LWLockInitialize(BufferDescriptorGetContentLock(buf),
-							 LWTRANCHE_BUFFER_CONTENT);
-
+			proclist_init(&buf->lock_waiters);
 			ConditionVariableInit(BufferDescriptorGetIOCV(buf));
 		}
-
-		/* Correct last entry of linked list */
-		GetBufferDescriptor(NBuffers - 1)->freeNext = FREENEXT_END_OF_LIST;
 	}
 
 	/* Init other shared buffer-management stuff */
@@ -151,13 +143,13 @@ InitBufferPool(void)
 }
 
 /*
- * BufferShmemSize
+ * BufferManagerShmemSize
  *
  * compute the size of shared memory for the buffer pool including
  * data pages, buffer descriptors, hash tables, etc.
  */
 Size
-BufferShmemSize(void)
+BufferManagerShmemSize(void)
 {
 	Size		size = 0;
 

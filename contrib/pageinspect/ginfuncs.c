@@ -2,24 +2,21 @@
  * ginfuncs.c
  *		Functions to investigate the content of GIN indexes
  *
- * Copyright (c) 2014-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		contrib/pageinspect/ginfuncs.c
  */
 #include "postgres.h"
 
-#include "access/gin.h"
 #include "access/gin_private.h"
 #include "access/htup_details.h"
-#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pageinspect.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
-#include "utils/rel.h"
 
 
 PG_FUNCTION_INFO_V1(gin_metapage_info);
@@ -76,7 +73,7 @@ gin_metapage_info(PG_FUNCTION_ARGS)
 
 	values[0] = Int64GetDatum(metadata->head);
 	values[1] = Int64GetDatum(metadata->tail);
-	values[2] = Int32GetDatum(metadata->tailFreeSize);
+	values[2] = UInt32GetDatum(metadata->tailFreeSize);
 	values[3] = Int64GetDatum(metadata->nPendingPages);
 	values[4] = Int64GetDatum(metadata->nPendingHeapTuples);
 
@@ -225,7 +222,7 @@ gin_leafpage_items(PG_FUNCTION_ARGS)
 							   opaq->flags,
 							   (GIN_DATA | GIN_LEAF | GIN_COMPRESSED))));
 
-		inter_call_data = palloc(sizeof(gin_leafpage_items_state));
+		inter_call_data = palloc_object(gin_leafpage_items_state);
 
 		/* Build a tuple descriptor for our result type */
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)

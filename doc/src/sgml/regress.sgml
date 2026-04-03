@@ -125,6 +125,18 @@ make installcheck-parallel
   </para>
   </sect2>
 
+  <sect2 id="regress-subset">
+   <title>Running Specific Tests</title>
+
+   <para>
+    A subset of the regression tests can be run with the command
+    <literal>make check-tests TESTS="boolean char"</literal> or
+    <literal>make installcheck-tests TESTS="boolean char"</literal>.
+    Note that sometimes tests have dependencies on objects created by other
+    tests, which can cause unexpected failures.
+   </para>
+  </sect2>
+
   <sect2 id="regress-additional">
    <title>Additional Test Suites</title>
 
@@ -196,8 +208,9 @@ make check-world -j8 >/dev/null
    </listitem>
    <listitem>
     <para>
-     Regression tests for the ECPG interface library,
-     located in <filename>src/interfaces/ecpg/test</filename>.
+     Regression tests for the interface libraries,
+     located in <filename>src/interfaces/libpq/test</filename> and
+     <filename>src/interfaces/ecpg/test</filename>.
     </para>
    </listitem>
    <listitem>
@@ -252,13 +265,13 @@ make check-world -j8 >/dev/null
 
   <para>
    Some test suites are not run by default, either because they are not secure
-   to run on a multiuser system or because they require special software.  You
-   can decide which test suites to run additionally by setting the
-   <command>make</command> or environment variable
-   <varname>PG_TEST_EXTRA</varname> to a whitespace-separated list, for
-   example:
+   to run on a multiuser system, because they require special software or
+   because they are resource-intensive.  You can decide which test suites to
+   run additionally by setting the <command>make</command> or environment
+   variable <varname>PG_TEST_EXTRA</varname> to a whitespace-separated list,
+   for example:
 <programlisting>
-make check-world PG_TEST_EXTRA='kerberos ldap ssl load_balance'
+make check-world PG_TEST_EXTRA='kerberos ldap ssl load_balance libpq_encryption'
 </programlisting>
    The following values are currently supported:
    <variablelist>
@@ -284,10 +297,13 @@ make check-world PG_TEST_EXTRA='kerberos ldap ssl load_balance'
     </varlistentry>
 
     <varlistentry>
-     <term><literal>ssl</literal></term>
+     <term><literal>libpq_encryption</literal></term>
      <listitem>
       <para>
-       Runs the test suite under <filename>src/test/ssl</filename>.  This opens TCP/IP listen sockets.
+       Runs the test <filename>src/interfaces/libpq/t/005_negotiate_encryption.pl</filename>.
+       This opens TCP/IP listen sockets. If <varname>PG_TEST_EXTRA</varname>
+       also includes <literal>kerberos</literal>, additional tests that require
+       an MIT Kerberos installation are enabled.
       </para>
      </listitem>
     </varlistentry>
@@ -304,12 +320,65 @@ make check-world PG_TEST_EXTRA='kerberos ldap ssl load_balance'
     </varlistentry>
 
     <varlistentry>
+     <term><literal>oauth</literal></term>
+     <listitem>
+      <para>
+       Runs the test suite under <filename>src/test/modules/oauth_validator</filename>.
+       This opens TCP/IP listen sockets for a test server running HTTPS.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><literal>regress_dump_restore</literal></term>
+     <listitem>
+      <para>
+       Runs an additional test suite in
+       <filename>src/bin/pg_upgrade/t/002_pg_upgrade.pl</filename> which
+       cycles the regression database through <command>pg_dump</command>/
+       <command>pg_restore</command>.  Not enabled by default because it
+       is resource-intensive.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><literal>sepgsql</literal></term>
+     <listitem>
+      <para>
+       Runs the test suite under <filename>contrib/sepgsql</filename>.  This
+       requires an SELinux environment that is set up in a specific way; see
+       <xref linkend="sepgsql-regression"/>.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><literal>ssl</literal></term>
+     <listitem>
+      <para>
+       Runs the test suite under <filename>src/test/ssl</filename>.  This opens TCP/IP listen sockets.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
      <term><literal>wal_consistency_checking</literal></term>
      <listitem>
       <para>
        Uses <literal>wal_consistency_checking=all</literal> while running
        certain tests under <filename>src/test/recovery</filename>.  Not
-       enabled by default because it is resource intensive.
+       enabled by default because it is resource-intensive.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><literal>xid_wraparound</literal></term>
+     <listitem>
+      <para>
+       Runs the test suite under <filename>src/test/modules/xid_wraparound</filename>.
+       Not enabled by default because it is resource-intensive.
       </para>
      </listitem>
     </varlistentry>
@@ -379,12 +448,37 @@ make check LANG=C ENCODING=EUC_JP
    <title>Custom Server Settings</title>
 
    <para>
-    Custom server settings to use when running a regression test suite can be
+    There are several ways to use custom server settings when running a test
+    suite.  This can be useful to enable additional logging, adjust resource
+    limits, or enable extra run-time checks such as <xref
+    linkend="guc-debug-discard-caches"/>.  But note that not all tests can be
+    expected to pass cleanly with arbitrary settings.
+   </para>
+
+   <para>
+    Extra options can be passed to the various <command>initdb</command>
+    commands that are run internally during test setup using the environment
+    variable <envar>PG_TEST_INITDB_EXTRA_OPTS</envar>.  For example, to run a
+    test with checksums enabled and a custom WAL segment size and
+    <varname>work_mem</varname> setting, use:
+<screen>
+make check PG_TEST_INITDB_EXTRA_OPTS='-k --wal-segsize=4 -c work_mem=50MB'
+</screen>
+   </para>
+
+   <para>
+    For the core regression test suite and other tests driven by
+    <command>pg_regress</command>, custom run-time server settings can also be
     set in the <varname>PGOPTIONS</varname> environment variable (for settings
-    that allow this):
+    that allow this), for example:
 <screen>
 make check PGOPTIONS="-c debug_parallel_query=regress -c work_mem=50MB"
 </screen>
+    (This makes use of functionality provided by libpq; see <xref
+    linkend="libpq-connect-options"/> for details.)
+   </para>
+
+   <para>
     When running against a temporary installation, custom settings can also be
     set by supplying a pre-written <filename>postgresql.conf</filename>:
 <screen>
@@ -394,11 +488,6 @@ make check EXTRA_REGRESS_OPTS="--temp-config=test_postgresql.conf"
 </screen>
    </para>
 
-   <para>
-    This can be useful to enable additional logging, adjust resource limits,
-    or enable extra run-time checks such as <xref
-    linkend="guc-debug-discard-caches"/>.
-   </para>
   </sect2>
 
   <sect2 id="regress-run-extra-tests">
@@ -533,11 +622,11 @@ make check NO_LOCALE=1
     <para>
      Most of the date and time results are dependent on the time zone
      environment.  The reference files are generated for time zone
-     <literal>PST8PDT</literal> (Berkeley, California), and there will be
+     <literal>America/Los_Angeles</literal>, and there will be
      apparent failures if the tests are not run with that time zone setting.
      The regression test driver sets environment variable
-     <envar>PGTZ</envar> to <literal>PST8PDT</literal>, which normally
-     ensures proper results.
+     <envar>PGTZ</envar> to <literal>America/Los_Angeles</literal>,
+     which normally ensures proper results.
     </para>
    </sect2>
 
@@ -827,6 +916,14 @@ PG_TEST_NOCLEAN=1 make -C src/bin/pg_dump check
     hosts may lead to load-induced timeouts.  Setting the environment variable
     <varname>PG_TEST_TIMEOUT_DEFAULT</varname> to a higher number will change
     the default to avoid this.
+   </para>
+
+   <para>
+    For certain tests, the environment variable
+    <envar>PG_TEST_FILE_READ_LINES</envar> can be set to limit the number of
+    lines read from large output files (head and tail). This is useful when
+    the test output contains a lot of unnecessary content, allowing the test
+    framework to read only a limited number of lines for its reports.
    </para>
   </sect2>
 

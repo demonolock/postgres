@@ -105,7 +105,8 @@ less -x4
 
    <para>
     There are two required elements for every message: a severity level
-    (ranging from <literal>DEBUG</literal> to <literal>PANIC</literal>) and a primary
+    (ranging from <literal>DEBUG</literal> to <literal>PANIC</literal>, defined
+    in <filename>src/include/utils/elog.h</filename>) and a primary
     message text.  In addition there are optional elements, the most
     common of which is an error identifier code that follows the SQL spec's
     SQLSTATE conventions.
@@ -152,11 +153,12 @@ ereport(ERROR,
         errmsg("function %s is not unique",
                func_signature_string(funcname, nargs,
                                      NIL, actual_arg_types)),
-        errhint("Unable to choose a best candidate function. "
-                "You might need to add explicit typecasts."));
+        errdetail("Could not choose a best candidate function."),
+        errhint("You might need to add explicit type casts."));
 </programlisting>
     This illustrates the use of format codes to embed run-time values into
-    a message text.  Also, an optional <quote>hint</quote> message is provided.
+    a message text.  Also, optional <quote>detail</quote>
+    and <quote>hint</quote> messages are provided.
     The auxiliary function calls can be written in any order, but
     conventionally <function>errcode</function>
     and <function>errmsg</function> appear first.
@@ -470,7 +472,7 @@ IpcMemoryCreate: shmget(key=%d, size=%u, 0%o) failed: %m
 <programlisting>
 Primary:    could not create shared memory segment: %m
 Detail:     Failed syscall was shmget(key=%d, size=%u, 0%o).
-Hint:       the addendum
+Hint:       The addendum, written as a complete sentence.
 </programlisting>
    </para>
 
@@ -532,9 +534,10 @@ Hint:       the addendum
    <title>Use of Quotes</title>
 
    <para>
-    Always use quotes to delimit file names, user-supplied identifiers, and
-    other variables that might contain words.  Do not use them to mark up
-    variables that will not contain words (for example, operator names).
+    Always use quotes to delimit file names, user-supplied identifiers,
+    configuration variable names, and other variables that might contain
+    words.  Do not use them to mark up variables that will not contain words
+    (for example, operator names).
    </para>
 
    <para>
@@ -905,12 +908,12 @@ BETTER: unrecognized node type: 42
     <title>C Standard</title>
     <para>
      Code in <productname>PostgreSQL</productname> should only rely on language
-     features available in the C99 standard. That means a conforming
-     C99 compiler has to be able to compile postgres, at least aside
+     features available in the C11 standard. That means a conforming
+     C11 compiler has to be able to compile postgres, at least aside
      from a few platform dependent pieces.
     </para>
     <para>
-     A few features included in the C99 standard are, at this time, not
+     A few features included in the C11 standard are, at this time, not
      permitted to be used in core <productname>PostgreSQL</productname>
      code. This currently includes variable length arrays, intermingled
      declarations and code, <literal>//</literal> comments, universal
@@ -922,13 +925,11 @@ BETTER: unrecognized node type: 42
      features can be used, if a fallback is provided.
     </para>
     <para>
-     For example <literal>_Static_assert()</literal> and
+     For example <literal>typeof()</literal> and
      <literal>__builtin_constant_p</literal> are currently used, even though
      they are from newer revisions of the C standard and a
      <productname>GCC</productname> extension respectively. If not available
-     we respectively fall back to using a C99 compatible replacement that
-     performs the same checks, but emits rather cryptic messages and do not
-     use <literal>__builtin_constant_p</literal>.
+     we do not use them.
     </para>
    </simplesect>
 
@@ -998,18 +999,10 @@ MemoryContextSwitchTo(MemoryContext context)
 static void
 handle_sighup(SIGNAL_ARGS)
 {
-    int         save_errno = errno;
-
     got_SIGHUP = true;
     SetLatch(MyLatch);
-
-    errno = save_errno;
 }
 </programlisting>
-     <varname>errno</varname> is saved and restored because
-     <function>SetLatch()</function> might change it. If that were not done
-     interrupted code that's currently inspecting <varname>errno</varname> might see the wrong
-     value.
     </para>
    </simplesect>
 

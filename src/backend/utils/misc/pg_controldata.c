@@ -5,7 +5,7 @@
  * Routines to expose the contents of the control data file via
  * a set of SQL functions.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -20,10 +20,10 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
-#include "catalog/pg_type.h"
 #include "common/controldata_utils.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/lwlock.h"
 #include "utils/builtins.h"
 #include "utils/pg_lsn.h"
 #include "utils/timestamp.h"
@@ -42,7 +42,9 @@ pg_control_system(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 
 	/* read the control file */
+	LWLockAcquire(ControlFileLock, LW_SHARED);
 	ControlFile = get_controlfile(DataDir, &crc_ok);
+	LWLockRelease(ControlFileLock);
 	if (!crc_ok)
 		ereport(ERROR,
 				(errmsg("calculated CRC checksum does not match value stored in file")));
@@ -80,7 +82,9 @@ pg_control_checkpoint(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 
 	/* Read the control file. */
+	LWLockAcquire(ControlFileLock, LW_SHARED);
 	ControlFile = get_controlfile(DataDir, &crc_ok);
+	LWLockRelease(ControlFileLock);
 	if (!crc_ok)
 		ereport(ERROR,
 				(errmsg("calculated CRC checksum does not match value stored in file")));
@@ -169,7 +173,9 @@ pg_control_recovery(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 
 	/* read the control file */
+	LWLockAcquire(ControlFileLock, LW_SHARED);
 	ControlFile = get_controlfile(DataDir, &crc_ok);
+	LWLockRelease(ControlFileLock);
 	if (!crc_ok)
 		ereport(ERROR,
 				(errmsg("calculated CRC checksum does not match value stored in file")));
@@ -197,8 +203,8 @@ pg_control_recovery(PG_FUNCTION_ARGS)
 Datum
 pg_control_init(PG_FUNCTION_ARGS)
 {
-	Datum		values[11];
-	bool		nulls[11];
+	Datum		values[12];
+	bool		nulls[12];
 	TupleDesc	tupdesc;
 	HeapTuple	htup;
 	ControlFileData *ControlFile;
@@ -208,7 +214,9 @@ pg_control_init(PG_FUNCTION_ARGS)
 		elog(ERROR, "return type must be a row type");
 
 	/* read the control file */
+	LWLockAcquire(ControlFileLock, LW_SHARED);
 	ControlFile = get_controlfile(DataDir, &crc_ok);
+	LWLockRelease(ControlFileLock);
 	if (!crc_ok)
 		ereport(ERROR,
 				(errmsg("calculated CRC checksum does not match value stored in file")));
@@ -245,6 +253,9 @@ pg_control_init(PG_FUNCTION_ARGS)
 
 	values[10] = Int32GetDatum(ControlFile->data_checksum_version);
 	nulls[10] = false;
+
+	values[11] = BoolGetDatum(ControlFile->default_char_signedness);
+	nulls[11] = false;
 
 	htup = heap_form_tuple(tupdesc, values, nulls);
 

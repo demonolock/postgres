@@ -61,7 +61,7 @@
  *   (https://doi.org/10.1002/spe.948)
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -71,9 +71,7 @@
  */
 #include "postgres.h"
 
-#include "access/htup_details.h"
 #include "lib/integerset.h"
-#include "port/pg_bitutils.h"
 #include "utils/memutils.h"
 
 
@@ -286,7 +284,7 @@ intset_create(void)
 {
 	IntegerSet *intset;
 
-	intset = (IntegerSet *) palloc(sizeof(IntegerSet));
+	intset = palloc_object(IntegerSet);
 	intset->context = CurrentMemoryContext;
 	intset->mem_used = GetMemoryChunkSpace(intset);
 

@@ -10,7 +10,7 @@
  * guarantee that there can only be one matching row for a key combination.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/catcache.h
@@ -51,9 +51,11 @@ typedef struct catcache
 	CCFastEqualFN cc_fastequal[CATCACHE_MAXKEYS];	/* fast equal function for
 													 * each key */
 	int			cc_keyno[CATCACHE_MAXKEYS]; /* AttrNumber of each key */
-	dlist_head	cc_lists;		/* list of CatCList structs */
-	int			cc_ntup;		/* # of tuples currently in this cache */
 	int			cc_nkeys;		/* # of keys (1..CATCACHE_MAXKEYS) */
+	int			cc_ntup;		/* # of tuples currently in this cache */
+	int			cc_nlist;		/* # of CatCLists currently in this cache */
+	int			cc_nlbuckets;	/* # of CatCList hash buckets in this cache */
+	dlist_head *cc_lbucket;		/* hash buckets for CatCLists */
 	const char *cc_relname;		/* name of relation the tuples come from */
 	Oid			cc_reloid;		/* OID of relation the tuples come from */
 	Oid			cc_indexoid;	/* OID of index matching cache keys */
@@ -67,24 +69,32 @@ typedef struct catcache
 	 * doesn't break ABI for other modules
 	 */
 #ifdef CATCACHE_STATS
-	long		cc_searches;	/* total # searches against this cache */
-	long		cc_hits;		/* # of matches against existing entry */
-	long		cc_neg_hits;	/* # of matches against negative entry */
-	long		cc_newloads;	/* # of successful loads of new entry */
+	uint64		cc_searches;	/* total # searches against this cache */
+	uint64		cc_hits;		/* # of matches against existing entry */
+	uint64		cc_neg_hits;	/* # of matches against negative entry */
+	uint64		cc_newloads;	/* # of successful loads of new entry */
 
 	/*
 	 * cc_searches - (cc_hits + cc_neg_hits + cc_newloads) is number of failed
 	 * searches, each of which will result in loading a negative entry
 	 */
-	long		cc_invals;		/* # of entries invalidated from cache */
-	long		cc_lsearches;	/* total # list-searches */
-	long		cc_lhits;		/* # of matches against existing lists */
+	uint64		cc_invals;		/* # of entries invalidated from cache */
+	uint64		cc_lsearches;	/* total # list-searches */
+	uint64		cc_lhits;		/* # of matches against existing lists */
 #endif
 } CatCache;
 
 
 typedef struct catctup
 {
+	/*
+	 * Each tuple in a cache is a member of a dlist that stores the elements
+	 * of its hash bucket.  We keep each dlist in LRU order to speed repeated
+	 * lookups.  Keep the dlist_node field first so that Valgrind understands
+	 * the struct is reachable.
+	 */
+	dlist_node	cache_elem;		/* member for CatCache.cc_bucket[] dlist */
+
 	int			ct_magic;		/* for identifying CatCTup entries */
 #define CT_MAGIC   0x57261502
 
@@ -95,13 +105,6 @@ typedef struct catctup
 	 * positive cache entries, and are separately allocated for negative ones.
 	 */
 	Datum		keys[CATCACHE_MAXKEYS];
-
-	/*
-	 * Each tuple in a cache is a member of a dlist that stores the elements
-	 * of its hash bucket.  We keep each dlist in LRU order to speed repeated
-	 * lookups.
-	 */
-	dlist_node	cache_elem;		/* list member of per-bucket list */
 
 	/*
 	 * A tuple marked "dead" must not be returned by subsequent searches.
@@ -141,9 +144,6 @@ typedef struct catctup
  * object contains links to cache entries for all the table rows satisfying
  * the partial key.  (Note: none of these will be negative cache entries.)
  *
- * A CatCList is only a member of a per-cache list; we do not currently
- * divide them into hash buckets.
- *
  * A list marked "dead" must not be returned by subsequent searches.
  * However, it won't be physically deleted from the cache until its
  * refcount goes to zero.  (A list should be marked dead if any of its
@@ -156,12 +156,16 @@ typedef struct catctup
  */
 typedef struct catclist
 {
+	/*
+	 * Keep the dlist_node field first so that Valgrind understands the struct
+	 * is reachable.
+	 */
+	dlist_node	cache_elem;		/* member for CatCache.cc_lbucket[] dlist */
+
 	int			cl_magic;		/* for identifying CatCList entries */
 #define CL_MAGIC   0x52765103
 
 	uint32		hash_value;		/* hash value for lookup keys */
-
-	dlist_node	cache_elem;		/* list member of per-catcache list */
 
 	/*
 	 * Lookup keys for the entry, with the first nkeys elements being valid.
@@ -218,14 +222,13 @@ extern CatCList *SearchCatCacheList(CatCache *cache, int nkeys,
 extern void ReleaseCatCacheList(CatCList *list);
 
 extern void ResetCatalogCaches(void);
+extern void ResetCatalogCachesExt(bool debug_discard);
 extern void CatalogCacheFlushCatalog(Oid catId);
 extern void CatCacheInvalidate(CatCache *cache, uint32 hashValue);
 extern void PrepareToInvalidateCacheTuple(Relation relation,
 										  HeapTuple tuple,
 										  HeapTuple newtuple,
-										  void (*function) (int, uint32, Oid));
-
-extern void PrintCatCacheLeakWarning(HeapTuple tuple);
-extern void PrintCatCacheListLeakWarning(CatCList *list);
+										  void (*function) (int, uint32, Oid, void *),
+										  void *context);
 
 #endif							/* CATCACHE_H */

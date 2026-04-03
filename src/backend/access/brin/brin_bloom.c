@@ -2,7 +2,7 @@
  * brin_bloom.c
  *		Implementation of Bloom opclass for BRIN
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -114,24 +114,22 @@
  */
 #include "postgres.h"
 
-#include "access/genam.h"
+#include <limits.h>
+#include <math.h>
+
 #include "access/brin.h"
 #include "access/brin_internal.h"
 #include "access/brin_page.h"
 #include "access/brin_tuple.h"
-#include "access/hash.h"
+#include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
-#include "access/stratnum.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
-#include "catalog/pg_amop.h"
-#include "utils/builtins.h"
-#include "utils/datum.h"
-#include "utils/lsyscache.h"
+#include "common/hashfn.h"
+#include "port/pg_bitutils.h"
+#include "utils/fmgrprotos.h"
 #include "utils/rel.h"
-#include "utils/syscache.h"
-
-#include <math.h>
 
 #define BloomEqualStrategyNumber	1
 
@@ -320,8 +318,7 @@ bloom_init(int ndistinct, double false_positive_rate)
 	int			nhashes;		/* number of hash functions */
 
 	Assert(ndistinct > 0);
-	Assert((false_positive_rate >= BLOOM_MIN_FALSE_POSITIVE_RATE) &&
-		   (false_positive_rate < BLOOM_MAX_FALSE_POSITIVE_RATE));
+	Assert(false_positive_rate > 0 && false_positive_rate < 1);
 
 	/* calculate bloom filter size / parameters */
 	bloom_filter_size(ndistinct, false_positive_rate,
@@ -443,7 +440,6 @@ typedef struct BloomOpaque
 	 * consistency. We may need additional procs in the future.
 	 */
 	FmgrInfo	extra_procinfos[BLOOM_MAX_PROCNUMS];
-	bool		extra_proc_missing[BLOOM_MAX_PROCNUMS];
 } BloomOpaque;
 
 static FmgrInfo *bloom_get_procinfo(BrinDesc *bdesc, uint16 attno,
@@ -546,7 +542,7 @@ brin_bloom_add_value(PG_FUNCTION_ARGS)
 	BrinDesc   *bdesc = (BrinDesc *) PG_GETARG_POINTER(0);
 	BrinValues *column = (BrinValues *) PG_GETARG_POINTER(1);
 	Datum		newval = PG_GETARG_DATUM(2);
-	bool		isnull PG_USED_FOR_ASSERTS_ONLY = PG_GETARG_DATUM(3);
+	bool		isnull PG_USED_FOR_ASSERTS_ONLY = PG_GETARG_BOOL(3);
 	BloomOptions *opts = (BloomOptions *) PG_GET_OPCLASS_OPTIONS();
 	Oid			colloid = PG_GET_COLLATION();
 	FmgrInfo   *hashFn;
@@ -695,6 +691,20 @@ brin_bloom_union(PG_FUNCTION_ARGS)
 	for (i = 0; i < nbytes; i++)
 		filter_a->data[i] |= filter_b->data[i];
 
+	/* update the number of bits set in the filter */
+	filter_a->nbits_set = pg_popcount((const char *) filter_a->data, nbytes);
+
+	/* if we decompressed filter_a, update the summary */
+	if (PointerGetDatum(filter_a) != col_a->bv_values[0])
+	{
+		pfree(DatumGetPointer(col_a->bv_values[0]));
+		col_a->bv_values[0] = PointerGetDatum(filter_a);
+	}
+
+	/* also free filter_b, if it was decompressed */
+	if (PointerGetDatum(filter_b) != col_b->bv_values[0])
+		pfree(filter_b);
+
 	PG_RETURN_VOID();
 }
 
@@ -716,27 +726,19 @@ bloom_get_procinfo(BrinDesc *bdesc, uint16 attno, uint16 procnum)
 	 */
 	opaque = (BloomOpaque *) bdesc->bd_info[attno - 1]->oi_opaque;
 
-	/*
-	 * If we already searched for this proc and didn't find it, don't bother
-	 * searching again.
-	 */
-	if (opaque->extra_proc_missing[basenum])
-		return NULL;
-
 	if (opaque->extra_procinfos[basenum].fn_oid == InvalidOid)
 	{
 		if (RegProcedureIsValid(index_getprocid(bdesc->bd_index, attno,
 												procnum)))
-		{
 			fmgr_info_copy(&opaque->extra_procinfos[basenum],
 						   index_getprocinfo(bdesc->bd_index, attno, procnum),
 						   bdesc->bd_context);
-		}
 		else
-		{
-			opaque->extra_proc_missing[basenum] = true;
-			return NULL;
-		}
+			ereport(ERROR,
+					errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					errmsg_internal("invalid opclass definition"),
+					errdetail_internal("The operator class is missing support function %d for column %d.",
+									   procnum, attno));
 	}
 
 	return &opaque->extra_procinfos[basenum];
@@ -801,7 +803,7 @@ brin_bloom_summary_out(PG_FUNCTION_ARGS)
 	StringInfoData str;
 
 	/* detoast the data to get value with a full 4B header */
-	filter = (BloomFilter *) PG_DETOAST_DATUM_PACKED(PG_GETARG_DATUM(0));
+	filter = (BloomFilter *) PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
 
 	initStringInfo(&str);
 	appendStringInfoChar(&str, '{');

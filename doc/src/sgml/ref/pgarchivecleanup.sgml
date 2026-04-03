@@ -44,7 +44,7 @@ PostgreSQL documentation
    server to use <application>pg_archivecleanup</application>, put this into its
    <filename>postgresql.conf</filename> configuration file:
 <programlisting>
-archive_cleanup_command = 'pg_archivecleanup <replaceable>archivelocation</replaceable> %r'
+archive_cleanup_command = 'pg_archivecleanup <replaceable>archivelocation</replaceable> "%r"'
 </programlisting>
    where <replaceable>archivelocation</replaceable> is the directory from which WAL segment
    files should be removed.
@@ -92,6 +92,18 @@ pg_archivecleanup:  removing file "archive/00000001000000370000000E"
     <application>pg_archivecleanup</application> accepts the following command-line arguments:
 
     <variablelist>
+
+     <varlistentry>
+      <term><option>-b</option></term>
+      <term><option>--clean-backup-history</option></term>
+      <listitem>
+       <para>
+         Remove backup history files as well.
+         See <xref linkend="backup-base-backup"/> for details about backup
+         history files.
+       </para>
+      </listitem>
+     </varlistentry>
 
      <varlistentry>
       <term><option>-d</option></term>
@@ -186,7 +198,7 @@ pg_archivecleanup:  removing file "archive/00000001000000370000000E"
 
   <para>On Linux or Unix systems, you might use:
 <programlisting>
-archive_cleanup_command = 'pg_archivecleanup -d /mnt/standby/archive %r 2>>cleanup.log'
+archive_cleanup_command = 'pg_archivecleanup -d /mnt/standby/archive "%r" 2>>cleanup.log'
 </programlisting>
    where the archive directory is physically located on the standby server,
    so that the <varname>archive_command</varname> is accessing it across NFS,

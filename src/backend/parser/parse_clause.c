@@ -3,7 +3,7 @@
  * parse_clause.c
  *	  handle clauses in parser
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,10 +20,8 @@
 #include "access/table.h"
 #include "access/tsmapi.h"
 #include "catalog/catalog.h"
-#include "catalog/heap.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amproc.h"
-#include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -42,11 +40,9 @@
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
 #include "parser/parser.h"
-#include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
-#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -697,7 +693,11 @@ transformRangeTableFunc(ParseState *pstate, RangeTableFunc *rtf)
 	char	  **names;
 	int			colno;
 
-	/* Currently only XMLTABLE is supported */
+	/*
+	 * Currently we only support XMLTABLE here.  See transformJsonTable() for
+	 * JSON_TABLE support.
+	 */
+	tf->functype = TFT_XMLTABLE;
 	constructName = "XMLTABLE";
 	docType = XMLOID;
 
@@ -733,7 +733,7 @@ transformRangeTableFunc(ParseState *pstate, RangeTableFunc *rtf)
 	tf->ordinalitycol = -1;
 
 	/* Process column specs */
-	names = palloc(sizeof(char *) * list_length(rtf->columns));
+	names = palloc_array(char *, list_length(rtf->columns));
 
 	colno = 0;
 	foreach(col, rtf->columns)
@@ -1104,13 +1104,17 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 		rtr->rtindex = nsitem->p_rtindex;
 		return (Node *) rtr;
 	}
-	else if (IsA(n, RangeTableFunc))
+	else if (IsA(n, RangeTableFunc) || IsA(n, JsonTable))
 	{
 		/* table function is like a plain relation */
 		RangeTblRef *rtr;
 		ParseNamespaceItem *nsitem;
 
-		nsitem = transformRangeTableFunc(pstate, (RangeTableFunc *) n);
+		if (IsA(n, JsonTable))
+			nsitem = transformJsonTable(pstate, (JsonTable *) n);
+		else
+			nsitem = transformRangeTableFunc(pstate, (RangeTableFunc *) n);
+
 		*top_nsitem = nsitem;
 		*namespace = list_make1(nsitem);
 		rtr = makeNode(RangeTblRef);
@@ -1569,10 +1573,11 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 		{
 			ParseNamespaceItem *jnsitem;
 
-			jnsitem = (ParseNamespaceItem *) palloc(sizeof(ParseNamespaceItem));
+			jnsitem = palloc_object(ParseNamespaceItem);
 			jnsitem->p_names = j->join_using_alias;
 			jnsitem->p_rte = nsitem->p_rte;
 			jnsitem->p_rtindex = nsitem->p_rtindex;
+			jnsitem->p_perminfo = NULL;
 			/* no need to copy the first N columns, just use res_nscolumns */
 			jnsitem->p_nscolumns = res_nscolumns;
 			/* set default visibility flags; might get changed later */
@@ -1580,6 +1585,7 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 			jnsitem->p_cols_visible = true;
 			jnsitem->p_lateral_only = false;
 			jnsitem->p_lateral_ok = true;
+			jnsitem->p_returning_type = VAR_RETURNING_DEFAULT;
 			/* Per SQL, we must check for alias conflicts */
 			checkNameSpaceConflicts(pstate, list_make1(jnsitem), my_namespace);
 			my_namespace = lappend(my_namespace, jnsitem);
@@ -1642,6 +1648,7 @@ buildVarFromNSColumn(ParseState *pstate, ParseNamespaceColumn *nscol)
 				  nscol->p_varcollid,
 				  0);
 	/* makeVar doesn't offer parameters for these, so set by hand: */
+	var->varreturningtype = nscol->p_varreturningtype;
 	var->varnosyn = nscol->p_varnosyn;
 	var->varattnosyn = nscol->p_varattnosyn;
 
@@ -2591,6 +2598,9 @@ transformGroupingSet(List **flatresult,
  * GROUP BY items will be added to the targetlist (as resjunk columns)
  * if not already present, so the targetlist must be passed by reference.
  *
+ * If GROUP BY ALL is specified, the groupClause will be inferred to be all
+ * non-aggregate, non-window expressions in the targetlist.
+ *
  * This is also used for window PARTITION BY clauses (which act almost the
  * same, but are always interpreted per SQL99 rules).
  *
@@ -2615,6 +2625,7 @@ transformGroupingSet(List **flatresult,
  *
  * pstate		ParseState
  * grouplist	clause to transform
+ * groupByAll	is this a GROUP BY ALL statement?
  * groupingSets reference to list to contain the grouping set tree
  * targetlist	reference to TargetEntry list
  * sortClause	ORDER BY clause (SortGroupClause nodes)
@@ -2622,7 +2633,8 @@ transformGroupingSet(List **flatresult,
  * useSQL99		SQL99 rather than SQL92 syntax
  */
 List *
-transformGroupClause(ParseState *pstate, List *grouplist, List **groupingSets,
+transformGroupClause(ParseState *pstate, List *grouplist, bool groupByAll,
+					 List **groupingSets,
 					 List **targetlist, List *sortClause,
 					 ParseExprKind exprKind, bool useSQL99)
 {
@@ -2632,6 +2644,63 @@ transformGroupClause(ParseState *pstate, List *grouplist, List **groupingSets,
 	ListCell   *gl;
 	bool		hasGroupingSets = false;
 	Bitmapset  *seen_local = NULL;
+
+	/* Handle GROUP BY ALL */
+	if (groupByAll)
+	{
+		/* There cannot have been any explicit grouplist items */
+		Assert(grouplist == NIL);
+
+		/* Iterate over targets, adding acceptable ones to the result list */
+		foreach_ptr(TargetEntry, tle, *targetlist)
+		{
+			/* Ignore junk TLEs */
+			if (tle->resjunk)
+				continue;
+
+			/*
+			 * TLEs containing aggregates are not okay to add to GROUP BY
+			 * (compare checkTargetlistEntrySQL92).  But the SQL standard
+			 * directs us to skip them, so it's fine.
+			 */
+			if (pstate->p_hasAggs &&
+				contain_aggs_of_level((Node *) tle->expr, 0))
+				continue;
+
+			/*
+			 * Likewise, TLEs containing window functions are not okay to add
+			 * to GROUP BY.  At this writing, the SQL standard is silent on
+			 * what to do with them, but by analogy to aggregates we'll just
+			 * skip them.
+			 */
+			if (pstate->p_hasWindowFuncs &&
+				contain_windowfuncs((Node *) tle->expr))
+				continue;
+
+			/*
+			 * Otherwise, add the TLE to the result using default sort/group
+			 * semantics.  We specify the parse location as the TLE's
+			 * location, despite the comment for addTargetToGroupList
+			 * discouraging that.  The only other thing we could point to is
+			 * the ALL keyword, which seems unhelpful when there are multiple
+			 * TLEs.
+			 */
+			result = addTargetToGroupList(pstate, tle,
+										  result, *targetlist,
+										  exprLocation((Node *) tle->expr));
+		}
+
+		/* If we found any acceptable targets, we're done */
+		if (result != NIL)
+			return result;
+
+		/*
+		 * Otherwise, the SQL standard says to treat it like "GROUP BY ()".
+		 * Build a representation of that, and let the rest of this function
+		 * handle it.
+		 */
+		grouplist = list_make1(makeGroupingSet(GROUPING_SET_EMPTY, NIL, -1));
+	}
 
 	/*
 	 * Recursively flatten implicit RowExprs. (Technically this is only needed
@@ -2811,6 +2880,7 @@ transformWindowDefinitions(ParseState *pstate,
 										  true /* force SQL99 rules */ );
 		partitionClause = transformGroupClause(pstate,
 											   windef->partitionClause,
+											   false /* not GROUP BY ALL */ ,
 											   NULL,
 											   targetlist,
 											   orderClause,
@@ -2908,7 +2978,7 @@ transformWindowDefinitions(ParseState *pstate,
 		{
 			SortGroupClause *sortcl;
 			Node	   *sortkey;
-			int16		rangestrategy;
+			CompareType rangecmptype;
 
 			if (list_length(wc->orderClause) != 1)
 				ereport(ERROR,
@@ -2921,12 +2991,12 @@ transformWindowDefinitions(ParseState *pstate,
 			if (!get_ordering_op_properties(sortcl->sortop,
 											&rangeopfamily,
 											&rangeopcintype,
-											&rangestrategy))
+											&rangecmptype))
 				elog(ERROR, "operator %u is not a valid ordering operator",
 					 sortcl->sortop);
 			/* Record properties of sort ordering */
 			wc->inRangeColl = exprCollation(sortkey);
-			wc->inRangeAsc = (rangestrategy == BTLessStrategyNumber);
+			wc->inRangeAsc = !sortcl->reverse_sort;
 			wc->inRangeNullsFirst = sortcl->nulls_first;
 		}
 
@@ -2949,7 +3019,6 @@ transformWindowDefinitions(ParseState *pstate,
 											 rangeopfamily, rangeopcintype,
 											 &wc->endInRangeFunc,
 											 windef->endOffset);
-		wc->runCondition = NIL;
 		wc->winref = winref;
 
 		result = lappend(result, wc);
@@ -3208,24 +3277,29 @@ resolve_unique_index_expr(ParseState *pstate, InferClause *infer,
 		 * Raw grammar re-uses CREATE INDEX infrastructure for unique index
 		 * inference clause, and so will accept opclasses by name and so on.
 		 *
-		 * Make no attempt to match ASC or DESC ordering or NULLS FIRST/NULLS
-		 * LAST ordering, since those are not significant for inference
-		 * purposes (any unique index matching the inference specification in
-		 * other regards is accepted indifferently).  Actively reject this as
-		 * wrong-headed.
+		 * Make no attempt to match ASC or DESC ordering, NULLS FIRST/NULLS
+		 * LAST ordering or opclass options, since those are not significant
+		 * for inference purposes (any unique index matching the inference
+		 * specification in other regards is accepted indifferently). Actively
+		 * reject this as wrong-headed.
 		 */
 		if (ielem->ordering != SORTBY_DEFAULT)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-					 errmsg("ASC/DESC is not allowed in ON CONFLICT clause"),
-					 parser_errposition(pstate,
-										exprLocation((Node *) infer))));
+					 errmsg("%s is not allowed in ON CONFLICT clause",
+							"ASC/DESC"),
+					 parser_errposition(pstate, ielem->location)));
 		if (ielem->nulls_ordering != SORTBY_NULLS_DEFAULT)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-					 errmsg("NULLS FIRST/LAST is not allowed in ON CONFLICT clause"),
-					 parser_errposition(pstate,
-										exprLocation((Node *) infer))));
+					 errmsg("%s is not allowed in ON CONFLICT clause",
+							"NULLS FIRST/LAST"),
+					 parser_errposition(pstate, ielem->location)));
+		if (ielem->opclassopts)
+			ereport(ERROR,
+					errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+					errmsg("operator class options are not allowed in ON CONFLICT clause"),
+					parser_errposition(pstate, ielem->location));
 
 		if (!ielem->expr)
 		{
@@ -3265,7 +3339,7 @@ resolve_unique_index_expr(ParseState *pstate, InferClause *infer,
 			pInfer->infercollid = InvalidOid;
 		else
 			pInfer->infercollid = LookupCollation(pstate, ielem->collation,
-												  exprLocation(pInfer->expr));
+												  ielem->location);
 
 		if (!ielem->opclass)
 			pInfer->inferopclass = InvalidOid;
@@ -3299,13 +3373,15 @@ transformOnConflictArbiter(ParseState *pstate,
 	*arbiterWhere = NULL;
 	*constraint = InvalidOid;
 
-	if (onConflictClause->action == ONCONFLICT_UPDATE && !infer)
+	if ((onConflictClause->action == ONCONFLICT_UPDATE ||
+		 onConflictClause->action == ONCONFLICT_SELECT) && !infer)
 		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("ON CONFLICT DO UPDATE requires inference specification or constraint name"),
-				 errhint("For example, ON CONFLICT (column_name)."),
-				 parser_errposition(pstate,
-									exprLocation((Node *) onConflictClause))));
+				errcode(ERRCODE_SYNTAX_ERROR),
+				errmsg("ON CONFLICT DO %s requires inference specification or constraint name",
+					   onConflictClause->action == ONCONFLICT_UPDATE ? "UPDATE" : "SELECT"),
+				errhint("For example, ON CONFLICT (column_name)."),
+				parser_errposition(pstate,
+								   exprLocation((Node *) onConflictClause)));
 
 	/*
 	 * To simplify certain aspects of its design, speculative insertion into
@@ -3483,6 +3559,7 @@ addTargetToSortList(ParseState *pstate, TargetEntry *tle,
 		sortcl->eqop = eqop;
 		sortcl->sortop = sortop;
 		sortcl->hashable = hashable;
+		sortcl->reverse_sort = reverse;
 
 		switch (sortby->sortby_nulls)
 		{
@@ -3565,6 +3642,8 @@ addTargetToGroupList(ParseState *pstate, TargetEntry *tle,
 		grpcl->tleSortGroupRef = assignSortGroupRef(tle, targetlist);
 		grpcl->eqop = eqop;
 		grpcl->sortop = sortop;
+		grpcl->reverse_sort = false;	/* sortop is "less than", or
+										 * InvalidOid */
 		grpcl->nulls_first = false; /* OK with or without sortop */
 		grpcl->hashable = hashable;
 

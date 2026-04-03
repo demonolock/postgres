@@ -3,7 +3,7 @@
  * test_regex.c
  *		Test harness for the regular expression package.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,7 +15,6 @@
 #include "postgres.h"
 
 #include "funcapi.h"
-#include "miscadmin.h"
 #include "regex/regex.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -108,13 +107,11 @@ test_regex(PG_FUNCTION_ARGS)
 									  true);
 
 		/* Pre-create workspace that build_test_match_result needs */
-		matchctx->elems = (Datum *) palloc(sizeof(Datum) *
-										   (matchctx->npatterns + 1));
-		matchctx->nulls = (bool *) palloc(sizeof(bool) *
-										  (matchctx->npatterns + 1));
+		matchctx->elems = palloc_array(Datum, matchctx->npatterns + 1);
+		matchctx->nulls = palloc_array(bool, matchctx->npatterns + 1);
 
 		MemoryContextSwitchTo(oldcontext);
-		funcctx->user_fctx = (void *) matchctx;
+		funcctx->user_fctx = matchctx;
 
 		/*
 		 * Return the first result row, which is info equivalent to Tcl's
@@ -414,7 +411,8 @@ parse_test_flags(test_re_flags *flags, text *opts)
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							 errmsg("invalid regular expression test option: \"%.*s\"",
-									pg_mblen(opt_p + i), opt_p + i)));
+									pg_mblen_range(opt_p + i, opt_p + opt_len),
+									opt_p + i)));
 					break;
 			}
 		}
@@ -437,7 +435,7 @@ setup_test_matches(text *orig_str,
 				   Oid collation,
 				   bool use_subpatterns)
 {
-	test_regex_ctx *matchctx = palloc0(sizeof(test_regex_ctx));
+	test_regex_ctx *matchctx = palloc0_object(test_regex_ctx);
 	int			eml = pg_database_encoding_max_length();
 	int			orig_len;
 	pg_wchar   *wide_str;
@@ -458,7 +456,7 @@ setup_test_matches(text *orig_str,
 
 	/* convert string to pg_wchar form for matching */
 	orig_len = VARSIZE_ANY_EXHDR(orig_str);
-	wide_str = (pg_wchar *) palloc(sizeof(pg_wchar) * (orig_len + 1));
+	wide_str = palloc_array(pg_wchar, orig_len + 1);
 	wide_len = pg_mb2wchar_with_len(VARDATA_ANY(orig_str), wide_str, orig_len);
 
 	/* do we want to remember subpatterns? */
@@ -475,7 +473,7 @@ setup_test_matches(text *orig_str,
 	}
 
 	/* temporary output space for RE package */
-	pmatch = palloc(sizeof(regmatch_t) * pmatch_len);
+	pmatch = palloc_array(regmatch_t, pmatch_len);
 
 	/*
 	 * the real output space (grown dynamically if needed)
@@ -484,7 +482,7 @@ setup_test_matches(text *orig_str,
 	 * than at 2^27
 	 */
 	array_len = re_flags->glob ? 255 : 31;
-	matchctx->match_locs = (int *) palloc(sizeof(int) * array_len);
+	matchctx->match_locs = palloc_array(int, array_len);
 	array_idx = 0;
 
 	/* search for the pattern, perhaps repeatedly */

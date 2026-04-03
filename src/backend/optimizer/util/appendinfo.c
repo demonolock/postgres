@@ -3,7 +3,7 @@
  * appendinfo.c
  *	  Routines for mapping between append parent(s) and children
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -160,11 +160,15 @@ make_inh_translation_list(Relation oldrelation, Relation newrelation,
 
 		/* Found it, check type and collation match */
 		if (atttypid != att->atttypid || atttypmod != att->atttypmod)
-			elog(ERROR, "attribute \"%s\" of relation \"%s\" does not match parent's type",
-				 attname, RelationGetRelationName(newrelation));
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_COLUMN_DEFINITION),
+					 errmsg("attribute \"%s\" of relation \"%s\" does not match parent's type",
+							attname, RelationGetRelationName(newrelation))));
 		if (attcollation != att->attcollation)
-			elog(ERROR, "attribute \"%s\" of relation \"%s\" does not match parent's collation",
-				 attname, RelationGetRelationName(newrelation));
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_COLUMN_DEFINITION),
+					 errmsg("attribute \"%s\" of relation \"%s\" does not match parent's collation",
+							attname, RelationGetRelationName(newrelation))));
 
 		vars = lappend(vars, makeVar(newvarno,
 									 (AttrNumber) (new_attno + 1),
@@ -233,8 +237,9 @@ adjust_appendrel_attrs_mutator(Node *node,
 		 * You might think we need to adjust var->varnullingrels, but that
 		 * shouldn't need any changes.  It will contain outer-join relids,
 		 * while the transformation we are making affects only baserels.
-		 * Below, we just propagate var->varnullingrels into the translated
-		 * Var.
+		 * Below, we just merge var->varnullingrels into the translated Var.
+		 * (We must merge not just copy: the child Var could have some
+		 * nullingrel bits set already, and we mustn't drop those.)
 		 *
 		 * If var->varnullingrels isn't empty, and the translation wouldn't be
 		 * a Var, we have to fail.  One could imagine wrapping the translated
@@ -249,6 +254,13 @@ adjust_appendrel_attrs_mutator(Node *node,
 		 * all non-Var outputs of such subqueries, and then we could look up
 		 * the pre-existing PHV here.  Or perhaps just wrap the translations
 		 * that way to begin with?
+		 *
+		 * If var->varreturningtype is not VAR_RETURNING_DEFAULT, then that
+		 * also needs to be copied to the translated Var.  That too would fail
+		 * if the translation wasn't a Var, but that should never happen since
+		 * a non-default var->varreturningtype is only used for Vars referring
+		 * to the result relation, which should never be a flattened UNION ALL
+		 * subquery.
 		 */
 
 		for (cnt = 0; cnt < nappinfos; cnt++)
@@ -279,9 +291,20 @@ adjust_appendrel_attrs_mutator(Node *node,
 					elog(ERROR, "attribute %d of relation \"%s\" does not exist",
 						 var->varattno, get_rel_name(appinfo->parent_reloid));
 				if (IsA(newnode, Var))
-					((Var *) newnode)->varnullingrels = var->varnullingrels;
-				else if (var->varnullingrels != NULL)
-					elog(ERROR, "failed to apply nullingrels to a non-Var");
+				{
+					Var		   *newvar = (Var *) newnode;
+
+					newvar->varreturningtype = var->varreturningtype;
+					newvar->varnullingrels = bms_add_members(newvar->varnullingrels,
+															 var->varnullingrels);
+				}
+				else
+				{
+					if (var->varreturningtype != VAR_RETURNING_DEFAULT)
+						elog(ERROR, "failed to apply returningtype to a non-Var");
+					if (var->varnullingrels != NULL)
+						elog(ERROR, "failed to apply nullingrels to a non-Var");
+				}
 				return newnode;
 			}
 			else if (var->varattno == 0)
@@ -335,6 +358,8 @@ adjust_appendrel_attrs_mutator(Node *node,
 					rowexpr->colnames = copyObject(rte->eref->colnames);
 					rowexpr->location = -1;
 
+					if (var->varreturningtype != VAR_RETURNING_DEFAULT)
+						elog(ERROR, "failed to apply returningtype to a non-Var");
 					if (var->varnullingrels != NULL)
 						elog(ERROR, "failed to apply nullingrels to a non-Var");
 
@@ -421,7 +446,7 @@ adjust_appendrel_attrs_mutator(Node *node,
 
 		phv = (PlaceHolderVar *) expression_tree_mutator(node,
 														 adjust_appendrel_attrs_mutator,
-														 (void *) context);
+														 context);
 		/* now fix PlaceHolderVar's relid sets */
 		if (phv->phlevelsup == 0)
 		{
@@ -496,6 +521,57 @@ adjust_appendrel_attrs_mutator(Node *node,
 	}
 
 	/*
+	 * We have to process RelAggInfo nodes specially.
+	 */
+	if (IsA(node, RelAggInfo))
+	{
+		RelAggInfo *oldinfo = (RelAggInfo *) node;
+		RelAggInfo *newinfo = makeNode(RelAggInfo);
+
+		newinfo->target = (PathTarget *)
+			adjust_appendrel_attrs_mutator((Node *) oldinfo->target,
+										   context);
+
+		newinfo->agg_input = (PathTarget *)
+			adjust_appendrel_attrs_mutator((Node *) oldinfo->agg_input,
+										   context);
+
+		newinfo->group_clauses = oldinfo->group_clauses;
+
+		newinfo->group_exprs = (List *)
+			adjust_appendrel_attrs_mutator((Node *) oldinfo->group_exprs,
+										   context);
+
+		return (Node *) newinfo;
+	}
+
+	/*
+	 * We have to process PathTarget nodes specially.
+	 */
+	if (IsA(node, PathTarget))
+	{
+		PathTarget *oldtarget = (PathTarget *) node;
+		PathTarget *newtarget = makeNode(PathTarget);
+
+		/* Copy all flat-copiable fields */
+		memcpy(newtarget, oldtarget, sizeof(PathTarget));
+
+		newtarget->exprs = (List *)
+			adjust_appendrel_attrs_mutator((Node *) oldtarget->exprs,
+										   context);
+
+		if (oldtarget->sortgrouprefs)
+		{
+			Size		nbytes = list_length(oldtarget->exprs) * sizeof(Index);
+
+			newtarget->sortgrouprefs = (Index *) palloc(nbytes);
+			memcpy(newtarget->sortgrouprefs, oldtarget->sortgrouprefs, nbytes);
+		}
+
+		return (Node *) newtarget;
+	}
+
+	/*
 	 * NOTE: we do not need to recurse into sublinks, because they should
 	 * already have been converted to subplans before we see them.
 	 */
@@ -505,8 +581,7 @@ adjust_appendrel_attrs_mutator(Node *node,
 	Assert(!IsA(node, RangeTblRef));
 	Assert(!IsA(node, JoinExpr));
 
-	return expression_tree_mutator(node, adjust_appendrel_attrs_mutator,
-								   (void *) context);
+	return expression_tree_mutator(node, adjust_appendrel_attrs_mutator, context);
 }
 
 /*
@@ -737,8 +812,7 @@ find_appinfos_by_relids(PlannerInfo *root, Relids relids, int *nappinfos)
 	int			i;
 
 	/* Allocate an array that's certainly big enough */
-	appinfos = (AppendRelInfo **)
-		palloc(sizeof(AppendRelInfo *) * bms_num_members(relids));
+	appinfos = palloc_array(AppendRelInfo *, bms_num_members(relids));
 
 	i = -1;
 	while ((i = bms_next_member(relids, i)) >= 0)
@@ -891,8 +965,7 @@ add_row_identity_columns(PlannerInfo *root, Index rtindex,
 
 	Assert(commandType == CMD_UPDATE || commandType == CMD_DELETE || commandType == CMD_MERGE);
 
-	if (commandType == CMD_MERGE ||
-		relkind == RELKIND_RELATION ||
+	if (relkind == RELKIND_RELATION ||
 		relkind == RELKIND_MATVIEW ||
 		relkind == RELKIND_PARTITIONED_TABLE)
 	{

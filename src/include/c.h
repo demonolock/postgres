@@ -9,13 +9,14 @@
  *	  polluting the namespace with lots of stuff...
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/c.h
  *
  *-------------------------------------------------------------------------
  */
+/* IWYU pragma: always_keep */
 /*
  *----------------------------------------------------------------
  *	 TABLE OF CONTENTS
@@ -46,16 +47,21 @@
 #ifndef C_H
 #define C_H
 
-#include "postgres_ext.h"
+/* IWYU pragma: begin_exports */
 
-/* Must undef pg_config_ext.h symbols before including pg_config.h */
-#undef PG_INT64_TYPE
-
+/*
+ * These headers must be included before any system headers, because on some
+ * platforms they affect the behavior of the system headers (for example, by
+ * defining _FILE_OFFSET_BITS).
+ */
 #include "pg_config.h"
 #include "pg_config_manual.h"	/* must be after pg_config.h */
-#include "pg_config_os.h"		/* must be before any system header files */
+#include "pg_config_os.h"		/* config from include/port/PORTNAME.h */
 
 /* System header files that should be available everywhere in Postgres */
+#include <assert.h>
+#include <inttypes.h>
+#include <stdalign.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,15 +77,24 @@
 #include <fcntl.h>				/* ensure O_BINARY is available */
 #endif
 #include <locale.h>
+#ifdef HAVE_XLOCALE_H
+#include <xlocale.h>
+#endif
 #ifdef ENABLE_NLS
 #include <libintl.h>
+#endif
+
+ /* Pull in fundamental symbols that we also expose to applications */
+#include "postgres_ext.h"
+
+/* Define before including zlib.h to add const decorations to zlib API. */
+#ifdef HAVE_LIBZ
+#define ZLIB_CONST
 #endif
 
 
 /* ----------------------------------------------------------------
  *				Section 1: compiler characteristics
- *
- * type prefixes (const, signed, volatile, inline) are handled in pg_config.h.
  * ----------------------------------------------------------------
  */
 
@@ -99,9 +114,6 @@
  * GCC: https://gcc.gnu.org/onlinedocs/gcc/Function-Attributes.html
  * GCC: https://gcc.gnu.org/onlinedocs/gcc/Type-Attributes.html
  * Clang: https://clang.llvm.org/docs/AttributeReference.html
- * Sunpro: https://docs.oracle.com/cd/E18659_01/html/821-1384/gjzke.html
- * XLC: https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.2/com.ibm.xlc131.aix.doc/language_ref/function_attributes.html
- * XLC: https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.2/com.ibm.xlc131.aix.doc/language_ref/type_attrib.html
  */
 
 /*
@@ -121,15 +133,60 @@
 #endif
 
 /*
+ * pg_fallthrough indicates that the fall through from the previous case is
+ * intentional.
+ */
+#if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L) || (defined(__cplusplus) && __cplusplus >= 201703L)
+#define pg_fallthrough [[fallthrough]]
+#elif __has_attribute(fallthrough)
+#define pg_fallthrough __attribute__((fallthrough))
+#else
+#define pg_fallthrough
+#endif
+
+/*
  * pg_nodiscard means the compiler should warn if the result of a function
- * call is ignored.  The name "nodiscard" is chosen in alignment with
- * (possibly future) C and C++ standards.  For maximum compatibility, use it
- * as a function declaration specifier, so it goes before the return type.
+ * call is ignored.  The name "nodiscard" is chosen in alignment with the C23
+ * standard attribute with the same name.  For maximum forward compatibility,
+ * place it before the declaration.
  */
 #ifdef __GNUC__
 #define pg_nodiscard __attribute__((warn_unused_result))
 #else
 #define pg_nodiscard
+#endif
+
+/*
+ * pg_noreturn corresponds to the C11 noreturn/_Noreturn function specifier.
+ * We can't use the standard name "noreturn" because some third-party code
+ * uses __attribute__((noreturn)) in headers, which would get confused if
+ * "noreturn" is defined to "_Noreturn", as is done by <stdnoreturn.h>.
+ *
+ * In a declaration, function specifiers go before the function name.  The
+ * common style is to put them before the return type.  (The MSVC fallback has
+ * the same requirement.  The GCC fallback is more flexible.)
+ */
+#if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L) && !defined(__cplusplus)
+#define pg_noreturn _Noreturn
+#elif defined(__GNUC__)
+#define pg_noreturn __attribute__((noreturn))
+#elif defined(_MSC_VER)
+#define pg_noreturn __declspec(noreturn)
+#else
+#define pg_noreturn
+#endif
+
+/*
+ * This macro will disable address safety instrumentation for a function
+ * when running with "-fsanitize=address". Think twice before using this!
+ */
+#if defined(__clang__) || __GNUC__ >= 8
+#define pg_attribute_no_sanitize_address() __attribute__((no_sanitize("address")))
+#elif __has_attribute(no_sanitize_address)
+/* This would work for clang, but it's deprecated. */
+#define pg_attribute_no_sanitize_address() __attribute__((no_sanitize_address))
+#else
+#define pg_attribute_no_sanitize_address()
 #endif
 
 /*
@@ -156,6 +213,18 @@
 #endif
 
 /*
+ * pg_attribute_target allows specifying different target options that the
+ * function should be compiled with (e.g., for using special CPU instructions).
+ * Note that there still needs to be a configure-time check to verify that a
+ * specific target is understood by the compiler.
+ */
+#if __has_attribute (target)
+#define pg_attribute_target(...) __attribute__((target(__VA_ARGS__)))
+#else
+#define pg_attribute_target(...)
+#endif
+
+/*
  * Append PG_USED_FOR_ASSERTS_ONLY to definitions of variables that are only
  * used in assert-enabled builds, to avoid compiler warnings about unused
  * variables in assert-disabled builds.
@@ -166,8 +235,18 @@
 #define PG_USED_FOR_ASSERTS_ONLY pg_attribute_unused()
 #endif
 
-/* GCC and XLC support format attributes */
-#if defined(__GNUC__) || defined(__IBMC__)
+/*
+ * Our C and C++ compilers may have different ideas about which printf
+ * archetype best represents what src/port/snprintf.c can do.
+ */
+#ifndef __cplusplus
+#define PG_PRINTF_ATTRIBUTE PG_C_PRINTF_ATTRIBUTE
+#else
+#define PG_PRINTF_ATTRIBUTE PG_CXX_PRINTF_ATTRIBUTE
+#endif
+
+/* GCC supports format attributes */
+#if defined(__GNUC__)
 #define pg_attribute_format_arg(a) __attribute__((format_arg(a)))
 #define pg_attribute_printf(f,a) __attribute__((format(PG_PRINTF_ATTRIBUTE, f, a)))
 #else
@@ -175,30 +254,24 @@
 #define pg_attribute_printf(f,a)
 #endif
 
-/* GCC, Sunpro and XLC support aligned, packed and noreturn */
-#if defined(__GNUC__) || defined(__SUNPRO_C) || defined(__IBMC__)
+/* GCC supports aligned and packed */
+#if defined(__GNUC__)
 #define pg_attribute_aligned(a) __attribute__((aligned(a)))
-#define pg_attribute_noreturn() __attribute__((noreturn))
 #define pg_attribute_packed() __attribute__((packed))
-#define HAVE_PG_ATTRIBUTE_NORETURN 1
 #elif defined(_MSC_VER)
 /*
- * MSVC supports aligned.  noreturn is also possible but in MSVC it is
- * declared before the definition while pg_attribute_noreturn() macro
- * is currently used after the definition.
+ * MSVC supports aligned.
  *
  * Packing is also possible but only by wrapping the entire struct definition
  * which doesn't fit into our current macro declarations.
  */
 #define pg_attribute_aligned(a) __declspec(align(a))
-#define pg_attribute_noreturn()
 #else
 /*
  * NB: aligned and packed are not given default definitions because they
  * affect code functionality; they *must* be implemented by the compiler
  * if they are to be used.
  */
-#define pg_attribute_noreturn()
 #endif
 
 /*
@@ -207,8 +280,8 @@
  * choose not to.  But, if possible, don't force inlining in unoptimized
  * debug builds.
  */
-#if (defined(__GNUC__) && __GNUC__ > 3 && defined(__OPTIMIZE__)) || defined(__SUNPRO_C) || defined(__IBMC__)
-/* GCC > 3, Sunpro and XLC support always_inline via __attribute__ */
+#if defined(__GNUC__) && defined(__OPTIMIZE__)
+/* GCC supports always_inline via __attribute__ */
 #define pg_attribute_always_inline __attribute__((always_inline)) inline
 #elif defined(_MSC_VER)
 /* MSVC has a special keyword for this */
@@ -224,8 +297,8 @@
  * for proper cost attribution.  Note that unlike the pg_attribute_XXX macros
  * above, this should be placed before the function's return type and name.
  */
-/* GCC, Sunpro and XLC support noinline via __attribute__ */
-#if (defined(__GNUC__) && __GNUC__ > 2) || defined(__SUNPRO_C) || defined(__IBMC__)
+/* GCC supports noinline via __attribute__ */
+#if defined(__GNUC__)
 #define pg_noinline __attribute__((noinline))
 /* msvc via declspec */
 #elif defined(_MSC_VER)
@@ -281,13 +354,69 @@
 #endif
 
 /*
+ * Define a compiler-independent macro for determining if an expression is a
+ * compile-time integer const.  We don't define this macro to return 0 when
+ * unsupported due to the risk of users of the macro misbehaving if we return
+ * 0 when the expression *is* an integer constant.  Callers may check if this
+ * macro is defined by checking if HAVE_PG_INTEGER_CONSTANT_P is defined.
+ */
+#if defined(HAVE__BUILTIN_CONSTANT_P)
+
+/* When __builtin_constant_p() is available, use it. */
+#define pg_integer_constant_p(x) __builtin_constant_p(x)
+#define HAVE_PG_INTEGER_CONSTANT_P
+#elif defined(_MSC_VER) && defined(__STDC_VERSION__)
+
+/*
+ * With MSVC we can use a trick with _Generic to make this work.  This has
+ * been borrowed from:
+ * https://stackoverflow.com/questions/49480442/detecting-integer-constant-expressions-in-macros
+ * and only works with integer constants.  Compilation will fail if given a
+ * constant or variable of any type other than an integer.
+ */
+#define pg_integer_constant_p(x) \
+	_Generic((1 ? ((void *) ((x) * (uintptr_t) 0)) : &(int) {1}), int *: 1, void *: 0)
+#define HAVE_PG_INTEGER_CONSTANT_P
+#endif
+
+/*
+ * pg_assume(expr) states that we assume `expr` to evaluate to true. In assert
+ * enabled builds pg_assume() is turned into an assertion, in optimized builds
+ * we try to clue the compiler into the fact that `expr` is true.
+ *
+ * This is useful for two purposes:
+ *
+ * 1) Avoid compiler warnings by telling the compiler about assumptions the
+ *	  code makes. This is particularly useful when building with optimizations
+ *	  and w/o assertions.
+ *
+ * 2) Help the compiler to generate more efficient code
+ *
+ * It is unspecified whether `expr` is evaluated, therefore it better be
+ * side-effect free.
+ */
+#if defined(USE_ASSERT_CHECKING)
+#define pg_assume(expr) Assert(expr)
+#elif defined(HAVE__BUILTIN_UNREACHABLE)
+#define pg_assume(expr) \
+	do { \
+		if (!(expr)) \
+			__builtin_unreachable(); \
+	} while (0)
+#elif defined(_MSC_VER)
+#define pg_assume(expr) __assume(expr)
+#else
+#define pg_assume(expr) ((void) 0)
+#endif
+
+/*
  * Hints to the compiler about the likelihood of a branch. Both likely() and
  * unlikely() return the boolean value of the contained expression.
  *
  * These should only be used sparingly, in very hot code paths. It's very easy
  * to mis-estimate likelihoods.
  */
-#if __GNUC__ >= 3
+#ifdef __GNUC__
 #define likely(x)	__builtin_expect((x) != 0, 1)
 #define unlikely(x) __builtin_expect((x) != 0, 0)
 #else
@@ -324,25 +453,7 @@
  * pretty trivial: VA_ARGS_NARGS_() returns its 64th argument, and we set up
  * the call so that that is the appropriate one of the list of constants.
  * This idea is due to Laurent Deniau.
- *
- * MSVC has an implementation of __VA_ARGS__ that doesn't conform to the
- * standard unless you use the /Zc:preprocessor compiler flag, but that
- * isn't available before Visual Studio 2019.  For now, use a different
- * definition that also works on older compilers.
  */
-#ifdef _MSC_VER
-#define EXPAND(args) args
-#define VA_ARGS_NARGS(...) \
-	VA_ARGS_NARGS_ EXPAND((__VA_ARGS__, \
-				   63,62,61,60,                   \
-				   59,58,57,56,55,54,53,52,51,50, \
-				   49,48,47,46,45,44,43,42,41,40, \
-				   39,38,37,36,35,34,33,32,31,30, \
-				   29,28,27,26,25,24,23,22,21,20, \
-				   19,18,17,16,15,14,13,12,11,10, \
-				   9, 8, 7, 6, 5, 4, 3, 2, 1, 0))
-#else
-
 #define VA_ARGS_NARGS(...) \
 	VA_ARGS_NARGS_(__VA_ARGS__, \
 				   63,62,61,60,                   \
@@ -352,7 +463,6 @@
 				   29,28,27,26,25,24,23,22,21,20, \
 				   19,18,17,16,15,14,13,12,11,10, \
 				   9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
-#endif
 
 #define VA_ARGS_NARGS_( \
 	_01,_02,_03,_04,_05,_06,_07,_08,_09,_10, \
@@ -419,37 +529,11 @@ typedef void (*pg_funcptr_t) (void);
  * bool
  *		Boolean value, either true or false.
  *
- * We use stdbool.h if available and its bool has size 1.  That's useful for
- * better compiler and debugger output and for compatibility with third-party
- * libraries.  But PostgreSQL currently cannot deal with bool of other sizes;
- * there are static assertions around the code to prevent that.
- *
- * For C++ compilers, we assume the compiler has a compatible built-in
- * definition of bool.
- *
- * See also the version of this code in src/interfaces/ecpg/include/ecpglib.h.
+ * PostgreSQL currently cannot deal with bool of size other than 1; there are
+ * static assertions around the code to prevent that.
  */
 
-#ifndef __cplusplus
-
-#ifdef PG_USE_STDBOOL
 #include <stdbool.h>
-#else
-
-#ifndef bool
-typedef unsigned char bool;
-#endif
-
-#ifndef true
-#define true	((bool) 1)
-#endif
-
-#ifndef false
-#define false	((bool) 0)
-#endif
-
-#endif							/* not PG_USE_STDBOOL */
-#endif							/* not C++ */
 
 
 /* ----------------------------------------------------------------
@@ -460,35 +544,19 @@ typedef unsigned char bool;
 /*
  * Pointer
  *		Variable holding address of any memory resident object.
- *
- *		XXX Pointer arithmetic is done with this, so it can't be void *
- *		under "true" ANSI compilers.
+ *		(obsolescent; use void * or char *)
  */
-typedef char *Pointer;
+typedef void *Pointer;
 
-/*
- * intN
- *		Signed integer, EXACTLY N BITS IN SIZE,
- *		used for numerical computations and the
- *		frontend/backend protocol.
- */
-#ifndef HAVE_INT8
-typedef signed char int8;		/* == 8 bits */
-typedef signed short int16;		/* == 16 bits */
-typedef signed int int32;		/* == 32 bits */
-#endif							/* not HAVE_INT8 */
-
-/*
- * uintN
- *		Unsigned integer, EXACTLY N BITS IN SIZE,
- *		used for numerical computations and the
- *		frontend/backend protocol.
- */
-#ifndef HAVE_UINT8
-typedef unsigned char uint8;	/* == 8 bits */
-typedef unsigned short uint16;	/* == 16 bits */
-typedef unsigned int uint32;	/* == 32 bits */
-#endif							/* not HAVE_UINT8 */
+/* Historical names for types in <stdint.h>. */
+typedef int8_t int8;
+typedef int16_t int16;
+typedef int32_t int32;
+typedef int64_t int64;
+typedef uint8_t uint8;
+typedef uint16_t uint16;
+typedef uint32_t uint32;
+typedef uint64_t uint64;
 
 /*
  * bitsN
@@ -501,36 +569,13 @@ typedef uint32 bits32;			/* >= 32 bits */
 /*
  * 64-bit integers
  */
-#ifdef HAVE_LONG_INT_64
-/* Plain "long int" fits, use it */
-
-#ifndef HAVE_INT64
-typedef long int int64;
-#endif
-#ifndef HAVE_UINT64
-typedef unsigned long int uint64;
-#endif
-#define INT64CONST(x)  (x##L)
-#define UINT64CONST(x) (x##UL)
-#elif defined(HAVE_LONG_LONG_INT_64)
-/* We have working support for "long long int", use that */
-
-#ifndef HAVE_INT64
-typedef long long int int64;
-#endif
-#ifndef HAVE_UINT64
-typedef unsigned long long int uint64;
-#endif
-#define INT64CONST(x)  (x##LL)
-#define UINT64CONST(x) (x##ULL)
-#else
-/* neither HAVE_LONG_INT_64 nor HAVE_LONG_LONG_INT_64 */
-#error must have a working 64-bit integer datatype
-#endif
+#define INT64CONST(x)  INT64_C(x)
+#define UINT64CONST(x) UINT64_C(x)
 
 /* snprintf format strings to use for 64-bit integers */
-#define INT64_FORMAT "%" INT64_MODIFIER "d"
-#define UINT64_FORMAT "%" INT64_MODIFIER "u"
+#define INT64_FORMAT "%" PRId64
+#define UINT64_FORMAT "%" PRIu64
+#define OID8_FORMAT "%" PRIu64
 
 /*
  * 128-bit signed and unsigned integers
@@ -559,22 +604,19 @@ typedef unsigned PG_INT128_TYPE uint128
 #endif
 #endif
 
-/*
- * stdint.h limits aren't guaranteed to have compatible types with our fixed
- * width types. So just define our own.
- */
-#define PG_INT8_MIN		(-0x7F-1)
-#define PG_INT8_MAX		(0x7F)
-#define PG_UINT8_MAX	(0xFF)
-#define PG_INT16_MIN	(-0x7FFF-1)
-#define PG_INT16_MAX	(0x7FFF)
-#define PG_UINT16_MAX	(0xFFFF)
-#define PG_INT32_MIN	(-0x7FFFFFFF-1)
-#define PG_INT32_MAX	(0x7FFFFFFF)
-#define PG_UINT32_MAX	(0xFFFFFFFFU)
-#define PG_INT64_MIN	(-INT64CONST(0x7FFFFFFFFFFFFFFF) - 1)
-#define PG_INT64_MAX	INT64CONST(0x7FFFFFFFFFFFFFFF)
-#define PG_UINT64_MAX	UINT64CONST(0xFFFFFFFFFFFFFFFF)
+/* Historical names for limits in <stdint.h>. */
+#define PG_INT8_MIN		INT8_MIN
+#define PG_INT8_MAX		INT8_MAX
+#define PG_UINT8_MAX	UINT8_MAX
+#define PG_INT16_MIN	INT16_MIN
+#define PG_INT16_MAX	INT16_MAX
+#define PG_UINT16_MAX	UINT16_MAX
+#define PG_INT32_MIN	INT32_MIN
+#define PG_INT32_MAX	INT32_MAX
+#define PG_UINT32_MAX	UINT32_MAX
+#define PG_INT64_MIN	INT64_MIN
+#define PG_INT64_MAX	INT64_MAX
+#define PG_UINT64_MAX	UINT64_MAX
 
 /*
  * We now always use int64 timestamps, but keep this symbol defined for the
@@ -613,14 +655,14 @@ typedef signed int Offset;
 typedef float float4;
 typedef double float8;
 
-#ifdef USE_FLOAT8_BYVAL
+/*
+ * float8, int8, and related datatypes are now always pass-by-value.
+ * We keep this symbol to avoid breaking extension code that may use it.
+ */
 #define FLOAT8PASSBYVAL true
-#else
-#define FLOAT8PASSBYVAL false
-#endif
 
 /*
- * Oid, RegProcedure, TransactionId, SubTransactionId, MultiXactId,
+ * Oid, Oid8, RegProcedure, TransactionId, SubTransactionId, MultiXactId,
  * CommandId
  */
 
@@ -645,16 +687,21 @@ typedef uint32 SubTransactionId;
 /* MultiXactId must be equivalent to TransactionId, to fit in t_xmax */
 typedef TransactionId MultiXactId;
 
-typedef uint32 MultiXactOffset;
+typedef uint64 MultiXactOffset;
 
 typedef uint32 CommandId;
 
 #define FirstCommandId	((CommandId) 0)
 #define InvalidCommandId	(~(CommandId)0)
 
+/* 8-byte Object ID */
+typedef uint64 Oid8;
+
+#define InvalidOid8		((Oid8) 0)
+#define OID8_MAX	UINT64_MAX
 
 /* ----------------
- *		Variable-length datatypes all share the 'struct varlena' header.
+ *		Variable-length datatypes all share the 'varlena' header.
  *
  * NOTE: for TOASTable types, this is an oversimplification, since the value
  * may be compressed or moved out-of-line.  However datatype-specific routines
@@ -664,14 +711,14 @@ typedef uint32 CommandId;
  * representation is no longer convenient.  It's recommended that code always
  * use macros VARDATA_ANY, VARSIZE_ANY, VARSIZE_ANY_EXHDR, VARDATA, VARSIZE,
  * and SET_VARSIZE instead of relying on direct mentions of the struct fields.
- * See postgres.h for details of the TOASTed form.
+ * See varatt.h for details of the TOASTed form.
  * ----------------
  */
-struct varlena
+typedef struct varlena
 {
 	char		vl_len_[4];		/* Do not touch this field directly! */
 	char		vl_dat[FLEXIBLE_ARRAY_MEMBER];	/* Data content is here */
-};
+} varlena;
 
 #define VARHDRSZ		((int32) sizeof(int32))
 
@@ -680,10 +727,10 @@ struct varlena
  * There is no terminating null or anything like that --- the data length is
  * always VARSIZE_ANY_EXHDR(ptr).
  */
-typedef struct varlena bytea;
-typedef struct varlena text;
-typedef struct varlena BpChar;	/* blank-padded char, ie SQL char(n) */
-typedef struct varlena VarChar; /* var-length char, ie SQL varchar(n) */
+typedef varlena bytea;
+typedef varlena text;
+typedef varlena BpChar;			/* blank-padded char, ie SQL char(n) */
+typedef varlena VarChar;		/* var-length char, ie SQL varchar(n) */
 
 /*
  * Specialized array types.  These are physically laid out just the same
@@ -741,12 +788,6 @@ typedef NameData *Name;
 #define BoolIsValid(boolean)	((boolean) == false || (boolean) == true)
 
 /*
- * PointerIsValid
- *		True iff pointer is valid.
- */
-#define PointerIsValid(pointer) ((const void*)(pointer) != NULL)
-
-/*
  * PointerIsAligned
  *		True iff pointer is properly aligned to point to the given type.
  */
@@ -757,6 +798,8 @@ typedef NameData *Name;
 		((void *)((char *) base + offset))
 
 #define OidIsValid(objectId)  ((bool) ((objectId) != InvalidOid))
+
+#define Oid8IsValid(objectId)  ((bool) ((objectId) != InvalidOid8))
 
 #define RegProcedureIsValid(p)	OidIsValid(p)
 
@@ -790,7 +833,7 @@ typedef NameData *Name;
 
 #define SHORTALIGN(LEN)			TYPEALIGN(ALIGNOF_SHORT, (LEN))
 #define INTALIGN(LEN)			TYPEALIGN(ALIGNOF_INT, (LEN))
-#define LONGALIGN(LEN)			TYPEALIGN(ALIGNOF_LONG, (LEN))
+#define INT64ALIGN(LEN)			TYPEALIGN(ALIGNOF_INT64_T, (LEN))
 #define DOUBLEALIGN(LEN)		TYPEALIGN(ALIGNOF_DOUBLE, (LEN))
 #define MAXALIGN(LEN)			TYPEALIGN(MAXIMUM_ALIGNOF, (LEN))
 /* MAXALIGN covers only built-in types, not buffers */
@@ -802,7 +845,7 @@ typedef NameData *Name;
 
 #define SHORTALIGN_DOWN(LEN)	TYPEALIGN_DOWN(ALIGNOF_SHORT, (LEN))
 #define INTALIGN_DOWN(LEN)		TYPEALIGN_DOWN(ALIGNOF_INT, (LEN))
-#define LONGALIGN_DOWN(LEN)		TYPEALIGN_DOWN(ALIGNOF_LONG, (LEN))
+#define INT64ALIGN_DOWN(LEN)	TYPEALIGN_DOWN(ALIGNOF_INT64_T, (LEN))
 #define DOUBLEALIGN_DOWN(LEN)	TYPEALIGN_DOWN(ALIGNOF_DOUBLE, (LEN))
 #define MAXALIGN_DOWN(LEN)		TYPEALIGN_DOWN(MAXIMUM_ALIGNOF, (LEN))
 #define BUFFERALIGN_DOWN(LEN)	TYPEALIGN_DOWN(ALIGNOF_BUFFER, (LEN))
@@ -844,7 +887,6 @@ typedef NameData *Name;
 
 #elif defined(FRONTEND)
 
-#include <assert.h>
 #define Assert(p) assert(p)
 #define AssertMacro(p)	((void) assert(p))
 
@@ -885,8 +927,8 @@ typedef NameData *Name;
  * we should declare it as long as !FRONTEND.
  */
 #ifndef FRONTEND
-extern void ExceptionalCondition(const char *conditionName,
-								 const char *fileName, int lineNumber) pg_attribute_noreturn();
+pg_noreturn extern void ExceptionalCondition(const char *conditionName,
+											 const char *fileName, int lineNumber);
 #endif
 
 /*
@@ -894,78 +936,67 @@ extern void ExceptionalCondition(const char *conditionName,
  *
  * If the "condition" (a compile-time-constant expression) evaluates to false,
  * throw a compile error using the "errmessage" (a string literal).
- *
- * C11 has _Static_assert(), and most C99 compilers already support that.  For
- * portability, we wrap it into StaticAssertDecl().  _Static_assert() is a
- * "declaration", and so it must be placed where for example a variable
+ */
+
+/*
+ * We require C11 and C++11, so static_assert() is expected to be there.
+ * StaticAssertDecl() was previously used for portability, but it's now just a
+ * plain wrapper and doesn't need to be used in new code.  static_assert() is
+ * a "declaration", and so it must be placed where for example a variable
  * declaration would be valid.  As long as we compile with
  * -Wno-declaration-after-statement, that also means it cannot be placed after
- * statements in a function.  Macros StaticAssertStmt() and StaticAssertExpr()
- * make it safe to use as a statement or in an expression, respectively.
+ * statements in a function.
+ */
+#define StaticAssertDecl(condition, errmessage) \
+	static_assert(condition, errmessage)
+
+/*
+ * StaticAssertStmt() was previously used to make static assertions work as a
+ * statement, but its use is now deprecated.
+ */
+#define StaticAssertStmt(condition, errmessage) \
+	do { static_assert(condition, errmessage); } while(0)
+
+/*
+ * StaticAssertExpr() is for use in an expression.
  *
- * For compilers without _Static_assert(), we fall back on a kluge that
- * assumes the compiler will complain about a negative width for a struct
+ * For compilers without GCC statement expressions, we fall back on a kluge
+ * that assumes the compiler will complain about a negative width for a struct
  * bit-field.  This will not include a helpful error message, but it beats not
  * getting an error at all.
  */
-#ifndef __cplusplus
-#ifdef HAVE__STATIC_ASSERT
-#define StaticAssertDecl(condition, errmessage) \
-	_Static_assert(condition, errmessage)
-#define StaticAssertStmt(condition, errmessage) \
-	do { _Static_assert(condition, errmessage); } while(0)
+#ifdef HAVE_STATEMENT_EXPRESSIONS
 #define StaticAssertExpr(condition, errmessage) \
-	((void) ({ StaticAssertStmt(condition, errmessage); true; }))
-#else							/* !HAVE__STATIC_ASSERT */
-#define StaticAssertDecl(condition, errmessage) \
-	extern void static_assert_func(int static_assert_failure[(condition) ? 1 : -1])
-#define StaticAssertStmt(condition, errmessage) \
+	((void) ({ static_assert(condition, errmessage); true; }))
+#else
+#define StaticAssertExpr(condition, errmessage) \
 	((void) sizeof(struct { int static_assert_failure : (condition) ? 1 : -1; }))
-#define StaticAssertExpr(condition, errmessage) \
-	StaticAssertStmt(condition, errmessage)
-#endif							/* HAVE__STATIC_ASSERT */
-#else							/* C++ */
-#if defined(__cpp_static_assert) && __cpp_static_assert >= 200410
-#define StaticAssertDecl(condition, errmessage) \
-	static_assert(condition, errmessage)
-#define StaticAssertStmt(condition, errmessage) \
-	static_assert(condition, errmessage)
-#define StaticAssertExpr(condition, errmessage) \
-	({ static_assert(condition, errmessage); })
-#else							/* !__cpp_static_assert */
-#define StaticAssertDecl(condition, errmessage) \
-	extern void static_assert_func(int static_assert_failure[(condition) ? 1 : -1])
-#define StaticAssertStmt(condition, errmessage) \
-	do { struct static_assert_struct { int static_assert_failure : (condition) ? 1 : -1; }; } while(0)
-#define StaticAssertExpr(condition, errmessage) \
-	((void) ({ StaticAssertStmt(condition, errmessage); }))
-#endif							/* __cpp_static_assert */
-#endif							/* C++ */
+#endif							/* HAVE_STATEMENT_EXPRESSIONS */
 
 
 /*
  * Compile-time checks that a variable (or expression) has the specified type.
  *
- * AssertVariableIsOfType() can be used as a statement.
- * AssertVariableIsOfTypeMacro() is intended for use in macros, eg
- *		#define foo(x) (AssertVariableIsOfTypeMacro(x, int), bar(x))
+ * StaticAssertVariableIsOfType() can be used as a declaration.
+ * StaticAssertVariableIsOfTypeMacro() is intended for use in macros, eg
+ *		#define foo(x) (StaticAssertVariableIsOfTypeMacro(x, int), bar(x))
  *
  * If we don't have __builtin_types_compatible_p, we can still assert that
  * the types have the same size.  This is far from ideal (especially on 32-bit
  * platforms) but it provides at least some coverage.
  */
 #ifdef HAVE__BUILTIN_TYPES_COMPATIBLE_P
-#define AssertVariableIsOfType(varname, typename) \
-	StaticAssertStmt(__builtin_types_compatible_p(__typeof__(varname), typename), \
+#define StaticAssertVariableIsOfType(varname, typename) \
+	StaticAssertDecl(__builtin_types_compatible_p(__typeof__(varname), typename), \
 	CppAsString(varname) " does not have type " CppAsString(typename))
-#define AssertVariableIsOfTypeMacro(varname, typename) \
+#define StaticAssertVariableIsOfTypeMacro(varname, typename) \
 	(StaticAssertExpr(__builtin_types_compatible_p(__typeof__(varname), typename), \
 	 CppAsString(varname) " does not have type " CppAsString(typename)))
 #else							/* !HAVE__BUILTIN_TYPES_COMPATIBLE_P */
-#define AssertVariableIsOfType(varname, typename) \
-	StaticAssertStmt(sizeof(varname) == sizeof(typename), \
+#define StaticAssertVariableIsOfType(varname, typename) \
+	StaticAssertDecl(sizeof(varname) == sizeof(typename), \
 	CppAsString(varname) " does not have type " CppAsString(typename))
-#define AssertVariableIsOfTypeMacro(varname, typename) \
+#define StaticAssertVariableIsOfTypeMacro(varname, typename) \
 	(StaticAssertExpr(sizeof(varname) == sizeof(typename), \
 	 CppAsString(varname) " does not have type " CppAsString(typename)))
 #endif							/* HAVE__BUILTIN_TYPES_COMPATIBLE_P */
@@ -988,29 +1019,29 @@ extern void ExceptionalCondition(const char *conditionName,
 #define Min(x, y)		((x) < (y) ? (x) : (y))
 
 
-/* Get a bit mask of the bits set in non-long aligned addresses */
-#define LONG_ALIGN_MASK (sizeof(long) - 1)
+/* Get a bit mask of the bits set in non-size_t aligned addresses */
+#define SIZE_T_ALIGN_MASK (sizeof(size_t) - 1)
 
 /*
  * MemSet
  *	Exactly the same as standard library function memset(), but considerably
- *	faster for zeroing small word-aligned structures (such as parsetree nodes).
- *	This has to be a macro because the main point is to avoid function-call
- *	overhead.   However, we have also found that the loop is faster than
- *	native libc memset() on some platforms, even those with assembler
- *	memset() functions.  More research needs to be done, perhaps with
- *	MEMSET_LOOP_LIMIT tests in configure.
+ *	faster for zeroing small size_t-aligned structures (such as parsetree
+ *	nodes).  This has to be a macro because the main point is to avoid
+ *	function-call overhead.  However, we have also found that the loop is
+ *	faster than native libc memset() on some platforms, even those with
+ *	assembler memset() functions.  More research needs to be done, perhaps
+ *	with MEMSET_LOOP_LIMIT tests in configure.
  */
 #define MemSet(start, val, len) \
 	do \
 	{ \
-		/* must be void* because we don't know if it is integer aligned yet */ \
+		/* must be void* because we don't know if it is size_t aligned yet */ \
 		void   *_vstart = (void *) (start); \
 		int		_val = (val); \
 		Size	_len = (len); \
 \
-		if ((((uintptr_t) _vstart) & LONG_ALIGN_MASK) == 0 && \
-			(_len & LONG_ALIGN_MASK) == 0 && \
+		if ((((uintptr_t) _vstart) & SIZE_T_ALIGN_MASK) == 0 && \
+			(_len & SIZE_T_ALIGN_MASK) == 0 && \
 			_val == 0 && \
 			_len <= MEMSET_LOOP_LIMIT && \
 			/* \
@@ -1019,8 +1050,8 @@ extern void ExceptionalCondition(const char *conditionName,
 			 */ \
 			MEMSET_LOOP_LIMIT != 0) \
 		{ \
-			long *_start = (long *) _vstart; \
-			long *_stop = (long *) ((char *) _start + _len); \
+			size_t *_start = (size_t *) _vstart; \
+			size_t *_stop = (size_t *) ((char *) _start + _len); \
 			while (_start < _stop) \
 				*_start++ = 0; \
 		} \
@@ -1030,23 +1061,23 @@ extern void ExceptionalCondition(const char *conditionName,
 
 /*
  * MemSetAligned is the same as MemSet except it omits the test to see if
- * "start" is word-aligned.  This is okay to use if the caller knows a-priori
- * that the pointer is suitably aligned (typically, because he just got it
- * from palloc(), which always delivers a max-aligned pointer).
+ * "start" is size_t-aligned.  This is okay to use if the caller knows
+ * a-priori that the pointer is suitably aligned (typically, because he just
+ * got it from palloc(), which always delivers a max-aligned pointer).
  */
 #define MemSetAligned(start, val, len) \
 	do \
 	{ \
-		long   *_start = (long *) (start); \
+		size_t *_start = (size_t *) (start); \
 		int		_val = (val); \
 		Size	_len = (len); \
 \
-		if ((_len & LONG_ALIGN_MASK) == 0 && \
+		if ((_len & SIZE_T_ALIGN_MASK) == 0 && \
 			_val == 0 && \
 			_len <= MEMSET_LOOP_LIMIT && \
 			MEMSET_LOOP_LIMIT != 0) \
 		{ \
-			long *_stop = (long *) ((char *) _start + _len); \
+			size_t *_stop = (size_t *) ((char *) _start + _len); \
 			while (_start < _stop) \
 				*_start++ = 0; \
 		} \
@@ -1054,30 +1085,6 @@ extern void ExceptionalCondition(const char *conditionName,
 			memset(_start, _val, _len); \
 	} while (0)
 
-
-/*
- * MemSetTest/MemSetLoop are a variant version that allow all the tests in
- * MemSet to be done at compile time in cases where "val" and "len" are
- * constants *and* we know the "start" pointer must be word-aligned.
- * If MemSetTest succeeds, then it is okay to use MemSetLoop, otherwise use
- * MemSetAligned.  Beware of multiple evaluations of the arguments when using
- * this approach.
- */
-#define MemSetTest(val, len) \
-	( ((len) & LONG_ALIGN_MASK) == 0 && \
-	(len) <= MEMSET_LOOP_LIMIT && \
-	MEMSET_LOOP_LIMIT != 0 && \
-	(val) == 0 )
-
-#define MemSetLoop(start, val, len) \
-	do \
-	{ \
-		long * _start = (long *) (start); \
-		long * _stop = (long *) ((char *) _start + (Size) (len)); \
-	\
-		while (_start < _stop) \
-			*_start++ = 0; \
-	} while (0)
 
 /*
  * Macros for range-checking float values before converting to integer.
@@ -1121,16 +1128,20 @@ extern void ExceptionalCondition(const char *conditionName,
  * Use this, not "char buf[BLCKSZ]", to declare a field or local variable
  * holding a page buffer, if that page might be accessed as a page.  Otherwise
  * the variable might be under-aligned, causing problems on alignment-picky
- * hardware.  We include both "double" and "int64" in the union to ensure that
- * the compiler knows the value must be MAXALIGN'ed (cf. configure's
- * computation of MAXIMUM_ALIGNOF).
+ * hardware.
  */
-typedef union PGAlignedBlock
+typedef struct PGAlignedBlock
 {
-	char		data[BLCKSZ];
-	double		force_align_d;
-	int64		force_align_i64;
+	alignas(MAXIMUM_ALIGNOF) char data[BLCKSZ];
 } PGAlignedBlock;
+
+/*
+ * alignas with extended alignments is buggy in g++ < 9.  As a simple
+ * workaround, we disable these definitions in that case.
+ *
+ * <https://gcc.gnu.org/bugzilla/show_bug.cgi?id=89357>
+ */
+#if !(defined(__cplusplus) && defined(__GNUC__) && !defined(__clang__) && __GNUC__ < 9)
 
 /*
  * Use this to declare a field or local variable holding a page buffer, if that
@@ -1140,26 +1151,24 @@ typedef union PGAlignedBlock
  * for I/O in general, but may be strictly required on some platforms when
  * using direct I/O.
  */
-typedef union PGIOAlignedBlock
+typedef struct PGIOAlignedBlock
 {
-#ifdef pg_attribute_aligned
-	pg_attribute_aligned(PG_IO_ALIGN_SIZE)
-#endif
-	char		data[BLCKSZ];
-	double		force_align_d;
-	int64		force_align_i64;
+	alignas(PG_IO_ALIGN_SIZE) char data[BLCKSZ];
 } PGIOAlignedBlock;
 
 /* Same, but for an XLOG_BLCKSZ-sized buffer */
-typedef union PGAlignedXLogBlock
+typedef struct PGAlignedXLogBlock
 {
-#ifdef pg_attribute_aligned
-	pg_attribute_aligned(PG_IO_ALIGN_SIZE)
-#endif
-	char		data[XLOG_BLCKSZ];
-	double		force_align_d;
-	int64		force_align_i64;
+	alignas(PG_IO_ALIGN_SIZE) char data[XLOG_BLCKSZ];
 } PGAlignedXLogBlock;
+
+#else							/* (g++ < 9) */
+
+/* Allow these types to be used as abstract types when using old g++ */
+typedef struct PGIOAlignedBlock PGIOAlignedBlock;
+typedef struct PGAlignedXLogBlock PGAlignedXLogBlock;
+
+#endif							/* !(g++ < 9) */
 
 /* msb for char */
 #define HIGHBIT					(0x80)
@@ -1240,7 +1249,10 @@ typedef union PGAlignedXLogBlock
  * Note that this only works in function scope, not for global variables (it'd
  * be nice, but not trivial, to improve that).
  */
-#if defined(HAVE__BUILTIN_TYPES_COMPATIBLE_P)
+#if defined(__cplusplus)
+#define unconstify(underlying_type, expr) const_cast<underlying_type>(expr)
+#define unvolatize(underlying_type, expr) const_cast<underlying_type>(expr)
+#elif defined(HAVE__BUILTIN_TYPES_COMPATIBLE_P)
 #define unconstify(underlying_type, expr) \
 	(StaticAssertExpr(__builtin_types_compatible_p(__typeof(expr), const underlying_type), \
 					  "wrong cast"), \
@@ -1254,6 +1266,25 @@ typedef union PGAlignedXLogBlock
 	((underlying_type) (expr))
 #define unvolatize(underlying_type, expr) \
 	((underlying_type) (expr))
+#endif
+
+/*
+ * SSE2 instructions are part of the spec for the 64-bit x86 ISA. We assume
+ * that compilers targeting this architecture understand SSE2 intrinsics.
+ */
+#if (defined(__x86_64__) || defined(_M_AMD64))
+#define USE_SSE2
+
+/*
+ * We use the Neon instructions if the compiler provides access to them (as
+ * indicated by __ARM_NEON) and we are on aarch64.  While Neon support is
+ * technically optional for aarch64, it appears that all available 64-bit
+ * hardware does have it.  Neon exists in some 32-bit hardware too, but we
+ * could not realistically use it there without a run-time check, which seems
+ * not worth the trouble for now.
+ */
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+#define USE_NEON
 #endif
 
 /* ----------------------------------------------------------------
@@ -1290,7 +1321,7 @@ typedef union PGAlignedXLogBlock
  */
 
 #if !HAVE_DECL_FDATASYNC
-extern int	fdatasync(int fildes);
+extern int	fdatasync(int fd);
 #endif
 
 /*
@@ -1298,21 +1329,25 @@ extern int	fdatasync(int fildes);
  * definition of int64.  (For the naming, compare that POSIX has
  * strtoimax()/strtoumax() which return intmax_t/uintmax_t.)
  */
-#ifdef HAVE_LONG_INT_64
+#if SIZEOF_LONG == 8
 #define strtoi64(str, endptr, base) ((int64) strtol(str, endptr, base))
 #define strtou64(str, endptr, base) ((uint64) strtoul(str, endptr, base))
-#else
+#elif SIZEOF_LONG_LONG == 8
 #define strtoi64(str, endptr, base) ((int64) strtoll(str, endptr, base))
 #define strtou64(str, endptr, base) ((uint64) strtoull(str, endptr, base))
+#else
+#error "cannot find integer type of the same size as int64_t"
 #endif
 
 /*
  * Similarly, wrappers around labs()/llabs() matching our int64.
  */
-#ifdef HAVE_LONG_INT_64
-#define i64abs(i) labs(i)
+#if SIZEOF_LONG == 8
+#define i64abs(i) ((int64) labs(i))
+#elif SIZEOF_LONG_LONG == 8
+#define i64abs(i) ((int64) llabs(i))
 #else
-#define i64abs(i) llabs(i)
+#error "cannot find integer type of the same size as int64_t"
 #endif
 
 /*
@@ -1373,5 +1408,30 @@ typedef intptr_t sigjmp_buf[5];
 
 /* /port compatibility functions */
 #include "port.h"
+
+/*
+ * char16_t and char32_t
+ *      Unicode code points.
+ *
+ * uchar.h should always be available in C11, but it's not available on
+ * Mac. However, these types are keywords in C++11, so when using C++, we
+ * can't redefine the types.
+ *
+ * XXX: when uchar.h is available everywhere, we can remove this check and
+ * just include uchar.h unconditionally.
+ *
+ * XXX: this section is out of place because uchar.h needs to be included
+ * after port.h, due to an interaction with win32_port.h in some cases.
+ */
+#ifdef HAVE_UCHAR_H
+#include <uchar.h>
+#else
+#ifndef __cplusplus
+typedef uint16_t char16_t;
+typedef uint32_t char32_t;
+#endif
+#endif
+
+/* IWYU pragma: end_exports */
 
 #endif							/* C_H */

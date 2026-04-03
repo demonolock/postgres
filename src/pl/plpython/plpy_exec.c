@@ -9,6 +9,7 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
+#include "commands/event_trigger.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "funcapi.h"
@@ -17,11 +18,9 @@
 #include "plpy_main.h"
 #include "plpy_procedure.h"
 #include "plpy_subxactobject.h"
-#include "plpython.h"
-#include "utils/builtins.h"
-#include "utils/lsyscache.h"
+#include "plpy_util.h"
+#include "utils/fmgrprotos.h"
 #include "utils/rel.h"
-#include "utils/typcache.h"
 
 /* saved state for a set-returning function */
 typedef struct PLySRFState
@@ -82,10 +81,10 @@ PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedure *proc)
 										   sizeof(PLySRFState));
 				/* Immediately register cleanup callback */
 				srfstate->callback.func = plpython_srf_cleanup_callback;
-				srfstate->callback.arg = (void *) srfstate;
+				srfstate->callback.arg = srfstate;
 				MemoryContextRegisterResetCallback(funcctx->multi_call_memory_ctx,
 												   &srfstate->callback);
-				funcctx->user_fctx = (void *) srfstate;
+				funcctx->user_fctx = srfstate;
 			}
 			/* Every call setup */
 			funcctx = SRF_PERCALL_SETUP();
@@ -231,7 +230,23 @@ PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedure *proc)
 		}
 		else
 		{
-			/* Normal conversion of result */
+			/*
+			 * Normal conversion of result.  However, if the result is of type
+			 * RECORD, we have to set up for that each time through, since it
+			 * might be different from last time.
+			 */
+			if (proc->result.typoid == RECORDOID)
+			{
+				TupleDesc	desc;
+
+				if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("function returning record called in context "
+									"that cannot accept type record")));
+				PLy_output_setup_record(&proc->result, desc, proc);
+			}
+
 			rv = PLy_output_convert(&proc->result, plrv,
 									&fcinfo->isnull);
 		}
@@ -335,6 +350,13 @@ PLy_exec_trigger(FunctionCallInfo fcinfo, PLyProcedure *proc)
 	PLy_output_setup_tuple(&proc->result, rel_descr, proc);
 	PLy_input_setup_tuple(&proc->result_in, rel_descr, proc);
 
+	/*
+	 * If the trigger is called recursively, we must push outer-level
+	 * arguments into the stack.  This must be immediately before the PG_TRY
+	 * to ensure that the corresponding pop happens.
+	 */
+	PLy_global_args_push(proc);
+
 	PG_TRY();
 	{
 		int			rc PG_USED_FOR_ASSERTS_ONLY;
@@ -397,12 +419,54 @@ PLy_exec_trigger(FunctionCallInfo fcinfo, PLyProcedure *proc)
 	}
 	PG_FINALLY();
 	{
+		PLy_global_args_pop(proc);
 		Py_XDECREF(plargs);
 		Py_XDECREF(plrv);
 	}
 	PG_END_TRY();
 
 	return rv;
+}
+
+/*
+ * event trigger subhandler
+ */
+void
+PLy_exec_event_trigger(FunctionCallInfo fcinfo, PLyProcedure *proc)
+{
+	EventTriggerData *tdata;
+	PyObject   *volatile pltdata = NULL;
+
+	Assert(CALLED_AS_EVENT_TRIGGER(fcinfo));
+	tdata = (EventTriggerData *) fcinfo->context;
+
+	PG_TRY();
+	{
+		PyObject   *pltevent,
+				   *plttag;
+
+		pltdata = PyDict_New();
+		if (!pltdata)
+			PLy_elog(ERROR, NULL);
+
+		pltevent = PLyUnicode_FromString(tdata->event);
+		PyDict_SetItemString(pltdata, "event", pltevent);
+		Py_DECREF(pltevent);
+
+		plttag = PLyUnicode_FromString(GetCommandTagName(tdata->tag));
+		PyDict_SetItemString(pltdata, "tag", plttag);
+		Py_DECREF(plttag);
+
+		PLy_procedure_call(proc, "TD", pltdata);
+
+		if (SPI_finish() != SPI_OK_FINISH)
+			elog(ERROR, "SPI_finish() failed");
+	}
+	PG_FINALLY();
+	{
+		Py_XDECREF(pltdata);
+	}
+	PG_END_TRY();
 }
 
 /* helper functions for Python code execution */
@@ -448,21 +512,6 @@ PLy_function_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc)
 				PLy_elog(ERROR, "PyDict_SetItemString() failed, while setting up arguments");
 			arg = NULL;
 		}
-
-		/* Set up output conversion for functions returning RECORD */
-		if (proc->result.typoid == RECORDOID)
-		{
-			TupleDesc	desc;
-
-			if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("function returning record called in context "
-								"that cannot accept type record")));
-
-			/* cache the output conversion functions */
-			PLy_output_setup_record(&proc->result, desc, proc);
-		}
 	}
 	PG_CATCH();
 	{
@@ -500,6 +549,13 @@ PLy_function_save_args(PLyProcedure *proc)
 	/* Fetch the "args" list */
 	result->args = PyDict_GetItemString(proc->globals, "args");
 	Py_XINCREF(result->args);
+
+	/* If it's a trigger, also save "TD" */
+	if (proc->is_trigger == PLPY_TRIGGER)
+	{
+		result->td = PyDict_GetItemString(proc->globals, "TD");
+		Py_XINCREF(result->td);
+	}
 
 	/* Fetch all the named arguments */
 	if (proc->argnames)
@@ -550,6 +606,13 @@ PLy_function_restore_args(PLyProcedure *proc, PLySavedArgs *savedargs)
 		Py_DECREF(savedargs->args);
 	}
 
+	/* Restore the "TD" object, too */
+	if (savedargs->td)
+	{
+		PyDict_SetItemString(proc->globals, "TD", savedargs->td);
+		Py_DECREF(savedargs->td);
+	}
+
 	/* And free the PLySavedArgs struct */
 	pfree(savedargs);
 }
@@ -568,8 +631,9 @@ PLy_function_drop_args(PLySavedArgs *savedargs)
 		Py_XDECREF(savedargs->namedargs[i]);
 	}
 
-	/* Drop ref to the "args" object, too */
+	/* Drop refs to the "args" and "TD" objects, too */
 	Py_XDECREF(savedargs->args);
+	Py_XDECREF(savedargs->td);
 
 	/* And free the PLySavedArgs struct */
 	pfree(savedargs);
@@ -578,9 +642,9 @@ PLy_function_drop_args(PLySavedArgs *savedargs)
 /*
  * Save away any existing arguments for the given procedure, so that we can
  * install new values for a recursive call.  This should be invoked before
- * doing PLy_function_build_args().
+ * doing PLy_function_build_args() or PLy_trigger_build_args().
  *
- * NB: caller must ensure that PLy_global_args_pop gets invoked once, and
+ * NB: callers must ensure that PLy_global_args_pop gets invoked once, and
  * only once, per successful completion of PLy_global_args_push.  Otherwise
  * we'll end up out-of-sync between the actual call stack and the contents
  * of proc->argstack.
@@ -689,7 +753,7 @@ PLy_trigger_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc, HeapTuple *r
 			   *pltrelid,
 			   *plttablename,
 			   *plttableschema,
-			   *pltargs = NULL,
+			   *pltargs,
 			   *pytnew,
 			   *pytold,
 			   *pltdata;
@@ -712,6 +776,11 @@ PLy_trigger_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc, HeapTuple *r
 			Py_DECREF(pltdata);
 			return NULL;
 		}
+	}
+	else
+	{
+		Py_INCREF(Py_None);
+		pltargs = Py_None;
 	}
 
 	PG_TRY();
@@ -856,7 +925,7 @@ PLy_trigger_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc, HeapTuple *r
 			PyObject   *pltarg;
 
 			/* pltargs should have been allocated before the PG_TRY block. */
-			Assert(pltargs);
+			Assert(pltargs && pltargs != Py_None);
 
 			for (i = 0; i < tdata->tg_trigger->tgnargs; i++)
 			{
@@ -870,8 +939,7 @@ PLy_trigger_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc, HeapTuple *r
 		}
 		else
 		{
-			Py_INCREF(Py_None);
-			pltargs = Py_None;
+			Assert(pltargs == Py_None);
 		}
 		PyDict_SetItemString(pltdata, "args", pltargs);
 		Py_DECREF(pltargs);
@@ -978,7 +1046,7 @@ PLy_modify_tuple(PLyProcedure *proc, PyObject *pltd, TriggerData *tdata,
 			Py_INCREF(plval);
 
 			/* We assume proc->result is set up to convert tuples properly */
-			att = &proc->result.u.tuple.atts[attn - 1];
+			att = &proc->result.tuple.atts[attn - 1];
 
 			modvalues[attn - 1] = PLy_output_convert(att,
 													 plval,
@@ -1040,13 +1108,7 @@ PLy_procedure_call(PLyProcedure *proc, const char *kargs, PyObject *vargs)
 
 	PG_TRY();
 	{
-#if PY_VERSION_HEX >= 0x03020000
-		rv = PyEval_EvalCode(proc->code,
-							 proc->globals, proc->globals);
-#else
-		rv = PyEval_EvalCode((PyCodeObject *) proc->code,
-							 proc->globals, proc->globals);
-#endif
+		rv = PyEval_EvalCode(proc->code, proc->globals, proc->globals);
 
 		/*
 		 * Since plpy will only let you close subtransactions that you

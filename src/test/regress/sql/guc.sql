@@ -2,12 +2,24 @@
 -- we can't rely on any specific default value of vacuum_cost_delay
 SHOW datestyle;
 
+-- Check output style of CamelCase enum options
+SET intervalstyle to 'asd';
+
 -- SET to some nondefault value
 SET vacuum_cost_delay TO 40;
 SET datestyle = 'ISO, YMD';
 SHOW vacuum_cost_delay;
 SHOW datestyle;
 SELECT '2006-08-13 12:34:56'::timestamptz;
+
+-- Check handling of list GUCs
+SET search_path = 'pg_catalog', Foo, 'Bar', '';
+SHOW search_path;
+SET search_path = null;  -- means empty list
+SHOW search_path;
+SET search_path = null, null;  -- syntax error
+SET enable_seqscan = null;  -- error
+RESET search_path;
 
 -- SET LOCAL has no effect outside of a transaction
 SET LOCAL vacuum_cost_delay TO 50;
@@ -221,6 +233,28 @@ select current_schemas(false);
 reset search_path;
 
 --
+-- Test parsing of log_min_messages
+--
+
+SET log_min_messages TO foo;  -- fail
+SET log_min_messages TO fatal;
+SHOW log_min_messages;
+SET log_min_messages TO 'fatal';
+SHOW log_min_messages;
+SET log_min_messages TO 'checkpointer:debug2, autovacuum:debug1';  -- fail
+SET log_min_messages TO 'debug1, backend:error, fatal';  -- fail
+SET log_min_messages TO 'backend:error, debug1, backend:warning';  -- fail
+SET log_min_messages TO 'backend:error, foo:fatal, archiver:debug1';  -- fail
+SET log_min_messages TO 'backend:error, checkpointer:bar, archiver:debug1';  -- fail
+SET log_min_messages TO 'backend:error, checkpointer:debug3, fatal, archiver:debug2, autovacuum:debug1, walsender:debug3';
+SHOW log_min_messages;
+SET log_min_messages TO 'warning, autovacuum:debug1';
+SHOW log_min_messages;
+SET log_min_messages TO 'autovacuum:debug1, warning';
+SHOW log_min_messages;
+RESET log_min_messages;
+
+--
 -- Tests for function-local GUC settings
 --
 
@@ -318,6 +352,18 @@ reset check_function_bodies;
 set default_with_oids to f;
 -- Should not allow to set it to true.
 set default_with_oids to t;
+
+-- Test that disabling track_activities disables query ID reporting in
+-- pg_stat_activity.
+SET compute_query_id = on;
+SET track_activities = on;
+SELECT query_id IS NOT NULL AS qid_set FROM pg_stat_activity
+  WHERE pid = pg_backend_pid();
+SET track_activities = off;
+SELECT query_id IS NOT NULL AS qid_set FROM pg_stat_activity
+  WHERE pid = pg_backend_pid();
+RESET track_activities;
+RESET compute_query_id;
 
 -- Test GUC categories and flag patterns
 SELECT pg_settings_get_flags(NULL);

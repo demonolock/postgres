@@ -4,7 +4,7 @@
  *	  Declarations for XML data type support.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/xml.h
@@ -20,20 +20,20 @@
 #include "nodes/execnodes.h"
 #include "nodes/primnodes.h"
 
-typedef struct varlena xmltype;
+typedef varlena xmltype;
 
 typedef enum
 {
 	XML_STANDALONE_YES,
 	XML_STANDALONE_NO,
 	XML_STANDALONE_NO_VALUE,
-	XML_STANDALONE_OMITTED
+	XML_STANDALONE_OMITTED,
 }			XmlStandaloneType;
 
 typedef enum
 {
 	XMLBINARY_BASE64,
-	XMLBINARY_HEX
+	XMLBINARY_HEX,
 }			XmlBinaryType;
 
 typedef enum
@@ -41,7 +41,7 @@ typedef enum
 	PG_XML_STRICTNESS_LEGACY,	/* ignore errors unless function result
 								 * indicates error condition */
 	PG_XML_STRICTNESS_WELLFORMED,	/* ignore non-parser messages */
-	PG_XML_STRICTNESS_ALL		/* report all notices/warnings/errors */
+	PG_XML_STRICTNESS_ALL,		/* report all notices/warnings/errors */
 } PgXmlStrictness;
 
 /* struct PgXmlErrorContext is private to xml.c */
@@ -71,8 +71,8 @@ extern void xml_ereport(PgXmlErrorContext *errcxt, int level, int sqlcode,
 
 extern xmltype *xmlconcat(List *args);
 extern xmltype *xmlelement(XmlExpr *xexpr,
-						   Datum *named_argvalue, bool *named_argnull,
-						   Datum *argvalue, bool *argnull);
+						   const Datum *named_argvalue, const bool *named_argnull,
+						   const Datum *argvalue, const bool *argnull);
 extern xmltype *xmlparse(text *data, XmlOptionType xmloption_arg, bool preserve_whitespace);
 extern xmltype *xmlpi(const char *target, text *arg, bool arg_is_null, bool *result_is_null);
 extern xmltype *xmlroot(xmltype *data, text *version, int standalone);

@@ -11,7 +11,7 @@
  *		can't be inside more-complex expressions.  If that'd otherwise be
  *		the case, the planner adds additional ProjectSet nodes.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -26,7 +26,6 @@
 #include "executor/nodeProjectSet.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
-#include "utils/memutils.h"
 
 
 static TupleTableSlot *ExecProjectSRF(ProjectSetState *node, bool continuing);
@@ -73,19 +72,21 @@ ExecProjectSet(PlanState *pstate)
 	}
 
 	/*
-	 * Reset argument context to free any expression evaluation storage
-	 * allocated in the previous tuple cycle.  Note this can't happen until
-	 * we're done projecting out tuples from a scan tuple, as ValuePerCall
-	 * functions are allowed to reference the arguments for each returned
-	 * tuple.
-	 */
-	MemoryContextReset(node->argcontext);
-
-	/*
 	 * Get another input tuple and project SRFs from it.
 	 */
 	for (;;)
 	{
+		/*
+		 * Reset argument context to free any expression evaluation storage
+		 * allocated in the previous tuple cycle.  Note this can't happen
+		 * until we're done projecting out tuples from a scan tuple, as
+		 * ValuePerCall functions are allowed to reference the arguments for
+		 * each returned tuple.  However, if we loop around after finding that
+		 * no rows are produced from a scan tuple, we should reset, to avoid
+		 * leaking memory when many successive scan tuples produce no rows.
+		 */
+		MemoryContextReset(node->argcontext);
+
 		/*
 		 * Retrieve tuples from the outer plan until there are no more.
 		 */
@@ -111,6 +112,12 @@ ExecProjectSet(PlanState *pstate)
 		 */
 		if (resultSlot)
 			return resultSlot;
+
+		/*
+		 * When we do loop back, we'd better reset the econtext again, just in
+		 * case the SRF leaked some memory there.
+		 */
+		ResetExprContext(econtext);
 	}
 
 	return NULL;
@@ -260,10 +267,8 @@ ExecInitProjectSet(ProjectSet *node, EState *estate, int eflags)
 
 	/* Create workspace for per-tlist-entry expr state & SRF-is-done state */
 	state->nelems = list_length(node->plan.targetlist);
-	state->elems = (Node **)
-		palloc(sizeof(Node *) * state->nelems);
-	state->elemdone = (ExprDoneCond *)
-		palloc(sizeof(ExprDoneCond) * state->nelems);
+	state->elems = palloc_array(Node *, state->nelems);
+	state->elemdone = palloc_array(ExprDoneCond, state->nelems);
 
 	/*
 	 * Build expressions to evaluate targetlist.  We can't use
@@ -320,16 +325,6 @@ ExecInitProjectSet(ProjectSet *node, EState *estate, int eflags)
 void
 ExecEndProjectSet(ProjectSetState *node)
 {
-	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ps);
-
-	/*
-	 * clean out the tuple table
-	 */
-	ExecClearTuple(node->ps.ps_ResultTupleSlot);
-
 	/*
 	 * shut down subplans
 	 */

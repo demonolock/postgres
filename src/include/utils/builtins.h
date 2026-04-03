@@ -4,7 +4,7 @@
  *	  Declarations for operations on built-in types.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/builtins.h
@@ -28,6 +28,9 @@ extern bool parse_bool_with_len(const char *value, size_t len, bool *result);
 /* domains.c */
 extern void domain_check(Datum value, bool isnull, Oid domainType,
 						 void **extra, MemoryContext mcxt);
+extern bool domain_check_safe(Datum value, bool isnull, Oid domainType,
+							  void **extra, MemoryContext mcxt,
+							  Node *escontext);
 extern int	errdatatype(Oid datatypeOid);
 extern int	errdomainconstraint(Oid datatypeOid, const char *conname);
 
@@ -65,6 +68,7 @@ extern char *pg_ultostr(char *str, uint32 value);
 
 /* oid.c */
 extern oidvector *buildoidvector(const Oid *oids, int n);
+extern void check_valid_oidvector(const oidvector *oidArray);
 extern Oid	oidparse(Node *node);
 extern int	oid_cmp(const void *p1, const void *p2);
 
@@ -77,7 +81,7 @@ extern PGDLLIMPORT bool quote_all_identifiers;
 extern const char *quote_identifier(const char *ident);
 extern char *quote_qualified_identifier(const char *qualifier,
 										const char *ident);
-extern void generate_operator_clause(fmStringInfo buf,
+extern void generate_operator_clause(StringInfo buf,
 									 const char *leftop, Oid leftoptype,
 									 Oid opoid,
 									 const char *rightop, Oid rightoptype);

@@ -10,7 +10,7 @@
  * analyze.c and related files.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -21,8 +21,8 @@
 
 #include "postgres.h"
 
-#include "mb/pg_wchar.h"
 #include "gramparse.h"
+#include "mb/pg_wchar.h"
 #include "parser/parser.h"
 #include "parser/scansup.h"
 
@@ -56,12 +56,12 @@ raw_parser(const char *str, RawParseMode mode)
 	{
 		/* this array is indexed by RawParseMode enum */
 		static const int mode_token[] = {
-			0,					/* RAW_PARSE_DEFAULT */
-			MODE_TYPE_NAME,		/* RAW_PARSE_TYPE_NAME */
-			MODE_PLPGSQL_EXPR,	/* RAW_PARSE_PLPGSQL_EXPR */
-			MODE_PLPGSQL_ASSIGN1,	/* RAW_PARSE_PLPGSQL_ASSIGN1 */
-			MODE_PLPGSQL_ASSIGN2,	/* RAW_PARSE_PLPGSQL_ASSIGN2 */
-			MODE_PLPGSQL_ASSIGN3	/* RAW_PARSE_PLPGSQL_ASSIGN3 */
+			[RAW_PARSE_DEFAULT] = 0,
+			[RAW_PARSE_TYPE_NAME] = MODE_TYPE_NAME,
+			[RAW_PARSE_PLPGSQL_EXPR] = MODE_PLPGSQL_EXPR,
+			[RAW_PARSE_PLPGSQL_ASSIGN1] = MODE_PLPGSQL_ASSIGN1,
+			[RAW_PARSE_PLPGSQL_ASSIGN2] = MODE_PLPGSQL_ASSIGN2,
+			[RAW_PARSE_PLPGSQL_ASSIGN3] = MODE_PLPGSQL_ASSIGN3,
 		};
 
 		yyextra.have_lookahead = true;
@@ -339,7 +339,7 @@ hexval(unsigned char c)
 
 /* is Unicode code point acceptable? */
 static void
-check_unicode_value(pg_wchar c)
+check_unicode_value(char32_t c)
 {
 	if (!is_valid_unicode_codepoint(c))
 		ereport(ERROR,
@@ -376,7 +376,7 @@ str_udeescape(const char *str, char escape,
 	char	   *new,
 			   *out;
 	size_t		new_len;
-	pg_wchar	pair_first = 0;
+	char16_t	pair_first = 0;
 	ScannerCallbackState scbstate;
 
 	/*
@@ -420,7 +420,7 @@ str_udeescape(const char *str, char escape,
 					 isxdigit((unsigned char) in[3]) &&
 					 isxdigit((unsigned char) in[4]))
 			{
-				pg_wchar	unicode;
+				char32_t	unicode;
 
 				unicode = (hexval(in[1]) << 12) +
 					(hexval(in[2]) << 8) +
@@ -457,7 +457,7 @@ str_udeescape(const char *str, char escape,
 					 isxdigit((unsigned char) in[6]) &&
 					 isxdigit((unsigned char) in[7]))
 			{
-				pg_wchar	unicode;
+				char32_t	unicode;
 
 				unicode = (hexval(in[2]) << 20) +
 					(hexval(in[3]) << 16) +

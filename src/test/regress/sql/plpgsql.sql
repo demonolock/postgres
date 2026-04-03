@@ -1813,6 +1813,85 @@ SELECT * FROM perform_test;
 drop table perform_test;
 
 --
+-- test PERFORM with CTE (common table expression)
+--
+
+-- basic PERFORM WITH, PERFORM WITH RECURSIVE, and PERFORM WITH multiple CTEs
+create function perform_with_cte() returns void as $$
+BEGIN
+	PERFORM WITH vals AS (SELECT 1 AS x)
+		SELECT x FROM vals;
+
+	PERFORM WITH RECURSIVE nums(n) AS (
+		SELECT 1
+		UNION ALL
+		SELECT n + 1 FROM nums WHERE n < 5
+	)
+	SELECT n FROM nums;
+
+	PERFORM WITH
+		a AS (SELECT 1 AS x),
+		b AS (SELECT 2 AS y)
+	SELECT x, y FROM a, b;
+END;
+$$ language plpgsql;
+
+SELECT perform_with_cte();
+
+-- PERFORM WITH that has side effects (data-modifying CTE) and sets FOUND
+create table perform_cte_test (a int);
+
+create function perform_with_cte_sideeffect() returns boolean as $$
+BEGIN
+	PERFORM WITH inserted AS (
+		INSERT INTO perform_cte_test VALUES (1), (2), (3)
+		RETURNING *
+	)
+	SELECT * FROM inserted;
+	RETURN FOUND;
+END;
+$$ language plpgsql;
+
+SELECT perform_with_cte_sideeffect();
+SELECT * FROM perform_cte_test;
+
+-- FOUND is set correctly for empty CTE result
+DO $$
+DECLARE found_val boolean;
+BEGIN
+	PERFORM WITH empty AS (SELECT 1 WHERE false)
+	SELECT * FROM empty;
+	found_val := FOUND;
+	RAISE NOTICE 'FOUND after empty CTE: %', found_val;
+END;
+$$;
+
+-- PERFORM with_func() is not misdetected as CTE (word boundary check)
+create function with_val(int) returns int as $$
+BEGIN
+	RETURN $1 + 1;
+END;
+$$ language plpgsql;
+
+DO $$
+BEGIN
+	PERFORM with_val(42);
+END;
+$$;
+
+-- backward compat: PERFORM (WITH ...) parenthesized form still works
+DO $$
+BEGIN
+	PERFORM (WITH vals AS (SELECT 42 AS x) SELECT x FROM vals);
+END;
+$$;
+
+drop table perform_cte_test;
+drop function with_val(int);
+drop function perform_with_cte();
+drop function perform_with_cte_sideeffect();
+
+--
 -- Test proper snapshot handling in simple expressions
 --
 
@@ -2047,11 +2126,9 @@ begin
 end $$ language plpgsql;
 select namedparmcursor_test7();
 
--- check that line comments work correctly within the argument list (there
--- is some special handling of this case in the code: the newline after the
--- comment must be preserved when the argument-evaluating query is
--- constructed, otherwise the comment effectively comments out the next
--- argument, too)
+-- check that line comments work correctly within the argument list
+-- (this used to require a special hack in the code; it no longer does,
+-- but let's keep the test anyway)
 create function namedparmcursor_test8() returns int4 as $$
 declare
   c1 cursor (p1 int, p2 int) for
@@ -2074,7 +2151,8 @@ declare
   p2 int4 := 1006;
   n int4;
 begin
-  open c1 (p1 := p1, p2 := p2, debug := 2);
+  -- use both supported syntaxes for named arguments
+  open c1 (p1 := p1, p2 => p2, debug => 2);
   fetch c1 into n;
   return n;
 end $$ language plpgsql;
@@ -2936,7 +3014,8 @@ begin
     raise notice '% from %', r.i, c;
   end loop;
   -- again, to test if cursor was closed properly
-  for r in c(9,10) loop
+  -- (and while we're at it, test named-parameter notation)
+  for r in c(r2 := 10, r1 => 9) loop
     raise notice '% from %', r.i, c;
   end loop;
   -- and test a parameterless cursor
@@ -3356,7 +3435,7 @@ declare v int := 0;
 begin
   return 10 / v;
 end;
-$$ language plpgsql;
+$$ language plpgsql parallel safe;
 
 create or replace function raise_test() returns void as $$
 begin
@@ -3417,8 +3496,28 @@ $$ language plpgsql;
 
 select stacked_diagnostics_test();
 
-drop function zero_divide();
 drop function stacked_diagnostics_test();
+
+-- Test that an error recovery subtransaction is parallel safe
+
+create function error_trap_test() returns text as $$
+begin
+  perform zero_divide();
+  return 'no error detected!';
+exception when division_by_zero then
+  return 'division_by_zero detected';
+end;
+$$ language plpgsql parallel safe;
+
+set debug_parallel_query to on;
+
+explain (verbose, costs off) select error_trap_test();
+select error_trap_test();
+
+reset debug_parallel_query;
+
+drop function error_trap_test();
+drop function zero_divide();
 
 -- check cases where implicit SQLSTATE variable could be confused with
 -- SQLSTATE as a keyword, cf bug #5524
@@ -3752,28 +3851,6 @@ select fail();
 drop function fail();
 
 -- Test handling of string literals.
-
-set standard_conforming_strings = off;
-
-create or replace function strtest() returns text as $$
-begin
-  raise notice 'foo\\bar\041baz';
-  return 'foo\\bar\041baz';
-end
-$$ language plpgsql;
-
-select strtest();
-
-create or replace function strtest() returns text as $$
-begin
-  raise notice E'foo\\bar\041baz';
-  return E'foo\\bar\041baz';
-end
-$$ language plpgsql;
-
-select strtest();
-
-set standard_conforming_strings = on;
 
 create or replace function strtest() returns text as $$
 begin
@@ -4734,12 +4811,12 @@ END; $$ LANGUAGE plpgsql;
 SELECT * FROM get_from_partitioned_table(1) AS t;
 
 CREATE OR REPLACE FUNCTION list_partitioned_table()
-RETURNS SETOF partitioned_table.a%TYPE AS $$
+RETURNS SETOF public.partitioned_table.a%TYPE AS $$
 DECLARE
-    row partitioned_table%ROWTYPE;
-    a_val partitioned_table.a%TYPE;
+    row public.partitioned_table%ROWTYPE;
+    a_val public.partitioned_table.a%TYPE;
 BEGIN
-    FOR row IN SELECT * FROM partitioned_table ORDER BY a LOOP
+    FOR row IN SELECT * FROM public.partitioned_table ORDER BY a LOOP
         a_val := row.a;
         RETURN NEXT a_val;
     END LOOP;

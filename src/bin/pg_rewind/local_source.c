@@ -3,7 +3,7 @@
  * local_source.c
  *	  Functions for using a local data directory as the source.
  *
- * Portions Copyright (c) 2013-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2026, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -12,10 +12,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "datapagemap.h"
+#include "common/logging.h"
 #include "file_ops.h"
-#include "filemap.h"
-#include "pg_rewind.h"
 #include "rewind_source.h"
 
 typedef struct
@@ -41,7 +39,7 @@ init_local_source(const char *datadir)
 {
 	local_source *src;
 
-	src = pg_malloc0(sizeof(local_source));
+	src = pg_malloc0_object(local_source);
 
 	src->common.traverse_files = local_traverse_files;
 	src->common.fetch_file = local_fetch_file;
@@ -114,8 +112,8 @@ local_queue_fetch_file(rewind_source *source, const char *path, size_t len)
 	 * check that the size of the file matches our earlier expectation.
 	 */
 	if (written_len != len)
-		pg_fatal("size of source file \"%s\" changed concurrently: %d bytes expected, %d copied",
-				 srcpath, (int) len, (int) written_len);
+		pg_fatal("size of source file \"%s\" changed concurrently: %zu bytes expected, %zu copied",
+				 srcpath, len, written_len);
 
 	if (close(srcfd) != 0)
 		pg_fatal("could not close file \"%s\": %m", srcpath);

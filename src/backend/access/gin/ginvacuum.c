@@ -4,7 +4,7 @@
  *	  delete & vacuum routines for the postgres GIN
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,7 +19,6 @@
 #include "access/xloginsert.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
-#include "postmaster/autovacuum.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
@@ -66,7 +65,7 @@ ginVacuumItemPointers(GinVacuumState *gvs, ItemPointerData *items,
 				 * First TID to be deleted: allocate memory to hold the
 				 * remaining items.
 				 */
-				tmpitems = palloc(sizeof(ItemPointerData) * nitem);
+				tmpitems = palloc_array(ItemPointerData, nitem);
 				memcpy(tmpitems, items, sizeof(ItemPointerData) * i);
 			}
 		}
@@ -217,7 +216,7 @@ ginDeletePage(GinVacuumState *gvs, BlockNumber deleteBlkno, BlockNumber leftBlkn
 		data.rightLink = GinPageGetOpaque(page)->rightlink;
 		data.deleteXid = GinPageGetDeleteXid(page);
 
-		XLogRegisterData((char *) &data, sizeof(ginxlogDeletePage));
+		XLogRegisterData(&data, sizeof(ginxlogDeletePage));
 
 		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_DELETE_PAGE);
 		PageSetLSN(page, recptr);
@@ -225,11 +224,11 @@ ginDeletePage(GinVacuumState *gvs, BlockNumber deleteBlkno, BlockNumber leftBlkn
 		PageSetLSN(BufferGetPage(lBuffer), recptr);
 	}
 
+	END_CRIT_SECTION();
+
 	ReleaseBuffer(pBuffer);
 	ReleaseBuffer(lBuffer);
 	ReleaseBuffer(dBuffer);
-
-	END_CRIT_SECTION();
 
 	gvs->result->pages_newly_deleted++;
 	gvs->result->pages_deleted++;
@@ -261,7 +260,7 @@ ginScanToDelete(GinVacuumState *gvs, BlockNumber blkno, bool isRoot,
 	{
 		if (!parent->child)
 		{
-			me = (DataPageDeleteStack *) palloc0(sizeof(DataPageDeleteStack));
+			me = palloc0_object(DataPageDeleteStack);
 			me->parent = parent;
 			parent->child = me;
 			me->leftBuffer = InvalidBuffer;
@@ -548,7 +547,7 @@ ginVacuumEntryPage(GinVacuumState *gvs, Buffer buffer, BlockNumber *roots, uint3
 					pfree(plist);
 				PageIndexTupleDelete(tmppage, i);
 
-				if (PageAddItem(tmppage, (Item) itup, IndexTupleSize(itup), i, false, false) != i)
+				if (PageAddItem(tmppage, itup, IndexTupleSize(itup), i, false, false) != i)
 					elog(ERROR, "failed to add item to index page in \"%s\"",
 						 RelationGetRelationName(gvs->index));
 
@@ -585,12 +584,12 @@ ginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	if (stats == NULL)
 	{
 		/* Yes, so initialize stats to zeroes */
-		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+		stats = palloc0_object(IndexBulkDeleteResult);
 
 		/*
 		 * and cleanup any pending inserts
 		 */
-		ginInsertCleanup(&gvs.ginstate, !IsAutoVacuumWorkerProcess(),
+		ginInsertCleanup(&gvs.ginstate, !AmAutoVacuumWorkerProcess(),
 						 false, true, stats);
 	}
 
@@ -655,20 +654,20 @@ ginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			PageRestoreTempPage(resPage, page);
 			MarkBufferDirty(buffer);
 			xlogVacuumPage(gvs.index, buffer);
-			UnlockReleaseBuffer(buffer);
 			END_CRIT_SECTION();
+			UnlockReleaseBuffer(buffer);
 		}
 		else
 		{
 			UnlockReleaseBuffer(buffer);
 		}
 
-		vacuum_delay_point();
+		vacuum_delay_point(false);
 
 		for (i = 0; i < nRoot; i++)
 		{
 			ginVacuumPostingTree(&gvs, rootOfPostingTree[i]);
-			vacuum_delay_point();
+			vacuum_delay_point(false);
 		}
 
 		if (blkno == InvalidBlockNumber)	/* rightmost page */
@@ -701,7 +700,7 @@ ginvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	 */
 	if (info->analyze_only)
 	{
-		if (IsAutoVacuumWorkerProcess())
+		if (AmAutoVacuumWorkerProcess())
 		{
 			initGinState(&ginstate, index);
 			ginInsertCleanup(&ginstate, false, true, true, stats);
@@ -715,9 +714,9 @@ ginvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	 */
 	if (stats == NULL)
 	{
-		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+		stats = palloc0_object(IndexBulkDeleteResult);
 		initGinState(&ginstate, index);
-		ginInsertCleanup(&ginstate, !IsAutoVacuumWorkerProcess(),
+		ginInsertCleanup(&ginstate, !AmAutoVacuumWorkerProcess(),
 						 false, true, stats);
 	}
 
@@ -749,12 +748,12 @@ ginvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		Buffer		buffer;
 		Page		page;
 
-		vacuum_delay_point();
+		vacuum_delay_point(false);
 
 		buffer = ReadBufferExtended(index, MAIN_FORKNUM, blkno,
 									RBM_NORMAL, info->strategy);
 		LockBuffer(buffer, GIN_SHARE);
-		page = (Page) BufferGetPage(buffer);
+		page = BufferGetPage(buffer);
 
 		if (GinPageIsRecyclable(page))
 		{

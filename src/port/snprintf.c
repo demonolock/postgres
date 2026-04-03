@@ -2,7 +2,7 @@
  * Copyright (c) 1983, 1995, 1996 Eric P. Allman
  * Copyright (c) 1988, 1993
  *	The Regents of the University of California.  All rights reserved.
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -338,13 +338,22 @@ static void leading_pad(int zpad, int signvalue, int *padlen,
 static void trailing_pad(int padlen, PrintfTarget *target);
 
 /*
- * If strchrnul exists (it's a glibc-ism), it's a good bit faster than the
- * equivalent manual loop.  If it doesn't exist, provide a replacement.
+ * If strchrnul exists (it's a glibc-ism, but since adopted by some other
+ * platforms), it's a good bit faster than the equivalent manual loop.
+ * Use it if possible, and if it doesn't exist, use this replacement.
  *
  * Note: glibc declares this as returning "char *", but that would require
  * casting away const internally, so we don't follow that detail.
+ *
+ * Note: macOS has this too as of Sequoia 15.4, but it's hidden behind
+ * a deployment-target check that causes compile errors if the deployment
+ * target isn't high enough.  So !HAVE_DECL_STRCHRNUL may mean "yes it's
+ * declared, but it doesn't compile".  To avoid failing in that scenario,
+ * use a macro to avoid matching <string.h>'s name.
  */
-#ifndef HAVE_STRCHRNUL
+#if !HAVE_DECL_STRCHRNUL
+
+#define strchrnul pg_strchrnul
 
 static inline const char *
 strchrnul(const char *s, int c)
@@ -354,19 +363,7 @@ strchrnul(const char *s, int c)
 	return s;
 }
 
-#else
-
-/*
- * glibc's <string.h> declares strchrnul only if _GNU_SOURCE is defined.
- * While we typically use that on glibc platforms, configure will set
- * HAVE_STRCHRNUL whether it's used or not.  Fill in the missing declaration
- * so that this file will compile cleanly with or without _GNU_SOURCE.
- */
-#ifndef _GNU_SOURCE
-extern char *strchrnul(const char *s, int c);
-#endif
-
-#endif							/* HAVE_STRCHRNUL */
+#endif							/* !HAVE_DECL_STRCHRNUL */
 
 
 /*
@@ -465,7 +462,7 @@ nextch2:
 				/* set zero padding if no nonzero digits yet */
 				if (accum == 0 && !pointflag)
 					zpad = '0';
-				/* FALL THRU */
+				pg_fallthrough;
 			case '1':
 			case '2':
 			case '3':
@@ -566,17 +563,22 @@ nextch2:
 				else
 					longflag = 1;
 				goto nextch2;
-			case 'z':
-#if SIZEOF_SIZE_T == 8
-#ifdef HAVE_LONG_INT_64
+			case 'j':
+#if SIZEOF_INTMAX_T == SIZEOF_LONG
 				longflag = 1;
-#elif defined(HAVE_LONG_LONG_INT_64)
+#elif SIZEOF_INTMAX_T == SIZEOF_LONG_LONG
 				longlongflag = 1;
 #else
-#error "Don't know how to print 64bit integers"
+#error "cannot find integer type of the same size as intmax_t"
 #endif
+				goto nextch2;
+			case 'z':
+#if SIZEOF_SIZE_T == SIZEOF_LONG
+				longflag = 1;
+#elif SIZEOF_SIZE_T == SIZEOF_LONG_LONG
+				longlongflag = 1;
 #else
-				/* assume size_t is same size as int */
+#error "cannot find integer type of the same size as size_t"
 #endif
 				goto nextch2;
 			case 'h':
@@ -833,17 +835,22 @@ nextch1:
 				else
 					longflag = 1;
 				goto nextch1;
-			case 'z':
-#if SIZEOF_SIZE_T == 8
-#ifdef HAVE_LONG_INT_64
+			case 'j':
+#if SIZEOF_INTMAX_T == SIZEOF_LONG
 				longflag = 1;
-#elif defined(HAVE_LONG_LONG_INT_64)
+#elif SIZEOF_INTMAX_T == SIZEOF_LONG_LONG
 				longlongflag = 1;
 #else
-#error "Don't know how to print 64bit integers"
+#error "cannot find integer type of the same size as intmax_t"
 #endif
+				goto nextch1;
+			case 'z':
+#if SIZEOF_SIZE_T == SIZEOF_LONG
+				longflag = 1;
+#elif SIZEOF_SIZE_T == SIZEOF_LONG_LONG
+				longlongflag = 1;
 #else
-				/* assume size_t is same size as int */
+#error "cannot find integer type of the same size as size_t"
 #endif
 				goto nextch1;
 			case 'h':
@@ -1216,22 +1223,6 @@ fmtfloat(double value, char type, int forcesign, int leftjust,
 		}
 		if (vallen < 0)
 			goto fail;
-
-		/*
-		 * Windows, alone among our supported platforms, likes to emit
-		 * three-digit exponent fields even when two digits would do.  Hack
-		 * such results to look like the way everyone else does it.
-		 */
-#ifdef WIN32
-		if (vallen >= 6 &&
-			convert[vallen - 5] == 'e' &&
-			convert[vallen - 3] == '0')
-		{
-			convert[vallen - 3] = convert[vallen - 2];
-			convert[vallen - 2] = convert[vallen - 1];
-			vallen--;
-		}
-#endif
 	}
 
 	padlen = compute_padlen(minlen, vallen + zeropadlen, leftjust);
@@ -1347,17 +1338,6 @@ pg_strfromd(char *str, size_t count, int precision, double value)
 				target.failed = true;
 				goto fail;
 			}
-
-#ifdef WIN32
-			if (vallen >= 6 &&
-				convert[vallen - 5] == 'e' &&
-				convert[vallen - 3] == '0')
-			{
-				convert[vallen - 3] = convert[vallen - 2];
-				convert[vallen - 2] = convert[vallen - 1];
-				vallen--;
-			}
-#endif
 		}
 	}
 

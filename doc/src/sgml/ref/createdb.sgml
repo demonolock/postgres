@@ -136,7 +136,8 @@ PostgreSQL documentation
       <term><option>--lc-collate=<replaceable class="parameter">locale</replaceable></option></term>
       <listitem>
        <para>
-        Specifies the LC_COLLATE setting to be used in this database.
+        Specifies the LC_COLLATE setting to be used in this database (ignored
+        unless the locale provider is <literal>libc</literal>).
        </para>
       </listitem>
      </varlistentry>
@@ -146,6 +147,16 @@ PostgreSQL documentation
       <listitem>
        <para>
         Specifies the LC_CTYPE setting to be used in this database.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--builtin-locale=<replaceable class="parameter">locale</replaceable></option></term>
+      <listitem>
+       <para>
+        Specifies the locale name when the builtin provider is used. Locale support
+        is described in <xref linkend="locale"/>.
        </para>
       </listitem>
      </varlistentry>
@@ -171,7 +182,7 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
-      <term><option>--locale-provider={<literal>libc</literal>|<literal>icu</literal>}</option></term>
+      <term><option>--locale-provider={<literal>builtin</literal>|<literal>libc</literal>|<literal>icu</literal>}</option></term>
       <listitem>
        <para>
         Specifies the locale provider for the database's default collation.
@@ -191,7 +202,7 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
-      <term><option>-S <replaceable class="parameter">template</replaceable></option></term>
+      <term><option>-S <replaceable class="parameter">strategy</replaceable></option></term>
       <term><option>--strategy=<replaceable class="parameter">strategy</replaceable></option></term>
       <listitem>
        <para>

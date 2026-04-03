@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Test cascading logical replication of 2PC.
 #
@@ -8,7 +8,7 @@
 # Two-phase and parallel apply will be tested in 023_twophase_stream, so we
 # didn't add a parallel apply version for the tests in this file.
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -39,7 +39,7 @@ logical_decoding_work_mem = 64kB
 $node_B->start;
 # node_C
 my $node_C = PostgreSQL::Test::Cluster->new('node_C');
-$node_C->init(allows_streaming => 'logical');
+$node_C->init;
 $node_C->append_conf(
 	'postgresql.conf', qq(
 max_prepared_transactions = 10
@@ -88,7 +88,7 @@ $node_B->safe_psql(
 	CREATE SUBSCRIPTION tap_sub_B
 	CONNECTION '$node_A_connstr application_name=$appname_B'
 	PUBLICATION tap_pub_A
-	WITH (two_phase = on)");
+	WITH (two_phase = on, streaming = off)");
 
 # node_B (pub) -> node_C (sub)
 my $node_B_connstr = $node_B->connstr . ' dbname=postgres';
@@ -100,7 +100,7 @@ $node_C->safe_psql(
 	CREATE SUBSCRIPTION tap_sub_C
 	CONNECTION '$node_B_connstr application_name=$appname_C'
 	PUBLICATION tap_pub_B
-	WITH (two_phase = on)");
+	WITH (two_phase = on, streaming = off)");
 
 # Wait for subscribers to finish initialization
 $node_A->wait_for_catchup($appname_B);

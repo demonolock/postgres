@@ -12,6 +12,7 @@ OBJS = \
 	barrier.o \
 	dsm.o \
 	dsm_impl.o \
+	dsm_registry.o \
 	ipc.o \
 	ipci.o \
 	latch.o \
@@ -24,6 +25,7 @@ OBJS = \
 	signalfuncs.o \
 	sinval.o \
 	sinvaladt.o \
-	standby.o
+	standby.o \
+	waiteventset.o
 
 include $(top_srcdir)/src/backend/common.mk

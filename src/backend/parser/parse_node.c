@@ -3,7 +3,7 @@
  * parse_node.c
  *	  various routines that make nodes for querytrees
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,14 +22,9 @@
 #include "nodes/miscnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/subscripting.h"
-#include "parser/parse_coerce.h"
-#include "parser/parse_expr.h"
-#include "parser/parse_relation.h"
-#include "parser/parsetree.h"
+#include "parser/parse_node.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
-#include "utils/syscache.h"
-#include "utils/varbit.h"
 
 static void pcb_error_callback(void *arg);
 
@@ -45,7 +40,7 @@ make_parsestate(ParseState *parentParseState)
 {
 	ParseState *pstate;
 
-	pstate = palloc0(sizeof(ParseState));
+	pstate = palloc0_object(ParseState);
 
 	pstate->parentParseState = parentParseState;
 
@@ -149,7 +144,7 @@ setup_parser_errposition_callback(ParseCallbackState *pcbstate,
 	pcbstate->pstate = pstate;
 	pcbstate->location = location;
 	pcbstate->errcallback.callback = pcb_error_callback;
-	pcbstate->errcallback.arg = (void *) pcbstate;
+	pcbstate->errcallback.arg = pcbstate;
 	pcbstate->errcallback.previous = error_context_stack;
 	error_context_stack = &pcbstate->errcallback;
 }
@@ -413,7 +408,7 @@ make_const(ParseState *pstate, A_Const *aconst)
 
 						typeid = INT8OID;
 						typelen = sizeof(int64);
-						typebyval = FLOAT8PASSBYVAL;	/* int8 and float8 alike */
+						typebyval = true;
 					}
 				}
 				else

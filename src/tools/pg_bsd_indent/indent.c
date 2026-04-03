@@ -54,7 +54,7 @@ static char sccsid[] = "@(#)indent.c	5.17 (Berkeley) 6/7/93";
 #include "indent.h"
 
 static void bakcopy(void);
-static void indent_declaration(int, int);
+static void indent_declaration(int cur_dec_ind, int tabs_to_var);
 
 const char *in_name = "Standard Input";	/* will always point to name of input
 					 * file */
@@ -296,6 +296,7 @@ main(int argc, char **argv)
 		 * done earlier.
 		 */
 		force_nl = false;
+		break;
 	    case form_feed:
 		break;
 	    case comment:
@@ -352,7 +353,7 @@ main(int argc, char **argv)
 		    }
 		    goto sw_buffer;
 		}
-		/* FALLTHROUGH */
+		pg_fallthrough;
 	    default:		/* it is the start of a normal statement */
 		{
 		    int remove_newlines;
@@ -608,7 +609,7 @@ check_type:
 
 		parse(hd_type);	/* let parser worry about if, or whatever */
 	    }
-	    ps.search_brace = btype_2;	/* this should insure that constructs
+	    ps.search_brace = btype_2;	/* this should ensure that constructs
 					 * such as main(){...} and int[]{...}
 					 * have their braces put in the right
 					 * place */
@@ -922,7 +923,7 @@ check_type:
 	case structure:
 	    if (ps.p_l_follow > 0)
 		goto copy_id;
-		/* FALLTHROUGH */
+	    pg_fallthrough;
 	case decl:		/* we have a declaration type (int, etc.) */
 	    parse(decl);	/* let parser worry about indentation */
 	    if (ps.last_token == rparen && ps.tos <= 1) {

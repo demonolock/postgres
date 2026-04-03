@@ -3,7 +3,7 @@
  * hash.c
  *	  Implementation of Margo Seltzer's Hashing package for postgres.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,15 +21,16 @@
 #include "access/hash.h"
 #include "access/hash_xlog.h"
 #include "access/relscan.h"
+#include "access/stratnum.h"
 #include "access/tableam.h"
 #include "access/xloginsert.h"
-#include "catalog/index.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
+#include "nodes/execnodes.h"
 #include "optimizer/plancat.h"
 #include "pgstat.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/index_selfuncs.h"
 #include "utils/rel.h"
 
@@ -56,54 +57,63 @@ static void hashbuildCallback(Relation index,
 Datum
 hashhandler(PG_FUNCTION_ARGS)
 {
-	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
+	static const IndexAmRoutine amroutine = {
+		.type = T_IndexAmRoutine,
+		.amstrategies = HTMaxStrategyNumber,
+		.amsupport = HASHNProcs,
+		.amoptsprocnum = HASHOPTIONS_PROC,
+		.amcanorder = false,
+		.amcanorderbyop = false,
+		.amcanhash = true,
+		.amconsistentequality = true,
+		.amconsistentordering = false,
+		.amcanbackward = true,
+		.amcanunique = false,
+		.amcanmulticol = false,
+		.amoptionalkey = false,
+		.amsearcharray = false,
+		.amsearchnulls = false,
+		.amstorage = false,
+		.amclusterable = false,
+		.ampredlocks = true,
+		.amcanparallel = false,
+		.amcanbuildparallel = false,
+		.amcaninclude = false,
+		.amusemaintenanceworkmem = false,
+		.amsummarizing = false,
+		.amparallelvacuumoptions =
+		VACUUM_OPTION_PARALLEL_BULKDEL,
+		.amkeytype = INT4OID,
 
-	amroutine->amstrategies = HTMaxStrategyNumber;
-	amroutine->amsupport = HASHNProcs;
-	amroutine->amoptsprocnum = HASHOPTIONS_PROC;
-	amroutine->amcanorder = false;
-	amroutine->amcanorderbyop = false;
-	amroutine->amcanbackward = true;
-	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = false;
-	amroutine->amoptionalkey = false;
-	amroutine->amsearcharray = false;
-	amroutine->amsearchnulls = false;
-	amroutine->amstorage = false;
-	amroutine->amclusterable = false;
-	amroutine->ampredlocks = true;
-	amroutine->amcanparallel = false;
-	amroutine->amcaninclude = false;
-	amroutine->amusemaintenanceworkmem = false;
-	amroutine->amsummarizing = false;
-	amroutine->amparallelvacuumoptions =
-		VACUUM_OPTION_PARALLEL_BULKDEL;
-	amroutine->amkeytype = INT4OID;
+		.ambuild = hashbuild,
+		.ambuildempty = hashbuildempty,
+		.aminsert = hashinsert,
+		.aminsertcleanup = NULL,
+		.ambulkdelete = hashbulkdelete,
+		.amvacuumcleanup = hashvacuumcleanup,
+		.amcanreturn = NULL,
+		.amcostestimate = hashcostestimate,
+		.amgettreeheight = NULL,
+		.amoptions = hashoptions,
+		.amproperty = NULL,
+		.ambuildphasename = NULL,
+		.amvalidate = hashvalidate,
+		.amadjustmembers = hashadjustmembers,
+		.ambeginscan = hashbeginscan,
+		.amrescan = hashrescan,
+		.amgettuple = hashgettuple,
+		.amgetbitmap = hashgetbitmap,
+		.amendscan = hashendscan,
+		.ammarkpos = NULL,
+		.amrestrpos = NULL,
+		.amestimateparallelscan = NULL,
+		.aminitparallelscan = NULL,
+		.amparallelrescan = NULL,
+		.amtranslatestrategy = hashtranslatestrategy,
+		.amtranslatecmptype = hashtranslatecmptype,
+	};
 
-	amroutine->ambuild = hashbuild;
-	amroutine->ambuildempty = hashbuildempty;
-	amroutine->aminsert = hashinsert;
-	amroutine->ambulkdelete = hashbulkdelete;
-	amroutine->amvacuumcleanup = hashvacuumcleanup;
-	amroutine->amcanreturn = NULL;
-	amroutine->amcostestimate = hashcostestimate;
-	amroutine->amoptions = hashoptions;
-	amroutine->amproperty = NULL;
-	amroutine->ambuildphasename = NULL;
-	amroutine->amvalidate = hashvalidate;
-	amroutine->amadjustmembers = hashadjustmembers;
-	amroutine->ambeginscan = hashbeginscan;
-	amroutine->amrescan = hashrescan;
-	amroutine->amgettuple = hashgettuple;
-	amroutine->amgetbitmap = hashgetbitmap;
-	amroutine->amendscan = hashendscan;
-	amroutine->ammarkpos = NULL;
-	amroutine->amrestrpos = NULL;
-	amroutine->amestimateparallelscan = NULL;
-	amroutine->aminitparallelscan = NULL;
-	amroutine->amparallelrescan = NULL;
-
-	PG_RETURN_POINTER(amroutine);
+	PG_RETURN_POINTER(&amroutine);
 }
 
 /*
@@ -117,7 +127,7 @@ hashbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	double		reltuples;
 	double		allvisfrac;
 	uint32		num_buckets;
-	long		sort_threshold;
+	Size		sort_threshold;
 	HashBuildState buildstate;
 
 	/*
@@ -152,13 +162,13 @@ hashbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * one page.  Also, "initial index size" accounting does not include the
 	 * metapage, nor the first bitmap page.
 	 */
-	sort_threshold = (maintenance_work_mem * 1024L) / BLCKSZ;
+	sort_threshold = (maintenance_work_mem * (Size) 1024) / BLCKSZ;
 	if (index->rd_rel->relpersistence != RELPERSISTENCE_TEMP)
 		sort_threshold = Min(sort_threshold, NBuffers);
 	else
 		sort_threshold = Min(sort_threshold, NLocBuffer);
 
-	if (num_buckets >= (uint32) sort_threshold)
+	if (num_buckets >= sort_threshold)
 		buildstate.spool = _h_spoolinit(heap, index, num_buckets);
 	else
 		buildstate.spool = NULL;
@@ -170,7 +180,7 @@ hashbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	/* do the heap scan */
 	reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
 									   hashbuildCallback,
-									   (void *) &buildstate, NULL);
+									   &buildstate, NULL);
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_TOTAL,
 								 buildstate.indtuples);
 
@@ -184,7 +194,7 @@ hashbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	/*
 	 * Return statistics
 	 */
-	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
+	result = palloc_object(IndexBuildResult);
 
 	result->heap_tuples = reltuples;
 	result->index_tuples = buildstate.indtuples;
@@ -309,8 +319,7 @@ hashgettuple(IndexScanDesc scan, ScanDirection dir)
 			 * entries.
 			 */
 			if (so->killedItems == NULL)
-				so->killedItems = (int *)
-					palloc(MaxIndexTuplesPerPage * sizeof(int));
+				so->killedItems = palloc_array(int, MaxIndexTuplesPerPage);
 
 			if (so->numKilled < MaxIndexTuplesPerPage)
 				so->killedItems[so->numKilled++] = so->currPos.itemIndex;
@@ -372,7 +381,7 @@ hashbeginscan(Relation rel, int nkeys, int norderbys)
 
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 
-	so = (HashScanOpaque) palloc(sizeof(HashScanOpaqueData));
+	so = (HashScanOpaque) palloc_object(HashScanOpaqueData);
 	HashScanPosInvalidate(so->currPos);
 	so->hashso_bucket_buf = InvalidBuffer;
 	so->hashso_split_bucket_buf = InvalidBuffer;
@@ -412,11 +421,7 @@ hashrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 
 	/* Update scan key, if a new one is given */
 	if (scankey && scan->numberOfKeys > 0)
-	{
-		memmove(scan->keyData,
-				scankey,
-				scan->numberOfKeys * sizeof(ScanKeyData));
-	}
+		memcpy(scan->keyData, scankey, scan->numberOfKeys * sizeof(ScanKeyData));
 
 	so->hashso_buc_populated = false;
 	so->hashso_buc_split = false;
@@ -614,7 +619,7 @@ loop_top:
 		xlrec.ntuples = metap->hashm_ntuples;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, SizeOfHashUpdateMetaPage);
+		XLogRegisterData(&xlrec, SizeOfHashUpdateMetaPage);
 
 		XLogRegisterBuffer(0, metabuf, REGBUF_STANDARD);
 
@@ -628,7 +633,7 @@ loop_top:
 
 	/* return statistics */
 	if (stats == NULL)
-		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+		stats = palloc0_object(IndexBulkDeleteResult);
 	stats->estimated_count = false;
 	stats->num_index_tuples = num_index_tuples;
 	stats->tuples_removed += tuples_removed;
@@ -714,7 +719,7 @@ hashbucketcleanup(Relation rel, Bucket cur_bucket, Buffer bucket_buf,
 		bool		retain_pin = false;
 		bool		clear_dead_marking = false;
 
-		vacuum_delay_point();
+		vacuum_delay_point(false);
 
 		page = BufferGetPage(buf);
 		opaque = HashPageGetOpaque(page);
@@ -821,17 +826,22 @@ hashbucketcleanup(Relation rel, Bucket cur_bucket, Buffer bucket_buf,
 				xlrec.is_primary_bucket_page = (buf == bucket_buf);
 
 				XLogBeginInsert();
-				XLogRegisterData((char *) &xlrec, SizeOfHashDelete);
+				XLogRegisterData(&xlrec, SizeOfHashDelete);
 
 				/*
-				 * bucket buffer needs to be registered to ensure that we can
-				 * acquire a cleanup lock on it during replay.
+				 * bucket buffer was not changed, but still needs to be
+				 * registered to ensure that we can acquire a cleanup lock on
+				 * it during replay.
 				 */
 				if (!xlrec.is_primary_bucket_page)
-					XLogRegisterBuffer(0, bucket_buf, REGBUF_STANDARD | REGBUF_NO_IMAGE);
+				{
+					uint8		flags = REGBUF_STANDARD | REGBUF_NO_IMAGE | REGBUF_NO_CHANGE;
+
+					XLogRegisterBuffer(0, bucket_buf, flags);
+				}
 
 				XLogRegisterBuffer(1, buf, REGBUF_STANDARD);
-				XLogRegisterBufData(1, (char *) deletable,
+				XLogRegisterBufData(1, deletable,
 									ndeletable * sizeof(OffsetNumber));
 
 				recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_DELETE);
@@ -917,4 +927,20 @@ hashbucketcleanup(Relation rel, Bucket cur_bucket, Buffer bucket_buf,
 							bstrategy);
 	else
 		LockBuffer(bucket_buf, BUFFER_LOCK_UNLOCK);
+}
+
+CompareType
+hashtranslatestrategy(StrategyNumber strategy, Oid opfamily)
+{
+	if (strategy == HTEqualStrategyNumber)
+		return COMPARE_EQ;
+	return COMPARE_INVALID;
+}
+
+StrategyNumber
+hashtranslatecmptype(CompareType cmptype, Oid opfamily)
+{
+	if (cmptype == COMPARE_EQ)
+		return HTEqualStrategyNumber;
+	return InvalidStrategy;
 }

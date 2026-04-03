@@ -22,8 +22,8 @@ PostgreSQL documentation
  <refsynopsisdiv>
   <cmdsynopsis>
    <command>pg_waldump</command>
-   <arg rep="repeat" choice="opt"><option>option</option></arg>
-   <arg choice="opt"><option>startseg</option><arg choice="opt"><option>endseg</option></arg></arg>
+   <arg rep="repeat" choice="opt"><replaceable>option</replaceable></arg>
+   <arg choice="opt"><replaceable>startseg</replaceable><arg choice="opt"><replaceable>endseg</replaceable></arg></arg>
   </cmdsynopsis>
  </refsynopsisdiv>
 
@@ -117,7 +117,7 @@ PostgreSQL documentation
       <term><option>--fork=<replaceable>fork</replaceable></option></term>
       <listitem>
        <para>
-        If provided, only display records that modify blocks in the given fork.
+        Only display records that modify blocks in the given fork.
         The valid values are <literal>main</literal> for the main fork,
         <literal>fsm</literal> for the free space map,
         <literal>vm</literal> for the visibility map,
@@ -174,12 +174,13 @@ PostgreSQL documentation
         names, and exit.
        </para>
        <para>
-        Extensions may define custom resource managers, but pg_waldump does
+        Extensions may define custom resource managers, but
+        <application>pg_waldump</application> does
         not load the extension module and therefore does not recognize custom
         resource managers by name. Instead, you can specify the custom
         resource managers as <literal>custom###</literal> where
-        "<literal>###</literal>" is the three-digit resource manager ID. Names
-        of this form will always be considered valid.
+        <replaceable>###</replaceable> is the three-digit resource manager ID.
+        Names of this form will always be considered valid.
        </para>
       </listitem>
      </varlistentry>
@@ -283,7 +284,7 @@ PostgreSQL documentation
        </para>
        <para>
         The full page images are saved with the following file name format:
-        <literal><replaceable>TIMELINE</replaceable>-<replaceable>LSN</replaceable>.<replaceable>RELTABLESPACE</replaceable>.<replaceable>DATOID</replaceable>.<replaceable>RELNODE</replaceable>.<replaceable>BLKNO</replaceable><replaceable>FORK</replaceable></literal>
+        <literal><replaceable>TIMELINE</replaceable>-<replaceable>LSN</replaceable>.<replaceable>RELTABLESPACE</replaceable>.<replaceable>DATOID</replaceable>.<replaceable>RELNODE</replaceable>.<replaceable>BLKNO</replaceable>_<replaceable>FORK</replaceable></literal>
 
         The file names are composed of the following parts:
         <informaltable>
@@ -334,8 +335,8 @@ PostgreSQL documentation
             <entry>FORK</entry>
             <entry>
              The name of the fork the full page image came from, such as
-             <literal>_main</literal>, <literal>_fsm</literal>,
-             <literal>_vm</literal>, or <literal>_init</literal>.
+             <literal>main</literal>, <literal>fsm</literal>,
+             <literal>vm</literal>, or <literal>init</literal>.
             </entry>
            </row>
           </tbody>

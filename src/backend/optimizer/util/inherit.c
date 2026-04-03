@@ -3,7 +3,7 @@
  * inherit.c
  *	  Routines to process child relations in inheritance trees
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -322,7 +322,6 @@ expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 						   PlanRowMark *top_parentrc, LOCKMODE lockmode)
 {
 	PartitionDesc partdesc;
-	Bitmapset  *live_parts;
 	int			num_live_parts;
 	int			i;
 
@@ -336,16 +335,6 @@ expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 	/* A partitioned table should always have a partition descriptor. */
 	Assert(partdesc);
 
-	/*
-	 * Note down whether any partition key cols are being updated. Though it's
-	 * the root partitioned table's updatedCols we are interested in,
-	 * parent_updatedCols provided by the caller contains the root partrel's
-	 * updatedCols translated to match the attribute ordering of parentrel.
-	 */
-	if (!root->partColsUpdated)
-		root->partColsUpdated =
-			has_partition_attrs(parentrel, parent_updatedCols, NULL);
-
 	/* Nothing further to do here if there are no partitions. */
 	if (partdesc->nparts == 0)
 		return;
@@ -356,10 +345,10 @@ expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 	 * that survive pruning.  Below, we will initialize child objects for the
 	 * surviving partitions.
 	 */
-	relinfo->live_parts = live_parts = prune_append_rel_partitions(relinfo);
+	relinfo->live_parts = prune_append_rel_partitions(relinfo);
 
 	/* Expand simple_rel_array and friends to hold child objects. */
-	num_live_parts = bms_num_members(live_parts);
+	num_live_parts = bms_num_members(relinfo->live_parts);
 	if (num_live_parts > 0)
 		expand_planner_arrays(root, num_live_parts);
 
@@ -378,7 +367,7 @@ expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 	 * table itself, because it's not going to be scanned.
 	 */
 	i = -1;
-	while ((i = bms_next_member(live_parts, i)) >= 0)
+	while ((i = bms_next_member(relinfo->live_parts, i)) >= 0)
 	{
 		Oid			childOID = partdesc->oids[i];
 		Relation	childrel;
@@ -386,8 +375,17 @@ expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 		Index		childRTindex;
 		RelOptInfo *childrelinfo;
 
-		/* Open rel, acquiring required locks */
-		childrel = table_open(childOID, lockmode);
+		/*
+		 * Open rel, acquiring required locks.  If a partition was recently
+		 * detached and subsequently dropped, then opening it will fail.  In
+		 * this case, behave as though the partition had been pruned.
+		 */
+		childrel = try_table_open(childOID, lockmode);
+		if (childrel == NULL)
+		{
+			relinfo->live_parts = bms_del_member(relinfo->live_parts, i);
+			continue;
+		}
 
 		/*
 		 * Temporary partitions belonging to other sessions should have been
@@ -494,19 +492,21 @@ expand_single_inheritance_child(PlannerInfo *root, RangeTblEntry *parentrte,
 		childrte->inh = false;
 	childrte->securityQuals = NIL;
 
-	/*
-	 * No permission checking for the child RTE unless it's the parent
-	 * relation in its child role, which only applies to traditional
-	 * inheritance.
-	 */
-	if (childOID != parentOID)
-		childrte->perminfoindex = 0;
+	/* No permission checking for child RTEs. */
+	childrte->perminfoindex = 0;
 
 	/* Link not-yet-fully-filled child RTE into data structures */
 	parse->rtable = lappend(parse->rtable, childrte);
 	childRTindex = list_length(parse->rtable);
 	*childrte_p = childrte;
 	*childRTindex_p = childRTindex;
+
+	/*
+	 * Retrieve column not-null constraint information for the child relation
+	 * if its relation OID is different from the parent's.
+	 */
+	if (childOID != parentOID)
+		get_relation_notnullatts(root, childrel);
 
 	/*
 	 * Build an AppendRelInfo struct for each parent/child pair.
@@ -826,11 +826,13 @@ expand_appendrel_subquery(PlannerInfo *root, RelOptInfo *rel,
 /*
  * apply_child_basequals
  *		Populate childrel's base restriction quals from parent rel's quals,
- *		translating them using appinfo.
+ *		translating Vars using appinfo and re-checking for quals which are
+ *		constant-TRUE or constant-FALSE when applied to this child relation.
  *
  * If any of the resulting clauses evaluate to constant false or NULL, we
  * return false and don't apply any quals.  Caller should mark the relation as
- * a dummy rel in this case, since it doesn't need to be scanned.
+ * a dummy rel in this case, since it doesn't need to be scanned.  Constant
+ * true quals are ignored.
  */
 bool
 apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
@@ -879,6 +881,7 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
 		{
 			Node	   *onecq = (Node *) lfirst(lc2);
 			bool		pseudoconstant;
+			RestrictInfo *childrinfo;
 
 			/* check for pseudoconstant (no Vars or volatile functions) */
 			pseudoconstant =
@@ -890,15 +893,23 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
 				root->hasPseudoConstantQuals = true;
 			}
 			/* reconstitute RestrictInfo with appropriate properties */
-			childquals = lappend(childquals,
-								 make_restrictinfo(root,
-												   (Expr *) onecq,
-												   rinfo->is_pushed_down,
-												   rinfo->has_clone,
-												   rinfo->is_clone,
-												   pseudoconstant,
-												   rinfo->security_level,
-												   NULL, NULL, NULL));
+			childrinfo = make_restrictinfo(root,
+										   (Expr *) onecq,
+										   rinfo->is_pushed_down,
+										   rinfo->has_clone,
+										   rinfo->is_clone,
+										   pseudoconstant,
+										   rinfo->security_level,
+										   NULL, NULL, NULL);
+
+			/* Restriction is proven always false */
+			if (restriction_is_always_false(root, childrinfo))
+				return false;
+			/* Restriction is proven always true, so drop it */
+			if (restriction_is_always_true(root, childrinfo))
+				continue;
+
+			childquals = lappend(childquals, childrinfo);
 			/* track minimum security level among child quals */
 			cq_min_security = Min(cq_min_security, rinfo->security_level);
 		}

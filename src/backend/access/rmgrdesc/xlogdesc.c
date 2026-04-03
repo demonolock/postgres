@@ -3,7 +3,7 @@
  * xlogdesc.c
  *	  rmgr descriptor routines for access/transam/xlog.c
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -33,6 +33,27 @@ const struct config_enum_entry wal_level_options[] = {
 	{NULL, 0, false}
 };
 
+/*
+ * Find a string representation for wal_level
+ */
+static const char *
+get_wal_level_string(int wal_level)
+{
+	const struct config_enum_entry *entry;
+	const char *wal_level_str = "?";
+
+	for (entry = wal_level_options; entry->name; entry++)
+	{
+		if (entry->val == wal_level)
+		{
+			wal_level_str = entry->name;
+			break;
+		}
+	}
+
+	return wal_level_str;
+}
+
 void
 xlog_desc(StringInfo buf, XLogReaderState *record)
 {
@@ -44,8 +65,8 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 	{
 		CheckPoint *checkpoint = (CheckPoint *) rec;
 
-		appendStringInfo(buf, "redo %X/%X; "
-						 "tli %u; prev tli %u; fpw %s; xid %u:%u; oid %u; multi %u; offset %u; "
+		appendStringInfo(buf, "redo %X/%08X; "
+						 "tli %u; prev tli %u; fpw %s; wal_level %s; logical decoding %s; xid %u:%u; oid %u; multi %u; offset %" PRIu64 "; "
 						 "oldest xid %u in DB %u; oldest multi %u in DB %u; "
 						 "oldest/newest commit timestamp xid: %u/%u; "
 						 "oldest running xid %u; %s",
@@ -53,6 +74,8 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 						 checkpoint->ThisTimeLineID,
 						 checkpoint->PrevTimeLineID,
 						 checkpoint->fullPageWrites ? "true" : "false",
+						 get_wal_level_string(checkpoint->wal_level),
+						 checkpoint->logicalDecodingEnabled ? "true" : "false",
 						 EpochFromFullTransactionId(checkpoint->nextXid),
 						 XidFromFullTransactionId(checkpoint->nextXid),
 						 checkpoint->nextOid,
@@ -89,26 +112,15 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 		XLogRecPtr	startpoint;
 
 		memcpy(&startpoint, rec, sizeof(XLogRecPtr));
-		appendStringInfo(buf, "%X/%X", LSN_FORMAT_ARGS(startpoint));
+		appendStringInfo(buf, "%X/%08X", LSN_FORMAT_ARGS(startpoint));
 	}
 	else if (info == XLOG_PARAMETER_CHANGE)
 	{
 		xl_parameter_change xlrec;
 		const char *wal_level_str;
-		const struct config_enum_entry *entry;
 
 		memcpy(&xlrec, rec, sizeof(xl_parameter_change));
-
-		/* Find a string representation for wal_level */
-		wal_level_str = "?";
-		for (entry = wal_level_options; entry->name; entry++)
-		{
-			if (entry->val == xlrec.wal_level)
-			{
-				wal_level_str = entry->name;
-				break;
-			}
-		}
+		wal_level_str = get_wal_level_string(xlrec.wal_level);
 
 		appendStringInfo(buf, "max_connections=%d max_worker_processes=%d "
 						 "max_wal_senders=%d max_prepared_xacts=%d "
@@ -135,18 +147,33 @@ xlog_desc(StringInfo buf, XLogReaderState *record)
 		xl_end_of_recovery xlrec;
 
 		memcpy(&xlrec, rec, sizeof(xl_end_of_recovery));
-		appendStringInfo(buf, "tli %u; prev tli %u; time %s",
+		appendStringInfo(buf, "tli %u; prev tli %u; time %s; wal_level %s",
 						 xlrec.ThisTimeLineID, xlrec.PrevTimeLineID,
-						 timestamptz_to_str(xlrec.end_time));
+						 timestamptz_to_str(xlrec.end_time),
+						 get_wal_level_string(xlrec.wal_level));
 	}
 	else if (info == XLOG_OVERWRITE_CONTRECORD)
 	{
 		xl_overwrite_contrecord xlrec;
 
 		memcpy(&xlrec, rec, sizeof(xl_overwrite_contrecord));
-		appendStringInfo(buf, "lsn %X/%X; time %s",
+		appendStringInfo(buf, "lsn %X/%08X; time %s",
 						 LSN_FORMAT_ARGS(xlrec.overwritten_lsn),
 						 timestamptz_to_str(xlrec.overwrite_time));
+	}
+	else if (info == XLOG_CHECKPOINT_REDO)
+	{
+		int			wal_level;
+
+		memcpy(&wal_level, rec, sizeof(int));
+		appendStringInfo(buf, "wal_level %s", get_wal_level_string(wal_level));
+	}
+	else if (info == XLOG_LOGICAL_DECODING_STATUS_CHANGE)
+	{
+		bool		enabled;
+
+		memcpy(&enabled, rec, sizeof(bool));
+		appendStringInfoString(buf, enabled ? "true" : "false");
 	}
 }
 
@@ -195,6 +222,12 @@ xlog_identify(uint8 info)
 			break;
 		case XLOG_FPI_FOR_HINT:
 			id = "FPI_FOR_HINT";
+			break;
+		case XLOG_CHECKPOINT_REDO:
+			id = "CHECKPOINT_REDO";
+			break;
+		case XLOG_LOGICAL_DECODING_STATUS_CHANGE:
+			id = "LOGICAL_DECODING_STATUS_CHANGE";
 			break;
 	}
 

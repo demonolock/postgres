@@ -4,7 +4,7 @@
  *	  POSTGRES define and remove utility definitions.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/defrem.h
@@ -14,6 +14,7 @@
 #ifndef DEFREM_H
 #define DEFREM_H
 
+#include "access/stratnum.h"
 #include "catalog/objectaddress.h"
 #include "nodes/params.h"
 #include "parser/parse_node.h"
@@ -24,7 +25,8 @@
 extern void RemoveObjects(DropStmt *stmt);
 
 /* commands/indexcmds.c */
-extern ObjectAddress DefineIndex(Oid relationId,
+extern ObjectAddress DefineIndex(ParseState *pstate,
+								 Oid tableId,
 								 IndexStmt *stmt,
 								 Oid indexRelationId,
 								 Oid parentIndexId,
@@ -35,7 +37,7 @@ extern ObjectAddress DefineIndex(Oid relationId,
 								 bool check_not_in_use,
 								 bool skip_build,
 								 bool quiet);
-extern void ExecReindex(ParseState *pstate, ReindexStmt *stmt, bool isTopLevel);
+extern void ExecReindex(ParseState *pstate, const ReindexStmt *stmt, bool isTopLevel);
 extern char *makeObjectName(const char *name1, const char *name2,
 							const char *label);
 extern char *ChooseRelationName(const char *name1, const char *name2,
@@ -43,11 +45,14 @@ extern char *ChooseRelationName(const char *name1, const char *name2,
 								bool isconstraint);
 extern bool CheckIndexCompatible(Oid oldId,
 								 const char *accessMethodName,
-								 List *attributeList,
-								 List *exclusionOpNames);
+								 const List *attributeList,
+								 const List *exclusionOpNames,
+								 bool isWithoutOverlaps);
 extern Oid	GetDefaultOpClass(Oid type_id, Oid am_id);
-extern Oid	ResolveOpClass(List *opclass, Oid attrType,
+extern Oid	ResolveOpClass(const List *opclass, Oid attrType,
 						   const char *accessMethodName, Oid accessMethodId);
+extern void GetOperatorFromCompareType(Oid opclass, Oid rhstype, CompareType cmptype,
+									   Oid *opid, StrategyNumber *strat);
 
 /* commands/functioncmds.c */
 extern ObjectAddress CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt);
@@ -81,7 +86,7 @@ extern void RemoveOperatorById(Oid operOid);
 extern ObjectAddress AlterOperator(AlterOperatorStmt *stmt);
 
 /* commands/statscmds.c */
-extern ObjectAddress CreateStatistics(CreateStatsStmt *stmt);
+extern ObjectAddress CreateStatistics(CreateStatsStmt *stmt, bool check_rights);
 extern ObjectAddress AlterStatistics(AlterStatsStmt *stmt);
 extern void RemoveStatisticsById(Oid statsOid);
 extern void RemoveStatisticsDataById(Oid statsOid, bool inh);
@@ -156,6 +161,6 @@ extern List *defGetQualifiedName(DefElem *def);
 extern TypeName *defGetTypeName(DefElem *def);
 extern int	defGetTypeLength(DefElem *def);
 extern List *defGetStringList(DefElem *def);
-extern void errorConflictingDefElem(DefElem *defel, ParseState *pstate) pg_attribute_noreturn();
+pg_noreturn extern void errorConflictingDefElem(DefElem *defel, ParseState *pstate);
 
 #endif							/* DEFREM_H */

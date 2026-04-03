@@ -4,7 +4,7 @@
  *	  Miscellaneous functions for bit-wise operations.
  *
  *
- * Copyright (c) 2019-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2019-2026, PostgreSQL Global Development Group
  *
  * src/include/port/pg_bitutils.h
  *
@@ -48,8 +48,9 @@ pg_leftmost_one_pos32(uint32 word)
 	unsigned long result;
 	bool		non_zero;
 
+	Assert(word != 0);
+
 	non_zero = _BitScanReverse(&result, word);
-	Assert(non_zero);
 	return (int) result;
 #else
 	int			shift = 32 - 8;
@@ -73,20 +74,21 @@ pg_leftmost_one_pos64(uint64 word)
 #ifdef HAVE__BUILTIN_CLZ
 	Assert(word != 0);
 
-#if defined(HAVE_LONG_INT_64)
+#if SIZEOF_LONG == 8
 	return 63 - __builtin_clzl(word);
-#elif defined(HAVE_LONG_LONG_INT_64)
+#elif SIZEOF_LONG_LONG == 8
 	return 63 - __builtin_clzll(word);
 #else
-#error must have a working 64-bit integer datatype
-#endif							/* HAVE_LONG_INT_64 */
+#error "cannot find integer type of the same size as uint64_t"
+#endif
 
 #elif defined(_MSC_VER) && (defined(_M_AMD64) || defined(_M_ARM64))
 	unsigned long result;
 	bool		non_zero;
 
+	Assert(word != 0);
+
 	non_zero = _BitScanReverse64(&result, word);
-	Assert(non_zero);
 	return (int) result;
 #else
 	int			shift = 64 - 8;
@@ -116,8 +118,9 @@ pg_rightmost_one_pos32(uint32 word)
 	unsigned long result;
 	bool		non_zero;
 
+	Assert(word != 0);
+
 	non_zero = _BitScanForward(&result, word);
-	Assert(non_zero);
 	return (int) result;
 #else
 	int			result = 0;
@@ -144,20 +147,21 @@ pg_rightmost_one_pos64(uint64 word)
 #ifdef HAVE__BUILTIN_CTZ
 	Assert(word != 0);
 
-#if defined(HAVE_LONG_INT_64)
+#if SIZEOF_LONG == 8
 	return __builtin_ctzl(word);
-#elif defined(HAVE_LONG_LONG_INT_64)
+#elif SIZEOF_LONG_LONG == 8
 	return __builtin_ctzll(word);
 #else
-#error must have a working 64-bit integer datatype
-#endif							/* HAVE_LONG_INT_64 */
+#error "cannot find integer type of the same size as uint64_t"
+#endif
 
 #elif defined(_MSC_VER) && (defined(_M_AMD64) || defined(_M_ARM64))
 	unsigned long result;
 	bool		non_zero;
 
+	Assert(word != 0);
+
 	non_zero = _BitScanForward64(&result, word);
-	Assert(non_zero);
 	return (int) result;
 #else
 	int			result = 0;
@@ -272,42 +276,116 @@ pg_ceil_log2_64(uint64 num)
 		return pg_leftmost_one_pos64(num - 1) + 1;
 }
 
-/*
- * With MSVC on x86_64 builds, try using native popcnt instructions via the
- * __popcnt and __popcnt64 intrinsics.  These don't work the same as GCC's
- * __builtin_popcount* intrinsic functions as they always emit popcnt
- * instructions.
- */
-#if defined(_MSC_VER) && defined(_M_AMD64)
-#define HAVE_X86_64_POPCNTQ
-#endif
+extern uint64 pg_popcount_portable(const char *buf, int bytes);
+extern uint64 pg_popcount_masked_portable(const char *buf, int bytes, bits8 mask);
 
+#if defined(HAVE_X86_64_POPCNTQ) || defined(USE_SVE_POPCNT_WITH_RUNTIME_CHECK)
 /*
- * On x86_64, we can use the hardware popcount instruction, but only if
- * we can verify that the CPU supports it via the cpuid instruction.
- *
- * Otherwise, we fall back to a hand-rolled implementation.
+ * Attempt to use specialized CPU instructions, but perform a runtime check
+ * first.
  */
-#ifdef HAVE_X86_64_POPCNTQ
-#if defined(HAVE__GET_CPUID) || defined(HAVE__CPUID)
-#define TRY_POPCNT_FAST 1
-#endif
-#endif
-
-#ifdef TRY_POPCNT_FAST
-/* Attempt to use the POPCNT instruction, but perform a runtime check first */
-extern int	(*pg_popcount32) (uint32 word);
-extern int	(*pg_popcount64) (uint64 word);
+extern PGDLLIMPORT uint64 (*pg_popcount_optimized) (const char *buf, int bytes);
+extern PGDLLIMPORT uint64 (*pg_popcount_masked_optimized) (const char *buf, int bytes, bits8 mask);
 
 #else
 /* Use a portable implementation -- no need for a function pointer. */
-extern int	pg_popcount32(uint32 word);
-extern int	pg_popcount64(uint64 word);
+extern uint64 pg_popcount_optimized(const char *buf, int bytes);
+extern uint64 pg_popcount_masked_optimized(const char *buf, int bytes, bits8 mask);
 
-#endif							/* TRY_POPCNT_FAST */
+#endif
 
-/* Count the number of one-bits in a byte array */
-extern uint64 pg_popcount(const char *buf, int bytes);
+/*
+ * pg_popcount32
+ *		Return the number of 1 bits set in word
+ *
+ * Adapted from
+ * https://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel.
+ *
+ * Note that newer versions of popular compilers will automatically replace
+ * this with a special popcount instruction if possible, so we don't bother
+ * using builtin functions or intrinsics.
+ */
+static inline int
+pg_popcount32(uint32 word)
+{
+	word -= (word >> 1) & 0x55555555;
+	word = (word & 0x33333333) + ((word >> 2) & 0x33333333);
+	return (((word + (word >> 4)) & 0xf0f0f0f) * 0x1010101) >> 24;
+}
+
+/*
+ * pg_popcount64
+ *		Return the number of 1 bits set in word
+ *
+ * Adapted from
+ * https://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel.
+ *
+ * Note that newer versions of popular compilers will automatically replace
+ * this with a special popcount instruction if possible, so we don't bother
+ * using builtin functions or intrinsics.
+ */
+static inline int
+pg_popcount64(uint64 word)
+{
+	word -= (word >> 1) & UINT64CONST(0x5555555555555555);
+	word = (word & UINT64CONST(0x3333333333333333)) +
+		((word >> 2) & UINT64CONST(0x3333333333333333));
+	word = (word + (word >> 4)) & UINT64CONST(0xf0f0f0f0f0f0f0f);
+	return (word * UINT64CONST(0x101010101010101)) >> 56;
+}
+
+/*
+ * Returns the number of 1-bits in buf.
+ *
+ * If there aren't many bytes to process, the function call overhead of the
+ * optimized versions isn't worth taking, so we inline a loop that consults
+ * pg_number_of_ones in that case.  If there are many bytes to process, we
+ * accept the function call overhead because the optimized versions are likely
+ * to be faster.
+ */
+static inline uint64
+pg_popcount(const char *buf, int bytes)
+{
+	/*
+	 * We set the threshold to the point at which we'll first use special
+	 * instructions in the optimized version.
+	 */
+	if (bytes < 8)
+	{
+		uint64		popcnt = 0;
+
+		while (bytes--)
+			popcnt += pg_number_of_ones[(unsigned char) *buf++];
+		return popcnt;
+	}
+
+	return pg_popcount_optimized(buf, bytes);
+}
+
+/*
+ * Returns the number of 1-bits in buf after applying the mask to each byte.
+ *
+ * Similar to pg_popcount(), we only take on the function pointer overhead when
+ * it's likely to be faster.
+ */
+static inline uint64
+pg_popcount_masked(const char *buf, int bytes, bits8 mask)
+{
+	/*
+	 * We set the threshold to the point at which we'll first use special
+	 * instructions in the optimized version.
+	 */
+	if (bytes < 8)
+	{
+		uint64		popcnt = 0;
+
+		while (bytes--)
+			popcnt += pg_number_of_ones[(unsigned char) *buf++ & mask];
+		return popcnt;
+	}
+
+	return pg_popcount_masked_optimized(buf, bytes, mask);
+}
 
 /*
  * Rotate the bits of "word" to the right/left by n bits.

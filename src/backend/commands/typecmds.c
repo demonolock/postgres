@@ -3,7 +3,7 @@
  * typecmds.c
  *	  Routines for SQL commands that manipulate types (and domains).
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,7 +13,7 @@
  * DESCRIPTION
  *	  The "DefineFoo" routines take the parse tree and pick out the
  *	  appropriate arguments/flags, passing the results to the
- *	  corresponding "FooDefine" routines (in src/catalog) that do
+ *	  corresponding "FooCreate" routines (in src/backend/catalog) that do
  *	  the actual catalog-munging.  These routines also verify permission
  *	  of the user to execute the command.
  *
@@ -32,8 +32,9 @@
 #include "postgres.h"
 
 #include "access/genam.h"
-#include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/relation.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
@@ -68,7 +69,6 @@
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
@@ -111,10 +111,12 @@ Oid			binary_upgrade_next_mrng_pg_type_oid = InvalidOid;
 Oid			binary_upgrade_next_mrng_array_pg_type_oid = InvalidOid;
 
 static void makeRangeConstructors(const char *name, Oid namespace,
-								  Oid rangeOid, Oid subtype);
+								  Oid rangeOid, Oid subtype,
+								  Oid *rangeConstruct2_p, Oid *rangeConstruct3_p);
 static void makeMultirangeConstructors(const char *name, Oid namespace,
 									   Oid multirangeOid, Oid rangeOid,
-									   Oid rangeArrayOid, Oid *castFuncOid);
+									   Oid rangeArrayOid,
+									   Oid *mltrngConstruct0_p, Oid *mltrngConstruct1_p, Oid *mltrngConstruct2_p);
 static Oid	findTypeInputFunction(List *procname, Oid typeOid);
 static Oid	findTypeOutputFunction(List *procname, Oid typeOid);
 static Oid	findTypeReceiveFunction(List *procname, Oid typeOid);
@@ -126,15 +128,19 @@ static Oid	findTypeSubscriptingFunction(List *procname, Oid typeOid);
 static Oid	findRangeSubOpclass(List *opcname, Oid subtype);
 static Oid	findRangeCanonicalFunction(List *procname, Oid typeOid);
 static Oid	findRangeSubtypeDiffFunction(List *procname, Oid subtype);
-static void validateDomainConstraint(Oid domainoid, char *ccbin);
+static void validateDomainCheckConstraint(Oid domainoid, const char *ccbin, LOCKMODE lockmode);
+static void validateDomainNotNullConstraint(Oid domainoid);
 static List *get_rels_with_domain(Oid domainOid, LOCKMODE lockmode);
 static void checkEnumOwner(HeapTuple tup);
-static char *domainAddConstraint(Oid domainOid, Oid domainNamespace,
-								 Oid baseTypeOid,
-								 int typMod, Constraint *constr,
-								 const char *domainName, ObjectAddress *constrAddr);
+static char *domainAddCheckConstraint(Oid domainOid, Oid domainNamespace,
+									  Oid baseTypeOid,
+									  int typMod, Constraint *constr,
+									  const char *domainName, ObjectAddress *constrAddr);
 static Node *replace_domain_constraint_value(ParseState *pstate,
 											 ColumnRef *cref);
+static void domainAddNotNullConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
+									   int typMod, Constraint *constr,
+									   const char *domainName, ObjectAddress *constrAddr);
 static void AlterTypeRecurse(Oid typeOid, bool isImplicitArray,
 							 HeapTuple tup, Relation catalog,
 							 AlterTypeRecurseParams *atparams);
@@ -344,7 +350,7 @@ DefineType(ParseState *pstate, List *names, List *parameters)
 		Type		likeType;
 		Form_pg_type likeForm;
 
-		likeType = typenameType(NULL, defGetTypeName(likeTypeEl), NULL);
+		likeType = typenameType(pstate, defGetTypeName(likeTypeEl), NULL);
 		likeForm = (Form_pg_type) GETSTRUCT(likeType);
 		internalLength = likeForm->typlen;
 		byValue = likeForm->typbyval;
@@ -690,7 +696,7 @@ RemoveTypeById(Oid typeOid)
  *		Registers a new domain.
  */
 ObjectAddress
-DefineDomain(CreateDomainStmt *stmt)
+DefineDomain(ParseState *pstate, CreateDomainStmt *stmt)
 {
 	char	   *domainName;
 	char	   *domainArrayName;
@@ -757,7 +763,7 @@ DefineDomain(CreateDomainStmt *stmt)
 	/*
 	 * Look up the base type.
 	 */
-	typeTup = typenameType(NULL, stmt->typeName, &basetypeMod);
+	typeTup = typenameType(pstate, stmt->typeName, &basetypeMod);
 	baseType = (Form_pg_type) GETSTRUCT(typeTup);
 	basetypeoid = baseType->oid;
 
@@ -779,7 +785,8 @@ DefineDomain(CreateDomainStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("\"%s\" is not a valid base type for a domain",
-						TypeNameToString(stmt->typeName))));
+						TypeNameToString(stmt->typeName)),
+				 parser_errposition(pstate, stmt->typeName->location)));
 
 	aclresult = object_aclcheck(TypeRelationId, basetypeoid, GetUserId(), ACL_USAGE);
 	if (aclresult != ACLCHECK_OK)
@@ -805,7 +812,8 @@ DefineDomain(CreateDomainStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("collations are not supported by type %s",
-						format_type_be(basetypeoid))));
+						format_type_be(basetypeoid)),
+				 parser_errposition(pstate, stmt->typeName->location)));
 
 	/* passed by value */
 	byValue = baseType->typbyval;
@@ -875,17 +883,14 @@ DefineDomain(CreateDomainStmt *stmt)
 				 */
 				if (saw_default)
 					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("multiple default expressions")));
+							errcode(ERRCODE_SYNTAX_ERROR),
+							errmsg("multiple default expressions"),
+							parser_errposition(pstate, constr->location));
 				saw_default = true;
 
 				if (constr->raw_expr)
 				{
-					ParseState *pstate;
 					Node	   *defaultExpr;
-
-					/* Create a dummy ParseState for transformExpr */
-					pstate = make_parsestate(NULL);
 
 					/*
 					 * Cook the constr->raw_expr into an expression. Note:
@@ -936,10 +941,24 @@ DefineDomain(CreateDomainStmt *stmt)
 				break;
 
 			case CONSTR_NOTNULL:
-				if (nullDefined && !typNotNull)
+				if (nullDefined)
+				{
+					if (!typNotNull)
+						ereport(ERROR,
+								errcode(ERRCODE_SYNTAX_ERROR),
+								errmsg("conflicting NULL/NOT NULL constraints"),
+								parser_errposition(pstate, constr->location));
+
 					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("conflicting NULL/NOT NULL constraints")));
+							errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							errmsg("redundant NOT NULL constraint definition"),
+							parser_errposition(pstate, constr->location));
+				}
+				if (constr->is_no_inherit)
+					ereport(ERROR,
+							errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							errmsg("not-null constraints for domains cannot be marked NO INHERIT"),
+							parser_errposition(pstate, constr->location));
 				typNotNull = true;
 				nullDefined = true;
 				break;
@@ -947,8 +966,9 @@ DefineDomain(CreateDomainStmt *stmt)
 			case CONSTR_NULL:
 				if (nullDefined && typNotNull)
 					ereport(ERROR,
-							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("conflicting NULL/NOT NULL constraints")));
+							errcode(ERRCODE_SYNTAX_ERROR),
+							errmsg("conflicting NULL/NOT NULL constraints"),
+							parser_errposition(pstate, constr->location));
 				typNotNull = false;
 				nullDefined = true;
 				break;
@@ -963,8 +983,10 @@ DefineDomain(CreateDomainStmt *stmt)
 				 */
 				if (constr->is_no_inherit)
 					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-							 errmsg("check constraints for domains cannot be marked NO INHERIT")));
+							errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							errmsg("check constraints for domains cannot be marked NO INHERIT"),
+							parser_errposition(pstate, constr->location));
+
 				break;
 
 				/*
@@ -972,26 +994,30 @@ DefineDomain(CreateDomainStmt *stmt)
 				 */
 			case CONSTR_UNIQUE:
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("unique constraints not possible for domains")));
+						errcode(ERRCODE_SYNTAX_ERROR),
+						errmsg("unique constraints not possible for domains"),
+						parser_errposition(pstate, constr->location));
 				break;
 
 			case CONSTR_PRIMARY:
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("primary key constraints not possible for domains")));
+						 errmsg("primary key constraints not possible for domains"),
+						 parser_errposition(pstate, constr->location)));
 				break;
 
 			case CONSTR_EXCLUSION:
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("exclusion constraints not possible for domains")));
+						 errmsg("exclusion constraints not possible for domains"),
+						 parser_errposition(pstate, constr->location)));
 				break;
 
 			case CONSTR_FOREIGN:
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("foreign key constraints not possible for domains")));
+						 errmsg("foreign key constraints not possible for domains"),
+						 parser_errposition(pstate, constr->location)));
 				break;
 
 			case CONSTR_ATTR_DEFERRABLE:
@@ -1000,13 +1026,27 @@ DefineDomain(CreateDomainStmt *stmt)
 			case CONSTR_ATTR_IMMEDIATE:
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("specifying constraint deferrability not supported for domains")));
+						 errmsg("specifying constraint deferrability not supported for domains"),
+						 parser_errposition(pstate, constr->location)));
 				break;
 
-			default:
-				elog(ERROR, "unrecognized constraint subtype: %d",
-					 (int) constr->contype);
+			case CONSTR_GENERATED:
+			case CONSTR_IDENTITY:
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("specifying GENERATED not supported for domains"),
+						 parser_errposition(pstate, constr->location)));
 				break;
+
+			case CONSTR_ATTR_ENFORCED:
+			case CONSTR_ATTR_NOT_ENFORCED:
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("specifying constraint enforceability not supported for domains"),
+						 parser_errposition(pstate, constr->location)));
+				break;
+
+				/* no default, to let compiler warn about missing case */
 		}
 	}
 
@@ -1105,9 +1145,15 @@ DefineDomain(CreateDomainStmt *stmt)
 		switch (constr->contype)
 		{
 			case CONSTR_CHECK:
-				domainAddConstraint(address.objectId, domainNamespace,
-									basetypeoid, basetypeMod,
-									constr, domainName, NULL);
+				domainAddCheckConstraint(address.objectId, domainNamespace,
+										 basetypeoid, basetypeMod,
+										 constr, domainName, NULL);
+				break;
+
+			case CONSTR_NOTNULL:
+				domainAddNotNullConstraint(address.objectId, domainNamespace,
+										   basetypeoid, basetypeMod,
+										   constr, domainName, NULL);
 				break;
 
 				/* Other constraint types were fully processed above */
@@ -1362,6 +1408,11 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 	ListCell   *lc;
 	ObjectAddress address;
 	ObjectAddress mltrngaddress PG_USED_FOR_ASSERTS_ONLY;
+	Oid			rangeConstruct2Oid = InvalidOid;
+	Oid			rangeConstruct3Oid = InvalidOid;
+	Oid			mltrngConstruct0Oid = InvalidOid;
+	Oid			mltrngConstruct1Oid = InvalidOid;
+	Oid			mltrngConstruct2Oid = InvalidOid;
 	Oid			castFuncOid;
 
 	/* Convert list of names to a name and namespace */
@@ -1617,10 +1668,6 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 				   InvalidOid); /* type's collation (ranges never have one) */
 	Assert(multirangeOid == mltrngaddress.objectId);
 
-	/* Create the entry in pg_range */
-	RangeCreate(typoid, rangeSubtype, rangeCollation, rangeSubOpclass,
-				rangeCanonical, rangeSubtypeDiff, multirangeOid);
-
 	/*
 	 * Create the array type that goes with it.
 	 */
@@ -1698,11 +1745,22 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 			   false,			/* Type NOT NULL */
 			   InvalidOid);		/* typcollation */
 
+	/* Ensure these new types are visible to ProcedureCreate */
+	CommandCounterIncrement();
+
 	/* And create the constructor functions for this range type */
-	makeRangeConstructors(typeName, typeNamespace, typoid, rangeSubtype);
+	makeRangeConstructors(typeName, typeNamespace, typoid, rangeSubtype,
+						  &rangeConstruct2Oid, &rangeConstruct3Oid);
 	makeMultirangeConstructors(multirangeTypeName, typeNamespace,
 							   multirangeOid, typoid, rangeArrayOid,
-							   &castFuncOid);
+							   &mltrngConstruct0Oid, &mltrngConstruct1Oid, &mltrngConstruct2Oid);
+	castFuncOid = mltrngConstruct1Oid;
+
+	/* Create the entry in pg_range */
+	RangeCreate(typoid, rangeSubtype, rangeCollation, rangeSubOpclass,
+				rangeCanonical, rangeSubtypeDiff, multirangeOid,
+				rangeConstruct2Oid, rangeConstruct3Oid,
+				mltrngConstruct0Oid, mltrngConstruct1Oid, mltrngConstruct2Oid);
 
 	/* Create cast from the range type to its multirange type */
 	CastCreate(typoid, multirangeOid, castFuncOid, InvalidOid, InvalidOid,
@@ -1720,12 +1778,16 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
  * impossible to define a polymorphic constructor; we have to generate new
  * constructor functions explicitly for each range type.
  *
- * We actually define 4 functions, with 0 through 3 arguments.  This is just
+ * We actually define 2 functions, with 2 through 3 arguments.  This is just
  * to offer more convenience for the user.
+ *
+ * The OIDs of the created functions are returned through the pointer
+ * arguments.
  */
 static void
 makeRangeConstructors(const char *name, Oid namespace,
-					  Oid rangeOid, Oid subtype)
+					  Oid rangeOid, Oid subtype,
+					  Oid *rangeConstruct2_p, Oid *rangeConstruct3_p)
 {
 	static const char *const prosrc[2] = {"range_constructor2",
 	"range_constructor3"};
@@ -1774,6 +1836,7 @@ makeRangeConstructors(const char *name, Oid namespace,
 								 PointerGetDatum(NULL), /* parameterNames */
 								 NIL,	/* parameterDefaults */
 								 PointerGetDatum(NULL), /* trftypes */
+								 NIL,	/* trfoids */
 								 PointerGetDatum(NULL), /* proconfig */
 								 InvalidOid,	/* prosupport */
 								 1.0,	/* procost */
@@ -1785,6 +1848,11 @@ makeRangeConstructors(const char *name, Oid namespace,
 		 * pg_dump depends on this choice to avoid dumping the constructors.
 		 */
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL);
+
+		if (pronargs[i] == 2)
+			*rangeConstruct2_p = myself.objectId;
+		else if (pronargs[i] == 3)
+			*rangeConstruct3_p = myself.objectId;
 	}
 }
 
@@ -1794,13 +1862,13 @@ makeRangeConstructors(const char *name, Oid namespace,
  * If we had an anyrangearray polymorphic type we could use it here,
  * but since each type has its own constructor name there's no need.
  *
- * Sets castFuncOid to the oid of the new constructor that can be used
- * to cast from a range to a multirange.
+ * The OIDs of the created functions are returned through the pointer
+ * arguments.
  */
 static void
 makeMultirangeConstructors(const char *name, Oid namespace,
 						   Oid multirangeOid, Oid rangeOid, Oid rangeArrayOid,
-						   Oid *castFuncOid)
+						   Oid *mltrngConstruct0_p, Oid *mltrngConstruct1_p, Oid *mltrngConstruct2_p)
 {
 	ObjectAddress myself,
 				referenced;
@@ -1839,6 +1907,7 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 							 PointerGetDatum(NULL), /* parameterNames */
 							 NIL,	/* parameterDefaults */
 							 PointerGetDatum(NULL), /* trftypes */
+							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
 							 InvalidOid,	/* prosupport */
 							 1.0,	/* procost */
@@ -1850,6 +1919,7 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 	 * depends on this choice to avoid dumping the constructors.
 	 */
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL);
+	*mltrngConstruct0_p = myself.objectId;
 	pfree(argtypes);
 
 	/*
@@ -1883,14 +1953,15 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 							 PointerGetDatum(NULL), /* parameterNames */
 							 NIL,	/* parameterDefaults */
 							 PointerGetDatum(NULL), /* trftypes */
+							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
 							 InvalidOid,	/* prosupport */
 							 1.0,	/* procost */
 							 0.0);	/* prorows */
 	/* ditto */
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL);
+	*mltrngConstruct1_p = myself.objectId;
 	pfree(argtypes);
-	*castFuncOid = myself.objectId;
 
 	/* n-arg constructor - vararg */
 	argtypes = buildoidvector(&rangeArrayOid, 1);
@@ -1921,12 +1992,14 @@ makeMultirangeConstructors(const char *name, Oid namespace,
 							 PointerGetDatum(NULL), /* parameterNames */
 							 NIL,	/* parameterDefaults */
 							 PointerGetDatum(NULL), /* trftypes */
+							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
 							 InvalidOid,	/* prosupport */
 							 1.0,	/* procost */
 							 0.0);	/* prorows */
 	/* ditto */
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL);
+	*mltrngConstruct2_p = myself.objectId;
 	pfree(argtypes);
 	pfree(allParameterTypes);
 	pfree(parameterModes);
@@ -2723,66 +2796,32 @@ AlterDomainNotNull(List *names, bool notNull)
 		return address;
 	}
 
-	/* Adding a NOT NULL constraint requires checking existing columns */
 	if (notNull)
 	{
-		List	   *rels;
-		ListCell   *rt;
+		Constraint *constr;
 
-		/* Fetch relation list with attributes based on this domain */
-		/* ShareLock is sufficient to prevent concurrent data changes */
+		constr = makeNode(Constraint);
+		constr->contype = CONSTR_NOTNULL;
+		constr->initially_valid = true;
+		constr->location = -1;
 
-		rels = get_rels_with_domain(domainoid, ShareLock);
+		domainAddNotNullConstraint(domainoid, typTup->typnamespace,
+								   typTup->typbasetype, typTup->typtypmod,
+								   constr, NameStr(typTup->typname), NULL);
 
-		foreach(rt, rels)
-		{
-			RelToCheck *rtc = (RelToCheck *) lfirst(rt);
-			Relation	testrel = rtc->rel;
-			TupleDesc	tupdesc = RelationGetDescr(testrel);
-			TupleTableSlot *slot;
-			TableScanDesc scan;
-			Snapshot	snapshot;
+		validateDomainNotNullConstraint(domainoid);
+	}
+	else
+	{
+		HeapTuple	conTup;
+		ObjectAddress conobj;
 
-			/* Scan all tuples in this relation */
-			snapshot = RegisterSnapshot(GetLatestSnapshot());
-			scan = table_beginscan(testrel, snapshot, 0, NULL);
-			slot = table_slot_create(testrel, NULL);
-			while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
-			{
-				int			i;
+		conTup = findDomainNotNullConstraint(domainoid);
+		if (conTup == NULL)
+			elog(ERROR, "could not find not-null constraint on domain \"%s\"", NameStr(typTup->typname));
 
-				/* Test attributes that are of the domain */
-				for (i = 0; i < rtc->natts; i++)
-				{
-					int			attnum = rtc->atts[i];
-					Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
-
-					if (slot_attisnull(slot, attnum))
-					{
-						/*
-						 * In principle the auxiliary information for this
-						 * error should be errdatatype(), but errtablecol()
-						 * seems considerably more useful in practice.  Since
-						 * this code only executes in an ALTER DOMAIN command,
-						 * the client should already know which domain is in
-						 * question.
-						 */
-						ereport(ERROR,
-								(errcode(ERRCODE_NOT_NULL_VIOLATION),
-								 errmsg("column \"%s\" of table \"%s\" contains null values",
-										NameStr(attr->attname),
-										RelationGetRelationName(testrel)),
-								 errtablecol(testrel, attnum)));
-					}
-				}
-			}
-			ExecDropSingleTupleTableSlot(slot);
-			table_endscan(scan);
-			UnregisterSnapshot(snapshot);
-
-			/* Close each rel after processing, but keep lock */
-			table_close(testrel, NoLock);
-		}
+		ObjectAddressSet(conobj, ConstraintRelationId, ((Form_pg_constraint) GETSTRUCT(conTup))->oid);
+		performDeletion(&conobj, DROP_RESTRICT, 0);
 	}
 
 	/*
@@ -2863,10 +2902,17 @@ AlterDomainDropConstraint(List *names, const char *constrName,
 	/* There can be at most one matching row */
 	if ((contup = systable_getnext(conscan)) != NULL)
 	{
+		Form_pg_constraint construct = (Form_pg_constraint) GETSTRUCT(contup);
 		ObjectAddress conobj;
 
+		if (construct->contype == CONSTRAINT_NOTNULL)
+		{
+			((Form_pg_type) GETSTRUCT(tup))->typnotnull = false;
+			CatalogTupleUpdate(rel, &tup->t_self, tup);
+		}
+
 		conobj.classId = ConstraintRelationId;
-		conobj.objectId = ((Form_pg_constraint) GETSTRUCT(contup))->oid;
+		conobj.objectId = construct->oid;
 		conobj.objectSubId = 0;
 
 		performDeletion(&conobj, behavior, 0);
@@ -2921,7 +2967,7 @@ AlterDomainAddConstraint(List *names, Node *newConstraint,
 	Form_pg_type typTup;
 	Constraint *constr;
 	char	   *ccbin;
-	ObjectAddress address;
+	ObjectAddress address = InvalidObjectAddress;
 
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
@@ -2944,74 +2990,55 @@ AlterDomainAddConstraint(List *names, Node *newConstraint,
 
 	constr = (Constraint *) newConstraint;
 
-	switch (constr->contype)
+	/* enforced by parser */
+	Assert(constr->contype == CONSTR_CHECK || constr->contype == CONSTR_NOTNULL);
+
+	if (constr->contype == CONSTR_CHECK)
 	{
-		case CONSTR_CHECK:
-			/* processed below */
-			break;
+		/*
+		 * First, process the constraint expression and add an entry to
+		 * pg_constraint.
+		 */
 
-		case CONSTR_UNIQUE:
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("unique constraints not possible for domains")));
-			break;
+		ccbin = domainAddCheckConstraint(domainoid, typTup->typnamespace,
+										 typTup->typbasetype, typTup->typtypmod,
+										 constr, NameStr(typTup->typname), constrAddr);
 
-		case CONSTR_PRIMARY:
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("primary key constraints not possible for domains")));
-			break;
 
-		case CONSTR_EXCLUSION:
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("exclusion constraints not possible for domains")));
-			break;
+		/*
+		 * If requested to validate the constraint, test all values stored in
+		 * the attributes based on the domain the constraint is being added
+		 * to.
+		 */
+		if (!constr->skip_validation)
+			validateDomainCheckConstraint(domainoid, ccbin, ShareLock);
 
-		case CONSTR_FOREIGN:
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("foreign key constraints not possible for domains")));
-			break;
-
-		case CONSTR_ATTR_DEFERRABLE:
-		case CONSTR_ATTR_NOT_DEFERRABLE:
-		case CONSTR_ATTR_DEFERRED:
-		case CONSTR_ATTR_IMMEDIATE:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("specifying constraint deferrability not supported for domains")));
-			break;
-
-		default:
-			elog(ERROR, "unrecognized constraint subtype: %d",
-				 (int) constr->contype);
-			break;
+		/*
+		 * We must send out an sinval message for the domain, to ensure that
+		 * any dependent plans get rebuilt.  Since this command doesn't change
+		 * the domain's pg_type row, that won't happen automatically; do it
+		 * manually.
+		 */
+		CacheInvalidateHeapTuple(typrel, tup, NULL);
 	}
+	else if (constr->contype == CONSTR_NOTNULL)
+	{
+		/* Is the domain already set NOT NULL? */
+		if (typTup->typnotnull)
+		{
+			table_close(typrel, RowExclusiveLock);
+			return address;
+		}
+		domainAddNotNullConstraint(domainoid, typTup->typnamespace,
+								   typTup->typbasetype, typTup->typtypmod,
+								   constr, NameStr(typTup->typname), constrAddr);
 
-	/*
-	 * Since all other constraint types throw errors, this must be a check
-	 * constraint.  First, process the constraint expression and add an entry
-	 * to pg_constraint.
-	 */
+		if (!constr->skip_validation)
+			validateDomainNotNullConstraint(domainoid);
 
-	ccbin = domainAddConstraint(domainoid, typTup->typnamespace,
-								typTup->typbasetype, typTup->typtypmod,
-								constr, NameStr(typTup->typname), constrAddr);
-
-	/*
-	 * If requested to validate the constraint, test all values stored in the
-	 * attributes based on the domain the constraint is being added to.
-	 */
-	if (!constr->skip_validation)
-		validateDomainConstraint(domainoid, ccbin);
-
-	/*
-	 * We must send out an sinval message for the domain, to ensure that any
-	 * dependent plans get rebuilt.  Since this command doesn't change the
-	 * domain's pg_type row, that won't happen automatically; do it manually.
-	 */
-	CacheInvalidateHeapTuple(typrel, tup, NULL);
+		typTup->typnotnull = true;
+		CatalogTupleUpdate(typrel, &tup->t_self, tup);
+	}
 
 	ObjectAddressSet(address, TypeRelationId, domainoid);
 
@@ -3025,6 +3052,9 @@ AlterDomainAddConstraint(List *names, Node *newConstraint,
  * AlterDomainValidateConstraint
  *
  * Implements the ALTER DOMAIN .. VALIDATE CONSTRAINT statement.
+ *
+ * Return value is the address of the validated constraint.  If the constraint
+ * was already validated, InvalidObjectAddress is returned.
  */
 ObjectAddress
 AlterDomainValidateConstraint(List *names, const char *constrName)
@@ -3042,7 +3072,7 @@ AlterDomainValidateConstraint(List *names, const char *constrName)
 	HeapTuple	tuple;
 	HeapTuple	copyTuple;
 	ScanKeyData skey[3];
-	ObjectAddress address;
+	ObjectAddress address = InvalidObjectAddress;
 
 	/* Make a TypeName so we can use standard type lookup machinery */
 	typename = makeTypeNameFromNameList(names);
@@ -3093,24 +3123,32 @@ AlterDomainValidateConstraint(List *names, const char *constrName)
 				 errmsg("constraint \"%s\" of domain \"%s\" is not a check constraint",
 						constrName, TypeNameToString(typename))));
 
-	val = SysCacheGetAttrNotNull(CONSTROID, tuple, Anum_pg_constraint_conbin);
-	conbin = TextDatumGetCString(val);
+	if (!con->convalidated)
+	{
+		val = SysCacheGetAttrNotNull(CONSTROID, tuple, Anum_pg_constraint_conbin);
+		conbin = TextDatumGetCString(val);
 
-	validateDomainConstraint(domainoid, conbin);
+		/*
+		 * Locking related relations with ShareUpdateExclusiveLock is ok
+		 * because not-yet-valid constraints are still enforced against
+		 * concurrent inserts or updates.
+		 */
+		validateDomainCheckConstraint(domainoid, conbin, ShareUpdateExclusiveLock);
 
-	/*
-	 * Now update the catalog, while we have the door open.
-	 */
-	copyTuple = heap_copytuple(tuple);
-	copy_con = (Form_pg_constraint) GETSTRUCT(copyTuple);
-	copy_con->convalidated = true;
-	CatalogTupleUpdate(conrel, &copyTuple->t_self, copyTuple);
+		/*
+		 * Now update the catalog, while we have the door open.
+		 */
+		copyTuple = heap_copytuple(tuple);
+		copy_con = (Form_pg_constraint) GETSTRUCT(copyTuple);
+		copy_con->convalidated = true;
+		CatalogTupleUpdate(conrel, &copyTuple->t_self, copyTuple);
 
-	InvokeObjectPostAlterHook(ConstraintRelationId, con->oid, 0);
+		InvokeObjectPostAlterHook(ConstraintRelationId, con->oid, 0);
 
-	ObjectAddressSet(address, TypeRelationId, domainoid);
+		ObjectAddressSet(address, TypeRelationId, domainoid);
 
-	heap_freetuple(copyTuple);
+		heap_freetuple(copyTuple);
+	}
 
 	systable_endscan(scan);
 
@@ -3122,22 +3160,14 @@ AlterDomainValidateConstraint(List *names, const char *constrName)
 	return address;
 }
 
+/*
+ * Verify that all columns currently using the domain are not null.
+ */
 static void
-validateDomainConstraint(Oid domainoid, char *ccbin)
+validateDomainNotNullConstraint(Oid domainoid)
 {
-	Expr	   *expr = (Expr *) stringToNode(ccbin);
 	List	   *rels;
 	ListCell   *rt;
-	EState	   *estate;
-	ExprContext *econtext;
-	ExprState  *exprstate;
-
-	/* Need an EState to run ExecEvalExpr */
-	estate = CreateExecutorState();
-	econtext = GetPerTupleExprContext(estate);
-
-	/* build execution state for expr */
-	exprstate = ExecPrepareExpr(expr, estate);
 
 	/* Fetch relation list with attributes based on this domain */
 	/* ShareLock is sufficient to prevent concurrent data changes */
@@ -3165,10 +3195,90 @@ validateDomainConstraint(Oid domainoid, char *ccbin)
 			for (i = 0; i < rtc->natts; i++)
 			{
 				int			attnum = rtc->atts[i];
+				Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
+				if (slot_attisnull(slot, attnum))
+				{
+					/*
+					 * In principle the auxiliary information for this error
+					 * should be errdatatype(), but errtablecol() seems
+					 * considerably more useful in practice.  Since this code
+					 * only executes in an ALTER DOMAIN command, the client
+					 * should already know which domain is in question.
+					 */
+					ereport(ERROR,
+							(errcode(ERRCODE_NOT_NULL_VIOLATION),
+							 errmsg("column \"%s\" of table \"%s\" contains null values",
+									NameStr(attr->attname),
+									RelationGetRelationName(testrel)),
+							 errtablecol(testrel, attnum)));
+				}
+			}
+		}
+		ExecDropSingleTupleTableSlot(slot);
+		table_endscan(scan);
+		UnregisterSnapshot(snapshot);
+
+		/* Close each rel after processing, but keep lock */
+		table_close(testrel, NoLock);
+	}
+}
+
+/*
+ * Verify that all columns currently using the domain satisfy the given check
+ * constraint expression.
+ *
+ * It is used to validate existing constraints and to add newly created check
+ * constraints to a domain.
+ *
+ * The lockmode is used for relations using the domain.  It should be
+ * ShareLock when adding a new constraint to domain.  It can be
+ * ShareUpdateExclusiveLock when validating an existing constraint.
+ */
+static void
+validateDomainCheckConstraint(Oid domainoid, const char *ccbin, LOCKMODE lockmode)
+{
+	Expr	   *expr = (Expr *) stringToNode(ccbin);
+	List	   *rels;
+	ListCell   *rt;
+	EState	   *estate;
+	ExprContext *econtext;
+	ExprState  *exprstate;
+
+	/* Need an EState to run ExecEvalExpr */
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+
+	/* build execution state for expr */
+	exprstate = ExecPrepareExpr(expr, estate);
+
+	/* Fetch relation list with attributes based on this domain */
+	rels = get_rels_with_domain(domainoid, lockmode);
+
+	foreach(rt, rels)
+	{
+		RelToCheck *rtc = (RelToCheck *) lfirst(rt);
+		Relation	testrel = rtc->rel;
+		TupleDesc	tupdesc = RelationGetDescr(testrel);
+		TupleTableSlot *slot;
+		TableScanDesc scan;
+		Snapshot	snapshot;
+
+		/* Scan all tuples in this relation */
+		snapshot = RegisterSnapshot(GetLatestSnapshot());
+		scan = table_beginscan(testrel, snapshot, 0, NULL);
+		slot = table_slot_create(testrel, NULL);
+		while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
+		{
+			int			i;
+
+			/* Test attributes that are of the domain */
+			for (i = 0; i < rtc->natts; i++)
+			{
+				int			attnum = rtc->atts[i];
 				Datum		d;
 				bool		isNull;
 				Datum		conResult;
-				Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 
 				d = slot_getattr(slot, attnum, &isNull);
 
@@ -3181,6 +3291,8 @@ validateDomainConstraint(Oid domainoid, char *ccbin)
 
 				if (!isNull && !DatumGetBool(conResult))
 				{
+					Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
 					/*
 					 * In principle the auxiliary information for this error
 					 * should be errdomainconstraint(), but errtablecol()
@@ -3363,10 +3475,10 @@ get_rels_with_domain(Oid domainOid, LOCKMODE lockmode)
 			}
 
 			/* Build the RelToCheck entry with enough space for all atts */
-			rtc = (RelToCheck *) palloc(sizeof(RelToCheck));
+			rtc = palloc_object(RelToCheck);
 			rtc->rel = rel;
 			rtc->natts = 0;
-			rtc->atts = (int *) palloc(sizeof(int) * RelationGetNumberOfAttributes(rel));
+			rtc->atts = palloc_array(int, RelationGetNumberOfAttributes(rel));
 			result = lappend(result, rtc);
 		}
 
@@ -3429,18 +3541,20 @@ checkDomainOwner(HeapTuple tup)
 }
 
 /*
- * domainAddConstraint - code shared between CREATE and ALTER DOMAIN
+ * domainAddCheckConstraint - code shared between CREATE and ALTER DOMAIN
  */
 static char *
-domainAddConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
-					int typMod, Constraint *constr,
-					const char *domainName, ObjectAddress *constrAddr)
+domainAddCheckConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
+						 int typMod, Constraint *constr,
+						 const char *domainName, ObjectAddress *constrAddr)
 {
 	Node	   *expr;
 	char	   *ccbin;
 	ParseState *pstate;
 	CoerceToDomainValue *domVal;
 	Oid			ccoid;
+
+	Assert(constr->contype == CONSTR_CHECK);
 
 	/*
 	 * Assign or validate constraint name
@@ -3481,7 +3595,7 @@ domainAddConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
 	domVal->location = -1;		/* will be set when/if used */
 
 	pstate->p_pre_columnref_hook = replace_domain_constraint_value;
-	pstate->p_ref_hook_state = (void *) domVal;
+	pstate->p_ref_hook_state = domVal;
 
 	expr = transformExpr(pstate, constr->raw_expr, EXPR_KIND_DOMAIN_CHECK);
 
@@ -3519,6 +3633,7 @@ domainAddConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
 							  CONSTRAINT_CHECK, /* Constraint Type */
 							  false,	/* Is Deferrable */
 							  false,	/* Is Deferred */
+							  true, /* Is Enforced */
 							  !constr->skip_validation, /* Is Validated */
 							  InvalidOid,	/* no parent constraint */
 							  InvalidOid,	/* not a relation constraint */
@@ -3544,6 +3659,7 @@ domainAddConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
 							  true, /* is local */
 							  0,	/* inhcount */
 							  false,	/* connoinherit */
+							  false,	/* conperiod */
 							  false);	/* is_internal */
 	if (constrAddr)
 		ObjectAddressSet(*constrAddr, ConstraintRelationId, ccoid);
@@ -3561,9 +3677,10 @@ replace_domain_constraint_value(ParseState *pstate, ColumnRef *cref)
 {
 	/*
 	 * Check for a reference to "value", and if that's what it is, replace
-	 * with a CoerceToDomainValue as prepared for us by domainAddConstraint.
-	 * (We handle VALUE as a name, not a keyword, to avoid breaking a lot of
-	 * applications that have used VALUE as a column name in the past.)
+	 * with a CoerceToDomainValue as prepared for us by
+	 * domainAddCheckConstraint. (We handle VALUE as a name, not a keyword, to
+	 * avoid breaking a lot of applications that have used VALUE as a column
+	 * name in the past.)
 	 */
 	if (list_length(cref->fields) == 1)
 	{
@@ -3581,6 +3698,80 @@ replace_domain_constraint_value(ParseState *pstate, ColumnRef *cref)
 		}
 	}
 	return NULL;
+}
+
+/*
+ * domainAddNotNullConstraint - code shared between CREATE and ALTER DOMAIN
+ */
+static void
+domainAddNotNullConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
+						   int typMod, Constraint *constr,
+						   const char *domainName, ObjectAddress *constrAddr)
+{
+	Oid			ccoid;
+
+	Assert(constr->contype == CONSTR_NOTNULL);
+
+	/*
+	 * Assign or validate constraint name
+	 */
+	if (constr->conname)
+	{
+		if (ConstraintNameIsUsed(CONSTRAINT_DOMAIN,
+								 domainOid,
+								 constr->conname))
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("constraint \"%s\" for domain \"%s\" already exists",
+							constr->conname, domainName)));
+	}
+	else
+		constr->conname = ChooseConstraintName(domainName,
+											   NULL,
+											   "not_null",
+											   domainNamespace,
+											   NIL);
+
+	/*
+	 * Store the constraint in pg_constraint
+	 */
+	ccoid =
+		CreateConstraintEntry(constr->conname,	/* Constraint Name */
+							  domainNamespace,	/* namespace */
+							  CONSTRAINT_NOTNULL,	/* Constraint Type */
+							  false,	/* Is Deferrable */
+							  false,	/* Is Deferred */
+							  true, /* Is Enforced */
+							  !constr->skip_validation, /* Is Validated */
+							  InvalidOid,	/* no parent constraint */
+							  InvalidOid,	/* not a relation constraint */
+							  NULL,
+							  0,
+							  0,
+							  domainOid,	/* domain constraint */
+							  InvalidOid,	/* no associated index */
+							  InvalidOid,	/* Foreign key fields */
+							  NULL,
+							  NULL,
+							  NULL,
+							  NULL,
+							  0,
+							  ' ',
+							  ' ',
+							  NULL,
+							  0,
+							  ' ',
+							  NULL, /* not an exclusion constraint */
+							  NULL,
+							  NULL,
+							  true, /* is local */
+							  0,	/* inhcount */
+							  false,	/* connoinherit */
+							  false,	/* conperiod */
+							  false);	/* is_internal */
+
+	if (constrAddr)
+		ObjectAddressSet(*constrAddr, ConstraintRelationId, ccoid);
 }
 
 
@@ -3633,7 +3824,9 @@ RenameType(RenameStmt *stmt)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("%s is a table's row type",
 						format_type_be(typeOid)),
-				 errhint("Use ALTER TABLE instead.")));
+		/* translator: %s is an SQL ALTER command */
+				 errhint("Use %s instead.",
+						 "ALTER TABLE")));
 
 	/* don't allow direct alteration of array types, either */
 	if (IsTrueArrayType(typTup))
@@ -3643,6 +3836,8 @@ RenameType(RenameStmt *stmt)
 						format_type_be(typeOid)),
 				 errhint("You can alter type %s, which will alter the array type as well.",
 						 format_type_be(typTup->typelem))));
+
+	/* we do allow separate renaming of multirange types, though */
 
 	/*
 	 * If type is composite we need to rename associated pg_class entry too.
@@ -3714,7 +3909,9 @@ AlterTypeOwner(List *names, Oid newOwnerId, ObjectType objecttype)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("%s is a table's row type",
 						format_type_be(typeOid)),
-				 errhint("Use ALTER TABLE instead.")));
+		/* translator: %s is an SQL ALTER command */
+				 errhint("Use %s instead.",
+						 "ALTER TABLE")));
 
 	/* don't allow direct alteration of array types, either */
 	if (IsTrueArrayType(typTup))
@@ -3724,6 +3921,21 @@ AlterTypeOwner(List *names, Oid newOwnerId, ObjectType objecttype)
 						format_type_be(typeOid)),
 				 errhint("You can alter type %s, which will alter the array type as well.",
 						 format_type_be(typTup->typelem))));
+
+	/* don't allow direct alteration of multirange types, either */
+	if (typTup->typtype == TYPTYPE_MULTIRANGE)
+	{
+		Oid			rangetype = get_multirange_range(typeOid);
+
+		/* We don't expect get_multirange_range to fail, but cope if so */
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot alter multirange type %s",
+						format_type_be(typeOid)),
+				 OidIsValid(rangetype) ?
+				 errhint("You can alter type %s, which will alter the multirange type as well.",
+						 format_type_be(rangetype)) : 0));
+	}
 
 	/*
 	 * If the new owner is the same as the existing owner, consider the
@@ -3764,13 +3976,13 @@ AlterTypeOwner(List *names, Oid newOwnerId, ObjectType objecttype)
 /*
  * AlterTypeOwner_oid - change type owner unconditionally
  *
- * This function recurses to handle a pg_class entry, if necessary.  It
- * invokes any necessary access object hooks.  If hasDependEntry is true, this
- * function modifies the pg_shdepend entry appropriately (this should be
- * passed as false only for table rowtypes and array types).
+ * This function recurses to handle dependent types (arrays and multiranges).
+ * It invokes any necessary access object hooks.  If hasDependEntry is true,
+ * this function modifies the pg_shdepend entry appropriately (this should be
+ * passed as false only for table rowtypes and dependent types).
  *
  * This is used by ALTER TABLE/TYPE OWNER commands, as well as by REASSIGN
- * OWNED BY.  It assumes the caller has done all needed check.
+ * OWNED BY.  It assumes the caller has done all needed checks.
  */
 void
 AlterTypeOwner_oid(Oid typeOid, Oid newOwnerId, bool hasDependEntry)
@@ -3810,7 +4022,7 @@ AlterTypeOwner_oid(Oid typeOid, Oid newOwnerId, bool hasDependEntry)
  * AlterTypeOwnerInternal - bare-bones type owner change.
  *
  * This routine simply modifies the owner of a pg_type entry, and recurses
- * to handle a possible array type.
+ * to handle any dependent types.
  */
 void
 AlterTypeOwnerInternal(Oid typeOid, Oid newOwnerId)
@@ -3860,6 +4072,19 @@ AlterTypeOwnerInternal(Oid typeOid, Oid newOwnerId)
 	if (OidIsValid(typTup->typarray))
 		AlterTypeOwnerInternal(typTup->typarray, newOwnerId);
 
+	/* If it is a range type, update the associated multirange too */
+	if (typTup->typtype == TYPTYPE_RANGE)
+	{
+		Oid			multirange_typeid = get_range_multirange(typeOid);
+
+		if (!OidIsValid(multirange_typeid))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("could not find multirange type for data type %s",
+							format_type_be(typeOid))));
+		AlterTypeOwnerInternal(multirange_typeid, newOwnerId);
+	}
+
 	/* Clean up */
 	table_close(rel, RowExclusiveLock);
 }
@@ -3882,7 +4107,7 @@ AlterTypeNamespace(List *names, const char *newschema, ObjectType objecttype,
 	typename = makeTypeNameFromNameList(names);
 	typeOid = typenameTypeId(NULL, typename);
 
-	/* Don't allow ALTER DOMAIN on a type */
+	/* Don't allow ALTER DOMAIN on a non-domain type */
 	if (objecttype == OBJECT_DOMAIN && get_typtype(typeOid) != TYPTYPE_DOMAIN)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -3893,7 +4118,7 @@ AlterTypeNamespace(List *names, const char *newschema, ObjectType objecttype,
 	nspOid = LookupCreationNamespace(newschema);
 
 	objsMoved = new_object_addresses();
-	oldNspOid = AlterTypeNamespace_oid(typeOid, nspOid, objsMoved);
+	oldNspOid = AlterTypeNamespace_oid(typeOid, nspOid, false, objsMoved);
 	free_object_addresses(objsMoved);
 
 	if (oldschema)
@@ -3904,8 +4129,21 @@ AlterTypeNamespace(List *names, const char *newschema, ObjectType objecttype,
 	return myself;
 }
 
+/*
+ * ALTER TYPE SET SCHEMA, where the caller has already looked up the OIDs
+ * of the type and the target schema and checked the schema's privileges.
+ *
+ * If ignoreDependent is true, we silently ignore dependent types
+ * (array types and table rowtypes) rather than raising errors.
+ *
+ * This entry point is exported for use by AlterObjectNamespace_oid,
+ * which doesn't want errors when it passes OIDs of dependent types.
+ *
+ * Returns the type's old namespace OID, or InvalidOid if we did nothing.
+ */
 Oid
-AlterTypeNamespace_oid(Oid typeOid, Oid nspOid, ObjectAddresses *objsMoved)
+AlterTypeNamespace_oid(Oid typeOid, Oid nspOid, bool ignoreDependent,
+					   ObjectAddresses *objsMoved)
 {
 	Oid			elemOid;
 
@@ -3916,15 +4154,23 @@ AlterTypeNamespace_oid(Oid typeOid, Oid nspOid, ObjectAddresses *objsMoved)
 	/* don't allow direct alteration of array types */
 	elemOid = get_element_type(typeOid);
 	if (OidIsValid(elemOid) && get_array_type(elemOid) == typeOid)
+	{
+		if (ignoreDependent)
+			return InvalidOid;
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot alter array type %s",
 						format_type_be(typeOid)),
 				 errhint("You can alter type %s, which will alter the array type as well.",
 						 format_type_be(elemOid))));
+	}
 
 	/* and do the work */
-	return AlterTypeNamespaceInternal(typeOid, nspOid, false, true, objsMoved);
+	return AlterTypeNamespaceInternal(typeOid, nspOid,
+									  false,	/* isImplicitArray */
+									  ignoreDependent,	/* ignoreDependent */
+									  true, /* errorOnTableType */
+									  objsMoved);
 }
 
 /*
@@ -3936,15 +4182,21 @@ AlterTypeNamespace_oid(Oid typeOid, Oid nspOid, ObjectAddresses *objsMoved)
  * if any.  isImplicitArray should be true only when doing this internal
  * recursion (outside callers must never try to move an array type directly).
  *
+ * If ignoreDependent is true, we silently don't process table types.
+ *
  * If errorOnTableType is true, the function errors out if the type is
  * a table type.  ALTER TABLE has to be used to move a table to a new
- * namespace.
+ * namespace.  (This flag is ignored if ignoreDependent is true.)
  *
- * Returns the type's old namespace OID.
+ * We also do nothing if the type is already listed in *objsMoved.
+ * After a successful move, we add the type to *objsMoved.
+ *
+ * Returns the type's old namespace OID, or InvalidOid if we did nothing.
  */
 Oid
 AlterTypeNamespaceInternal(Oid typeOid, Oid nspOid,
 						   bool isImplicitArray,
+						   bool ignoreDependent,
 						   bool errorOnTableType,
 						   ObjectAddresses *objsMoved)
 {
@@ -3999,13 +4251,21 @@ AlterTypeNamespaceInternal(Oid typeOid, Oid nspOid,
 		 get_rel_relkind(typform->typrelid) == RELKIND_COMPOSITE_TYPE);
 
 	/* Enforce not-table-type if requested */
-	if (typform->typtype == TYPTYPE_COMPOSITE && !isCompositeType &&
-		errorOnTableType)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("%s is a table's row type",
-						format_type_be(typeOid)),
-				 errhint("Use ALTER TABLE instead.")));
+	if (typform->typtype == TYPTYPE_COMPOSITE && !isCompositeType)
+	{
+		if (ignoreDependent)
+		{
+			table_close(rel, RowExclusiveLock);
+			return InvalidOid;
+		}
+		if (errorOnTableType)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("%s is a table's row type",
+							format_type_be(typeOid)),
+			/* translator: %s is an SQL ALTER command */
+					 errhint("Use %s instead.", "ALTER TABLE")));
+	}
 
 	if (oldNspOid != nspOid)
 	{
@@ -4059,7 +4319,7 @@ AlterTypeNamespaceInternal(Oid typeOid, Oid nspOid,
 		!isImplicitArray)
 		if (changeDependencyFor(TypeRelationId, typeOid,
 								NamespaceRelationId, oldNspOid, nspOid) != 1)
-			elog(ERROR, "failed to change schema dependency for type %s",
+			elog(ERROR, "could not change schema dependency for type \"%s\"",
 				 format_type_be(typeOid));
 
 	InvokeObjectPostAlterHook(TypeRelationId, typeOid, 0);
@@ -4072,7 +4332,11 @@ AlterTypeNamespaceInternal(Oid typeOid, Oid nspOid,
 
 	/* Recursively alter the associated array type, if any */
 	if (OidIsValid(arrayOid))
-		AlterTypeNamespaceInternal(arrayOid, nspOid, true, true, objsMoved);
+		AlterTypeNamespaceInternal(arrayOid, nspOid,
+								   true,	/* isImplicitArray */
+								   false,	/* ignoreDependent */
+								   true,	/* errorOnTableType */
+								   objsMoved);
 
 	return oldNspOid;
 }

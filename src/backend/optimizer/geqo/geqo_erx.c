@@ -32,10 +32,12 @@
 
 
 #include "postgres.h"
-#include "optimizer/geqo_random.h"
-#include "optimizer/geqo_recombination.h"
+#include "optimizer/geqo.h"
 
 #if defined(ERX)
+
+#include "optimizer/geqo_random.h"
+#include "optimizer/geqo_recombination.h"
 
 static int	gimme_edge(PlannerInfo *root, Gene gene1, Gene gene2, Edge *edge_table);
 static void remove_gene(PlannerInfo *root, Gene gene, Edge edge, Edge *edge_table);
@@ -60,7 +62,7 @@ alloc_edge_table(PlannerInfo *root, int num_gene)
 	 * directly; 0 will not be used
 	 */
 
-	edge_table = (Edge *) palloc((num_gene + 1) * sizeof(Edge));
+	edge_table = palloc_array(Edge, num_gene + 1);
 
 	return edge_table;
 }

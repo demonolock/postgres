@@ -45,7 +45,7 @@
  * and we'd like to still refer to them via C struct offsets.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -60,17 +60,84 @@
 #include "access/heaptoast.h"
 #include "access/sysattr.h"
 #include "access/tupdesc_details.h"
-#include "executor/tuptable.h"
+#include "common/hashfn.h"
+#include "utils/datum.h"
 #include "utils/expandeddatum.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
 
 
-/* Does att's datatype allow packing into the 1-byte-header varlena format? */
+/*
+ * Does att's datatype allow packing into the 1-byte-header varlena format?
+ * While functions that use TupleDescAttr() and assign attstorage =
+ * TYPSTORAGE_PLAIN cannot use packed varlena headers, functions that call
+ * TupleDescInitEntry() use typeForm->typstorage (TYPSTORAGE_EXTENDED) and
+ * can use packed varlena headers, e.g.:
+ *     CREATE TABLE test(a VARCHAR(10000) STORAGE PLAIN);
+ *     INSERT INTO test VALUES (repeat('A',10));
+ * This can be verified with pageinspect.
+ */
 #define ATT_IS_PACKABLE(att) \
 	((att)->attlen == -1 && (att)->attstorage != TYPSTORAGE_PLAIN)
 /* Use this if it's already known varlena */
 #define VARLENA_ATT_IS_PACKABLE(att) \
 	((att)->attstorage != TYPSTORAGE_PLAIN)
 
+/* FormData_pg_attribute.attstorage != TYPSTORAGE_PLAIN and an attlen of -1 */
+#define COMPACT_ATTR_IS_PACKABLE(att) \
+	((att)->attlen == -1 && (att)->attispackable)
+
+/*
+ * Setup for caching pass-by-ref missing attributes in a way that survives
+ * tupleDesc destruction.
+ */
+
+typedef struct
+{
+	int			len;
+	Datum		value;
+} missing_cache_key;
+
+static HTAB *missing_cache = NULL;
+
+static uint32
+missing_hash(const void *key, Size keysize)
+{
+	const missing_cache_key *entry = key;
+
+	return hash_bytes((const unsigned char *) DatumGetPointer(entry->value), entry->len);
+}
+
+static int
+missing_match(const void *key1, const void *key2, Size keysize)
+{
+	const missing_cache_key *entry1 = key1;
+	const missing_cache_key *entry2 = key2;
+
+	if (entry1->len != entry2->len)
+		return entry1->len > entry2->len ? 1 : -1;
+
+	return memcmp(DatumGetPointer(entry1->value),
+				  DatumGetPointer(entry2->value),
+				  entry1->len);
+}
+
+static void
+init_missing_cache(void)
+{
+	HASHCTL		hash_ctl;
+
+	hash_ctl.keysize = sizeof(missing_cache_key);
+	hash_ctl.entrysize = sizeof(missing_cache_key);
+	hash_ctl.hcxt = TopMemoryContext;
+	hash_ctl.hash = missing_hash;
+	hash_ctl.match = missing_match;
+	missing_cache =
+		hash_create("Missing Values Cache",
+					32,
+					&hash_ctl,
+					HASH_ELEM | HASH_CONTEXT | HASH_FUNCTION | HASH_COMPARE);
+}
 
 /* ----------------------------------------------------------------
  *						misc support routines
@@ -84,12 +151,12 @@ Datum
 getmissingattr(TupleDesc tupleDesc,
 			   int attnum, bool *isnull)
 {
-	Form_pg_attribute att;
+	CompactAttribute *att;
 
 	Assert(attnum <= tupleDesc->natts);
 	Assert(attnum > 0);
 
-	att = TupleDescAttr(tupleDesc, attnum - 1);
+	att = TupleDescCompactAttr(tupleDesc, attnum - 1);
 
 	if (att->atthasmissing)
 	{
@@ -102,8 +169,41 @@ getmissingattr(TupleDesc tupleDesc,
 
 		if (attrmiss->am_present)
 		{
+			missing_cache_key key;
+			missing_cache_key *entry;
+			bool		found;
+			MemoryContext oldctx;
+
 			*isnull = false;
-			return attrmiss->am_value;
+
+			/* no  need to cache by-value attributes */
+			if (att->attbyval)
+				return attrmiss->am_value;
+
+			/* set up cache if required */
+			if (missing_cache == NULL)
+				init_missing_cache();
+
+			/* check if there's a cache entry */
+			Assert(att->attlen > 0 || att->attlen == -1);
+			if (att->attlen > 0)
+				key.len = att->attlen;
+			else
+				key.len = VARSIZE_ANY(DatumGetPointer(attrmiss->am_value));
+			key.value = attrmiss->am_value;
+
+			entry = hash_search(missing_cache, &key, HASH_ENTER, &found);
+
+			if (!found)
+			{
+				/* cache miss, so we need a non-transient copy of the datum */
+				oldctx = MemoryContextSwitchTo(TopMemoryContext);
+				entry->value =
+					datumCopy(attrmiss->am_value, false, att->attlen);
+				MemoryContextSwitchTo(oldctx);
+			}
+
+			return entry->value;
 		}
 	}
 
@@ -117,8 +217,8 @@ getmissingattr(TupleDesc tupleDesc,
  */
 Size
 heap_compute_data_size(TupleDesc tupleDesc,
-					   Datum *values,
-					   bool *isnull)
+					   const Datum *values,
+					   const bool *isnull)
 {
 	Size		data_length = 0;
 	int			i;
@@ -127,15 +227,15 @@ heap_compute_data_size(TupleDesc tupleDesc,
 	for (i = 0; i < numberOfAttributes; i++)
 	{
 		Datum		val;
-		Form_pg_attribute atti;
+		CompactAttribute *atti;
 
 		if (isnull[i])
 			continue;
 
 		val = values[i];
-		atti = TupleDescAttr(tupleDesc, i);
+		atti = TupleDescCompactAttr(tupleDesc, i);
 
-		if (ATT_IS_PACKABLE(atti) &&
+		if (COMPACT_ATTR_IS_PACKABLE(atti) &&
 			VARATT_CAN_MAKE_SHORT(DatumGetPointer(val)))
 		{
 			/*
@@ -151,13 +251,13 @@ heap_compute_data_size(TupleDesc tupleDesc,
 			 * we want to flatten the expanded value so that the constructed
 			 * tuple doesn't depend on it
 			 */
-			data_length = att_align_nominal(data_length, atti->attalign);
+			data_length = att_nominal_alignby(data_length, atti->attalignby);
 			data_length += EOH_get_flat_size(DatumGetEOHP(val));
 		}
 		else
 		{
-			data_length = att_align_datum(data_length, atti->attalign,
-										  atti->attlen, val);
+			data_length = att_datum_alignby(data_length, atti->attalignby,
+											atti->attlen, val);
 			data_length = att_addlength_datum(data_length, atti->attlen,
 											  val);
 		}
@@ -172,7 +272,7 @@ heap_compute_data_size(TupleDesc tupleDesc,
  * Fill in either a data value or a bit in the null bitmask
  */
 static inline void
-fill_val(Form_pg_attribute att,
+fill_val(CompactAttribute *att,
 		 bits8 **bit,
 		 int *bitmask,
 		 char **dataP,
@@ -208,13 +308,13 @@ fill_val(Form_pg_attribute att,
 	}
 
 	/*
-	 * XXX we use the att_align macros on the pointer value itself, not on an
-	 * offset.  This is a bit of a hack.
+	 * XXX we use the att_nominal_alignby macro on the pointer value itself,
+	 * not on an offset.  This is a bit of a hack.
 	 */
 	if (att->attbyval)
 	{
 		/* pass-by-value */
-		data = (char *) att_align_nominal(data, att->attalign);
+		data = (char *) att_nominal_alignby(data, att->attalignby);
 		store_att_byval(data, datum, att->attlen);
 		data_length = att->attlen;
 	}
@@ -234,8 +334,7 @@ fill_val(Form_pg_attribute att,
 				 */
 				ExpandedObjectHeader *eoh = DatumGetEOHP(datum);
 
-				data = (char *) att_align_nominal(data,
-												  att->attalign);
+				data = (char *) att_nominal_alignby(data, att->attalignby);
 				data_length = EOH_get_flat_size(eoh);
 				EOH_flatten_into(eoh, data, data_length);
 			}
@@ -253,8 +352,7 @@ fill_val(Form_pg_attribute att,
 			data_length = VARSIZE_SHORT(val);
 			memcpy(data, val, data_length);
 		}
-		else if (VARLENA_ATT_IS_PACKABLE(att) &&
-				 VARATT_CAN_MAKE_SHORT(val))
+		else if (att->attispackable && VARATT_CAN_MAKE_SHORT(val))
 		{
 			/* convert to short varlena -- no alignment */
 			data_length = VARATT_CONVERTED_SHORT_SIZE(val);
@@ -264,8 +362,7 @@ fill_val(Form_pg_attribute att,
 		else
 		{
 			/* full 4-byte header varlena */
-			data = (char *) att_align_nominal(data,
-											  att->attalign);
+			data = (char *) att_nominal_alignby(data, att->attalignby);
 			data_length = VARSIZE(val);
 			memcpy(data, val, data_length);
 		}
@@ -274,14 +371,14 @@ fill_val(Form_pg_attribute att,
 	{
 		/* cstring ... never needs alignment */
 		*infomask |= HEAP_HASVARWIDTH;
-		Assert(att->attalign == TYPALIGN_CHAR);
+		Assert(att->attalignby == sizeof(char));
 		data_length = strlen(DatumGetCString(datum)) + 1;
 		memcpy(data, DatumGetPointer(datum), data_length);
 	}
 	else
 	{
 		/* fixed-length pass-by-reference */
-		data = (char *) att_align_nominal(data, att->attalign);
+		data = (char *) att_nominal_alignby(data, att->attalignby);
 		Assert(att->attlen > 0);
 		data_length = att->attlen;
 		memcpy(data, DatumGetPointer(datum), data_length);
@@ -302,7 +399,7 @@ fill_val(Form_pg_attribute att,
  */
 void
 heap_fill_tuple(TupleDesc tupleDesc,
-				Datum *values, bool *isnull,
+				const Datum *values, const bool *isnull,
 				char *data, Size data_size,
 				uint16 *infomask, bits8 *bit)
 {
@@ -331,7 +428,7 @@ heap_fill_tuple(TupleDesc tupleDesc,
 
 	for (i = 0; i < numberOfAttributes; i++)
 	{
-		Form_pg_attribute attr = TupleDescAttr(tupleDesc, i);
+		CompactAttribute *attr = TupleDescCompactAttr(tupleDesc, i);
 
 		fill_val(attr,
 				 bitP ? &bitP : NULL,
@@ -365,7 +462,8 @@ heap_attisnull(HeapTuple tup, int attnum, TupleDesc tupleDesc)
 	Assert(!tupleDesc || attnum <= tupleDesc->natts);
 	if (attnum > (int) HeapTupleHeaderGetNatts(tup->t_data))
 	{
-		if (tupleDesc && TupleDescAttr(tupleDesc, attnum - 1)->atthasmissing)
+		if (tupleDesc &&
+			TupleDescCompactAttr(tupleDesc, attnum - 1)->atthasmissing)
 			return false;
 		else
 			return true;
@@ -399,8 +497,8 @@ heap_attisnull(HeapTuple tup, int attnum, TupleDesc tupleDesc)
 /* ----------------
  *		nocachegetattr
  *
- *		This only gets called from fastgetattr() macro, in cases where
- *		we can't use a cacheoffset and the value is not null.
+ *		This only gets called from fastgetattr(), in cases where we
+ *		can't use a cacheoffset and the value is not null.
  *
  *		This caches attribute offsets in the attribute descriptor.
  *
@@ -474,13 +572,13 @@ nocachegetattr(HeapTuple tup,
 
 	if (!slow)
 	{
-		Form_pg_attribute att;
+		CompactAttribute *att;
 
 		/*
 		 * If we get here, there are no nulls up to and including the target
 		 * attribute.  If we have a cached offset, we can use it.
 		 */
-		att = TupleDescAttr(tupleDesc, attnum);
+		att = TupleDescCompactAttr(tupleDesc, attnum);
 		if (att->attcacheoff >= 0)
 			return fetchatt(att, tp + att->attcacheoff);
 
@@ -495,7 +593,7 @@ nocachegetattr(HeapTuple tup,
 
 			for (j = 0; j <= attnum; j++)
 			{
-				if (TupleDescAttr(tupleDesc, j)->attlen <= 0)
+				if (TupleDescCompactAttr(tupleDesc, j)->attlen <= 0)
 				{
 					slow = true;
 					break;
@@ -518,23 +616,23 @@ nocachegetattr(HeapTuple tup,
 		 * fixed-width columns, in hope of avoiding future visits to this
 		 * routine.
 		 */
-		TupleDescAttr(tupleDesc, 0)->attcacheoff = 0;
+		TupleDescCompactAttr(tupleDesc, 0)->attcacheoff = 0;
 
 		/* we might have set some offsets in the slow path previously */
-		while (j < natts && TupleDescAttr(tupleDesc, j)->attcacheoff > 0)
+		while (j < natts && TupleDescCompactAttr(tupleDesc, j)->attcacheoff > 0)
 			j++;
 
-		off = TupleDescAttr(tupleDesc, j - 1)->attcacheoff +
-			TupleDescAttr(tupleDesc, j - 1)->attlen;
+		off = TupleDescCompactAttr(tupleDesc, j - 1)->attcacheoff +
+			TupleDescCompactAttr(tupleDesc, j - 1)->attlen;
 
 		for (; j < natts; j++)
 		{
-			Form_pg_attribute att = TupleDescAttr(tupleDesc, j);
+			CompactAttribute *att = TupleDescCompactAttr(tupleDesc, j);
 
 			if (att->attlen <= 0)
 				break;
 
-			off = att_align_nominal(off, att->attalign);
+			off = att_nominal_alignby(off, att->attalignby);
 
 			att->attcacheoff = off;
 
@@ -543,7 +641,7 @@ nocachegetattr(HeapTuple tup,
 
 		Assert(j > attnum);
 
-		off = TupleDescAttr(tupleDesc, attnum)->attcacheoff;
+		off = TupleDescCompactAttr(tupleDesc, attnum)->attcacheoff;
 	}
 	else
 	{
@@ -563,7 +661,7 @@ nocachegetattr(HeapTuple tup,
 		off = 0;
 		for (i = 0;; i++)		/* loop exit is at "break" */
 		{
-			Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
+			CompactAttribute *att = TupleDescCompactAttr(tupleDesc, i);
 
 			if (HeapTupleHasNulls(tup) && att_isnull(i, bp))
 			{
@@ -583,19 +681,19 @@ nocachegetattr(HeapTuple tup,
 				 * either an aligned or unaligned value.
 				 */
 				if (usecache &&
-					off == att_align_nominal(off, att->attalign))
+					off == att_nominal_alignby(off, att->attalignby))
 					att->attcacheoff = off;
 				else
 				{
-					off = att_align_pointer(off, att->attalign, -1,
-											tp + off);
+					off = att_pointer_alignby(off, att->attalignby, -1,
+											  tp + off);
 					usecache = false;
 				}
 			}
 			else
 			{
-				/* not varlena, so safe to use att_align_nominal */
-				off = att_align_nominal(off, att->attalign);
+				/* not varlena, so safe to use att_nominal_alignby */
+				off = att_nominal_alignby(off, att->attalignby);
 
 				if (usecache)
 					att->attcacheoff = off;
@@ -611,7 +709,7 @@ nocachegetattr(HeapTuple tup,
 		}
 	}
 
-	return fetchatt(TupleDescAttr(tupleDesc, attnum), tp + off);
+	return fetchatt(TupleDescCompactAttr(tupleDesc, attnum), tp + off);
 }
 
 /* ----------------
@@ -619,8 +717,8 @@ nocachegetattr(HeapTuple tup,
  *
  *		Fetch the value of a system attribute for a tuple.
  *
- * This is a support routine for the heap_getattr macro.  The macro
- * has already determined that the attnum refers to a system attribute.
+ * This is a support routine for heap_getattr().  The function has already
+ * determined that the attnum refers to a system attribute.
  * ----------------
  */
 Datum
@@ -689,7 +787,7 @@ heap_copytuple(HeapTuple tuple)
 	newTuple->t_self = tuple->t_self;
 	newTuple->t_tableOid = tuple->t_tableOid;
 	newTuple->t_data = (HeapTupleHeader) ((char *) newTuple + HEAPTUPLESIZE);
-	memcpy((char *) newTuple->t_data, (char *) tuple->t_data, tuple->t_len);
+	memcpy(newTuple->t_data, tuple->t_data, tuple->t_len);
 	return newTuple;
 }
 
@@ -715,7 +813,7 @@ heap_copytuple_with_tuple(HeapTuple src, HeapTuple dest)
 	dest->t_self = src->t_self;
 	dest->t_tableOid = src->t_tableOid;
 	dest->t_data = (HeapTupleHeader) palloc(src->t_len);
-	memcpy((char *) dest->t_data, (char *) src->t_data, src->t_len);
+	memcpy(dest->t_data, src->t_data, src->t_len);
 }
 
 /*
@@ -796,16 +894,16 @@ expand_tuple(HeapTuple *targetHeapTuple,
 		{
 			if (attrmiss[attnum].am_present)
 			{
-				Form_pg_attribute att = TupleDescAttr(tupleDesc, attnum);
+				CompactAttribute *att = TupleDescCompactAttr(tupleDesc, attnum);
 
-				targetDataLen = att_align_datum(targetDataLen,
-												att->attalign,
-												att->attlen,
-												attrmiss[attnum].am_value);
+				targetDataLen = att_datum_alignby(targetDataLen,
+												  att->attalignby,
+												  att->attlen,
+												  attrmiss[attnum].am_value);
 
-				targetDataLen = att_addlength_pointer(targetDataLen,
-													  att->attlen,
-													  attrmiss[attnum].am_value);
+				targetDataLen = att_addlength_datum(targetDataLen,
+													att->attlen,
+													attrmiss[attnum].am_value);
 			}
 			else
 			{
@@ -924,8 +1022,7 @@ expand_tuple(HeapTuple *targetHeapTuple,
 	/* Now fill in the missing values */
 	for (attnum = sourceNatts; attnum < natts; attnum++)
 	{
-
-		Form_pg_attribute attr = TupleDescAttr(tupleDesc, attnum);
+		CompactAttribute *attr = TupleDescCompactAttr(tupleDesc, attnum);
 
 		if (attrmiss && attrmiss[attnum].am_present)
 		{
@@ -1000,7 +1097,7 @@ heap_copy_tuple_as_datum(HeapTuple tuple, TupleDesc tupleDesc)
 	 * the given tuple came from disk, rather than from heap_form_tuple).
 	 */
 	td = (HeapTupleHeader) palloc(tuple->t_len);
-	memcpy((char *) td, (char *) tuple->t_data, tuple->t_len);
+	memcpy(td, tuple->t_data, tuple->t_len);
 
 	HeapTupleHeaderSetDatumLength(td, tuple->t_len);
 	HeapTupleHeaderSetTypeId(td, tupleDesc->tdtypeid);
@@ -1018,8 +1115,8 @@ heap_copy_tuple_as_datum(HeapTuple tuple, TupleDesc tupleDesc)
  */
 HeapTuple
 heap_form_tuple(TupleDesc tupleDescriptor,
-				Datum *values,
-				bool *isnull)
+				const Datum *values,
+				const bool *isnull)
 {
 	HeapTuple	tuple;			/* return tuple */
 	HeapTupleHeader td;			/* tuple data */
@@ -1112,9 +1209,9 @@ heap_form_tuple(TupleDesc tupleDescriptor,
 HeapTuple
 heap_modify_tuple(HeapTuple tuple,
 				  TupleDesc tupleDesc,
-				  Datum *replValues,
-				  bool *replIsnull,
-				  bool *doReplace)
+				  const Datum *replValues,
+				  const bool *replIsnull,
+				  const bool *doReplace)
 {
 	int			numberOfAttributes = tupleDesc->natts;
 	int			attoff;
@@ -1133,8 +1230,8 @@ heap_modify_tuple(HeapTuple tuple,
 	 * O(N^2) if there are many non-replaced columns, so it seems better to
 	 * err on the side of linear cost.
 	 */
-	values = (Datum *) palloc(numberOfAttributes * sizeof(Datum));
-	isnull = (bool *) palloc(numberOfAttributes * sizeof(bool));
+	values = palloc_array(Datum, numberOfAttributes);
+	isnull = palloc_array(bool, numberOfAttributes);
 
 	heap_deform_tuple(tuple, tupleDesc, values, isnull);
 
@@ -1181,9 +1278,9 @@ HeapTuple
 heap_modify_tuple_by_cols(HeapTuple tuple,
 						  TupleDesc tupleDesc,
 						  int nCols,
-						  int *replCols,
-						  Datum *replValues,
-						  bool *replIsnull)
+						  const int *replCols,
+						  const Datum *replValues,
+						  const bool *replIsnull)
 {
 	int			numberOfAttributes = tupleDesc->natts;
 	Datum	   *values;
@@ -1195,8 +1292,8 @@ heap_modify_tuple_by_cols(HeapTuple tuple,
 	 * allocate and fill values and isnull arrays from the tuple, then replace
 	 * selected columns from the input arrays.
 	 */
-	values = (Datum *) palloc(numberOfAttributes * sizeof(Datum));
-	isnull = (bool *) palloc(numberOfAttributes * sizeof(bool));
+	values = palloc_array(Datum, numberOfAttributes);
+	isnull = palloc_array(bool, numberOfAttributes);
 
 	heap_deform_tuple(tuple, tupleDesc, values, isnull);
 
@@ -1274,7 +1371,7 @@ heap_deform_tuple(HeapTuple tuple, TupleDesc tupleDesc,
 
 	for (attnum = 0; attnum < natts; attnum++)
 	{
-		Form_pg_attribute thisatt = TupleDescAttr(tupleDesc, attnum);
+		CompactAttribute *thisatt = TupleDescCompactAttr(tupleDesc, attnum);
 
 		if (hasnulls && att_isnull(attnum, bp))
 		{
@@ -1297,19 +1394,19 @@ heap_deform_tuple(HeapTuple tuple, TupleDesc tupleDesc,
 			 * an aligned or unaligned value.
 			 */
 			if (!slow &&
-				off == att_align_nominal(off, thisatt->attalign))
+				off == att_nominal_alignby(off, thisatt->attalignby))
 				thisatt->attcacheoff = off;
 			else
 			{
-				off = att_align_pointer(off, thisatt->attalign, -1,
-										tp + off);
+				off = att_pointer_alignby(off, thisatt->attalignby, -1,
+										  tp + off);
 				slow = true;
 			}
 		}
 		else
 		{
-			/* not varlena, so safe to use att_align_nominal */
-			off = att_align_nominal(off, thisatt->attalign);
+			/* not varlena, so safe to use att_nominal_alignby */
+			off = att_nominal_alignby(off, thisatt->attalignby);
 
 			if (!slow)
 				thisatt->attcacheoff = off;
@@ -1354,16 +1451,20 @@ heap_freetuple(HeapTuple htup)
  */
 MinimalTuple
 heap_form_minimal_tuple(TupleDesc tupleDescriptor,
-						Datum *values,
-						bool *isnull)
+						const Datum *values,
+						const bool *isnull,
+						Size extra)
 {
 	MinimalTuple tuple;			/* return tuple */
+	char	   *mem;
 	Size		len,
 				data_len;
 	int			hoff;
 	bool		hasnull = false;
 	int			numberOfAttributes = tupleDescriptor->natts;
 	int			i;
+
+	Assert(extra == MAXALIGN(extra));
 
 	if (numberOfAttributes > MaxTupleAttributeNumber)
 		ereport(ERROR,
@@ -1400,7 +1501,8 @@ heap_form_minimal_tuple(TupleDesc tupleDescriptor,
 	/*
 	 * Allocate and zero the space needed.
 	 */
-	tuple = (MinimalTuple) palloc0(len);
+	mem = palloc0(len + extra);
+	tuple = (MinimalTuple) (mem + extra);
 
 	/*
 	 * And fill in the information.
@@ -1436,11 +1538,15 @@ heap_free_minimal_tuple(MinimalTuple mtup)
  * The result is allocated in the current memory context.
  */
 MinimalTuple
-heap_copy_minimal_tuple(MinimalTuple mtup)
+heap_copy_minimal_tuple(MinimalTuple mtup, Size extra)
 {
 	MinimalTuple result;
+	char	   *mem;
 
-	result = (MinimalTuple) palloc(mtup->t_len);
+	Assert(extra == MAXALIGN(extra));
+	mem = palloc(mtup->t_len + extra);
+	memset(mem, 0, extra);
+	result = (MinimalTuple) (mem + extra);
 	memcpy(result, mtup, mtup->t_len);
 	return result;
 }
@@ -1477,15 +1583,20 @@ heap_tuple_from_minimal_tuple(MinimalTuple mtup)
  * The result is allocated in the current memory context.
  */
 MinimalTuple
-minimal_tuple_from_heap_tuple(HeapTuple htup)
+minimal_tuple_from_heap_tuple(HeapTuple htup, Size extra)
 {
 	MinimalTuple result;
+	char	   *mem;
 	uint32		len;
 
+	Assert(extra == MAXALIGN(extra));
 	Assert(htup->t_len > MINIMAL_TUPLE_OFFSET);
 	len = htup->t_len - MINIMAL_TUPLE_OFFSET;
-	result = (MinimalTuple) palloc(len);
+	mem = palloc(len + extra);
+	memset(mem, 0, extra);
+	result = (MinimalTuple) (mem + extra);
 	memcpy(result, (char *) htup->t_data + MINIMAL_TUPLE_OFFSET, len);
+
 	result->t_len = len;
 	return result;
 }

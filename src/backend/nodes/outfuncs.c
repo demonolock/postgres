@@ -3,7 +3,7 @@
  * outfuncs.c
  *	  Output functions for Postgres tree nodes.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,6 +24,9 @@
 #include "nodes/nodes.h"
 #include "nodes/pg_list.h"
 #include "utils/datum.h"
+
+/* State flag that determines how nodeToStringInternal() should treat location fields */
+static bool write_location_fields = false;
 
 static void outChar(StringInfo str, char c);
 static void outDouble(StringInfo str, double d);
@@ -47,6 +50,12 @@ static void outDouble(StringInfo str, double d);
 /* Write an unsigned integer field (anything written as ":fldname %u") */
 #define WRITE_UINT_FIELD(fldname) \
 	appendStringInfo(str, " :" CppAsString(fldname) " %u", node->fldname)
+
+/* Write a signed integer field (anything written with INT64_FORMAT) */
+#define WRITE_INT64_FIELD(fldname) \
+	appendStringInfo(str, \
+					 " :" CppAsString(fldname) " " INT64_FORMAT, \
+					 node->fldname)
 
 /* Write an unsigned integer field (anything written with UINT64_FORMAT) */
 #define WRITE_UINT64_FIELD(fldname) \
@@ -88,7 +97,7 @@ static void outDouble(StringInfo str, double d);
 
 /* Write a parse location field (actually same as INT case) */
 #define WRITE_LOCATION_FIELD(fldname) \
-	appendStringInfo(str, " :" CppAsString(fldname) " %d", node->fldname)
+	appendStringInfo(str, " :" CppAsString(fldname) " %d", write_location_fields ? node->fldname : -1)
 
 /* Write a Node field */
 #define WRITE_NODE_FIELD(fldname) \
@@ -337,8 +346,7 @@ outBitmapset(StringInfo str, const Bitmapset *bms)
 void
 outDatum(StringInfo str, Datum value, int typlen, bool typbyval)
 {
-	Size		length,
-				i;
+	Size		length;
 	char	   *s;
 
 	length = datumGetSize(value, typbyval, typlen);
@@ -346,20 +354,20 @@ outDatum(StringInfo str, Datum value, int typlen, bool typbyval)
 	if (typbyval)
 	{
 		s = (char *) (&value);
-		appendStringInfo(str, "%u [ ", (unsigned int) length);
-		for (i = 0; i < (Size) sizeof(Datum); i++)
+		appendStringInfo(str, "%zu [ ", length);
+		for (Size i = 0; i < (Size) sizeof(Datum); i++)
 			appendStringInfo(str, "%d ", (int) (s[i]));
 		appendStringInfoChar(str, ']');
 	}
 	else
 	{
 		s = (char *) DatumGetPointer(value);
-		if (!PointerIsValid(s))
+		if (!s)
 			appendStringInfoString(str, "0 [ ]");
 		else
 		{
-			appendStringInfo(str, "%u [ ", (unsigned int) length);
-			for (i = 0; i < length; i++)
+			appendStringInfo(str, "%zu [ ", length);
+			for (Size i = 0; i < length; i++)
 				appendStringInfo(str, "%d ", (int) (s[i]));
 			appendStringInfoChar(str, ']');
 		}
@@ -425,8 +433,6 @@ _outBoolExpr(StringInfo str, const BoolExpr *node)
 static void
 _outForeignKeyOptInfo(StringInfo str, const ForeignKeyOptInfo *node)
 {
-	int			i;
-
 	WRITE_NODE_TYPE("FOREIGNKEYOPTINFO");
 
 	WRITE_UINT_FIELD(con_relid);
@@ -441,10 +447,10 @@ _outForeignKeyOptInfo(StringInfo str, const ForeignKeyOptInfo *node)
 	WRITE_INT_FIELD(nmatched_ri);
 	/* for compactness, just print the number of matches per column: */
 	appendStringInfoString(str, " :eclass");
-	for (i = 0; i < node->nkeys; i++)
+	for (int i = 0; i < node->nkeys; i++)
 		appendStringInfo(str, " %d", (node->eclass[i] != NULL));
 	appendStringInfoString(str, " :rinfos");
-	for (i = 0; i < node->nkeys; i++)
+	for (int i = 0; i < node->nkeys; i++)
 		appendStringInfo(str, " %d", list_length(node->rinfos[i]));
 }
 
@@ -462,9 +468,12 @@ _outEquivalenceClass(StringInfo str, const EquivalenceClass *node)
 
 	WRITE_NODE_FIELD(ec_opfamilies);
 	WRITE_OID_FIELD(ec_collation);
+	WRITE_INT_FIELD(ec_childmembers_size);
 	WRITE_NODE_FIELD(ec_members);
+	WRITE_NODE_ARRAY(ec_childmembers, node->ec_childmembers_size);
 	WRITE_NODE_FIELD(ec_sources);
-	WRITE_NODE_FIELD(ec_derives);
+	/* Only ec_derives_list is written; hash is not serialized. */
+	WRITE_NODE_FIELD(ec_derives_list);
 	WRITE_BITMAPSET_FIELD(ec_relids);
 	WRITE_BOOL_FIELD(ec_has_const);
 	WRITE_BOOL_FIELD(ec_has_volatile);
@@ -494,7 +503,6 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 {
 	WRITE_NODE_TYPE("RANGETBLENTRY");
 
-	/* put alias + eref first to make dump more legible */
 	WRITE_NODE_FIELD(alias);
 	WRITE_NODE_FIELD(eref);
 	WRITE_ENUM_FIELD(rtekind, RTEKind);
@@ -503,16 +511,18 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 	{
 		case RTE_RELATION:
 			WRITE_OID_FIELD(relid);
+			WRITE_BOOL_FIELD(inh);
 			WRITE_CHAR_FIELD(relkind);
 			WRITE_INT_FIELD(rellockmode);
-			WRITE_NODE_FIELD(tablesample);
 			WRITE_UINT_FIELD(perminfoindex);
+			WRITE_NODE_FIELD(tablesample);
 			break;
 		case RTE_SUBQUERY:
 			WRITE_NODE_FIELD(subquery);
 			WRITE_BOOL_FIELD(security_barrier);
 			/* we re-use these RELATION fields, too: */
 			WRITE_OID_FIELD(relid);
+			WRITE_BOOL_FIELD(inh);
 			WRITE_CHAR_FIELD(relkind);
 			WRITE_INT_FIELD(rellockmode);
 			WRITE_UINT_FIELD(perminfoindex);
@@ -558,13 +568,15 @@ _outRangeTblEntry(StringInfo str, const RangeTblEntry *node)
 		case RTE_RESULT:
 			/* no extra fields */
 			break;
+		case RTE_GROUP:
+			WRITE_NODE_FIELD(groupexprs);
+			break;
 		default:
 			elog(ERROR, "unrecognized RTE kind: %d", (int) node->rtekind);
 			break;
 	}
 
 	WRITE_BOOL_FIELD(lateral);
-	WRITE_BOOL_FIELD(inh);
 	WRITE_BOOL_FIELD(inFromCl);
 	WRITE_NODE_FIELD(securityQuals);
 }
@@ -638,6 +650,8 @@ _outA_Expr(StringInfo str, const A_Expr *node)
 
 	WRITE_NODE_FIELD(lexpr);
 	WRITE_NODE_FIELD(rexpr);
+	WRITE_LOCATION_FIELD(rexpr_list_start);
+	WRITE_LOCATION_FIELD(rexpr_list_end);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -680,8 +694,13 @@ _outString(StringInfo str, const String *node)
 static void
 _outBitString(StringInfo str, const BitString *node)
 {
-	/* internal representation already has leading 'b' */
-	appendStringInfoString(str, node->bsval);
+	/*
+	 * The lexer will always produce a string starting with 'b' or 'x'.  There
+	 * might be characters following that that need escaping, but outToken
+	 * won't escape the 'b' or 'x'.  This is relied on by nodeTokenType.
+	 */
+	Assert(node->bsval[0] == 'b' || node->bsval[0] == 'x');
+	outToken(str, node->bsval);
 }
 
 static void
@@ -697,127 +716,6 @@ _outA_Const(StringInfo str, const A_Const *node)
 		outNode(str, &node->val);
 	}
 	WRITE_LOCATION_FIELD(location);
-}
-
-static void
-_outConstraint(StringInfo str, const Constraint *node)
-{
-	WRITE_NODE_TYPE("CONSTRAINT");
-
-	WRITE_STRING_FIELD(conname);
-	WRITE_BOOL_FIELD(deferrable);
-	WRITE_BOOL_FIELD(initdeferred);
-	WRITE_LOCATION_FIELD(location);
-
-	appendStringInfoString(str, " :contype ");
-	switch (node->contype)
-	{
-		case CONSTR_NULL:
-			appendStringInfoString(str, "NULL");
-			break;
-
-		case CONSTR_NOTNULL:
-			appendStringInfoString(str, "NOT_NULL");
-			break;
-
-		case CONSTR_DEFAULT:
-			appendStringInfoString(str, "DEFAULT");
-			WRITE_NODE_FIELD(raw_expr);
-			WRITE_STRING_FIELD(cooked_expr);
-			break;
-
-		case CONSTR_IDENTITY:
-			appendStringInfoString(str, "IDENTITY");
-			WRITE_NODE_FIELD(options);
-			WRITE_CHAR_FIELD(generated_when);
-			break;
-
-		case CONSTR_GENERATED:
-			appendStringInfoString(str, "GENERATED");
-			WRITE_NODE_FIELD(raw_expr);
-			WRITE_STRING_FIELD(cooked_expr);
-			WRITE_CHAR_FIELD(generated_when);
-			break;
-
-		case CONSTR_CHECK:
-			appendStringInfoString(str, "CHECK");
-			WRITE_BOOL_FIELD(is_no_inherit);
-			WRITE_NODE_FIELD(raw_expr);
-			WRITE_STRING_FIELD(cooked_expr);
-			WRITE_BOOL_FIELD(skip_validation);
-			WRITE_BOOL_FIELD(initially_valid);
-			break;
-
-		case CONSTR_PRIMARY:
-			appendStringInfoString(str, "PRIMARY_KEY");
-			WRITE_NODE_FIELD(keys);
-			WRITE_NODE_FIELD(including);
-			WRITE_NODE_FIELD(options);
-			WRITE_STRING_FIELD(indexname);
-			WRITE_STRING_FIELD(indexspace);
-			WRITE_BOOL_FIELD(reset_default_tblspc);
-			/* access_method and where_clause not currently used */
-			break;
-
-		case CONSTR_UNIQUE:
-			appendStringInfoString(str, "UNIQUE");
-			WRITE_BOOL_FIELD(nulls_not_distinct);
-			WRITE_NODE_FIELD(keys);
-			WRITE_NODE_FIELD(including);
-			WRITE_NODE_FIELD(options);
-			WRITE_STRING_FIELD(indexname);
-			WRITE_STRING_FIELD(indexspace);
-			WRITE_BOOL_FIELD(reset_default_tblspc);
-			/* access_method and where_clause not currently used */
-			break;
-
-		case CONSTR_EXCLUSION:
-			appendStringInfoString(str, "EXCLUSION");
-			WRITE_NODE_FIELD(exclusions);
-			WRITE_NODE_FIELD(including);
-			WRITE_NODE_FIELD(options);
-			WRITE_STRING_FIELD(indexname);
-			WRITE_STRING_FIELD(indexspace);
-			WRITE_BOOL_FIELD(reset_default_tblspc);
-			WRITE_STRING_FIELD(access_method);
-			WRITE_NODE_FIELD(where_clause);
-			break;
-
-		case CONSTR_FOREIGN:
-			appendStringInfoString(str, "FOREIGN_KEY");
-			WRITE_NODE_FIELD(pktable);
-			WRITE_NODE_FIELD(fk_attrs);
-			WRITE_NODE_FIELD(pk_attrs);
-			WRITE_CHAR_FIELD(fk_matchtype);
-			WRITE_CHAR_FIELD(fk_upd_action);
-			WRITE_CHAR_FIELD(fk_del_action);
-			WRITE_NODE_FIELD(fk_del_set_cols);
-			WRITE_NODE_FIELD(old_conpfeqop);
-			WRITE_OID_FIELD(old_pktable_oid);
-			WRITE_BOOL_FIELD(skip_validation);
-			WRITE_BOOL_FIELD(initially_valid);
-			break;
-
-		case CONSTR_ATTR_DEFERRABLE:
-			appendStringInfoString(str, "ATTR_DEFERRABLE");
-			break;
-
-		case CONSTR_ATTR_NOT_DEFERRABLE:
-			appendStringInfoString(str, "ATTR_NOT_DEFERRABLE");
-			break;
-
-		case CONSTR_ATTR_DEFERRED:
-			appendStringInfoString(str, "ATTR_DEFERRED");
-			break;
-
-		case CONSTR_ATTR_IMMEDIATE:
-			appendStringInfoString(str, "ATTR_IMMEDIATE");
-			break;
-
-		default:
-			elog(ERROR, "unrecognized ConstrType: %d", (int) node->contype);
-			break;
-	}
 }
 
 
@@ -838,17 +736,17 @@ outNode(StringInfo str, const void *obj)
 		_outList(str, obj);
 	/* nodeRead does not want to see { } around these! */
 	else if (IsA(obj, Integer))
-		_outInteger(str, (Integer *) obj);
+		_outInteger(str, (const Integer *) obj);
 	else if (IsA(obj, Float))
-		_outFloat(str, (Float *) obj);
+		_outFloat(str, (const Float *) obj);
 	else if (IsA(obj, Boolean))
-		_outBoolean(str, (Boolean *) obj);
+		_outBoolean(str, (const Boolean *) obj);
 	else if (IsA(obj, String))
-		_outString(str, (String *) obj);
+		_outString(str, (const String *) obj);
 	else if (IsA(obj, BitString))
-		_outBitString(str, (BitString *) obj);
+		_outBitString(str, (const BitString *) obj);
 	else if (IsA(obj, Bitmapset))
-		outBitmapset(str, (Bitmapset *) obj);
+		outBitmapset(str, (const Bitmapset *) obj);
 	else
 	{
 		appendStringInfoChar(str, '{');
@@ -873,17 +771,45 @@ outNode(StringInfo str, const void *obj)
 /*
  * nodeToString -
  *	   returns the ascii representation of the Node as a palloc'd string
+ *
+ * write_loc_fields determines whether location fields are output with their
+ * actual value rather than -1.  The actual value can be useful for debugging,
+ * but for most uses, the actual value is not useful, since the original query
+ * string is no longer available.
  */
-char *
-nodeToString(const void *obj)
+static char *
+nodeToStringInternal(const void *obj, bool write_loc_fields)
 {
 	StringInfoData str;
+	bool		save_write_location_fields;
+
+	save_write_location_fields = write_location_fields;
+	write_location_fields = write_loc_fields;
 
 	/* see stringinfo.h for an explanation of this maneuver */
 	initStringInfo(&str);
 	outNode(&str, obj);
+
+	write_location_fields = save_write_location_fields;
+
 	return str.data;
 }
+
+/*
+ * Externally visible entry points
+ */
+char *
+nodeToString(const void *obj)
+{
+	return nodeToStringInternal(obj, false);
+}
+
+char *
+nodeToStringWithLocations(const void *obj)
+{
+	return nodeToStringInternal(obj, true);
+}
+
 
 /*
  * bmsToString -

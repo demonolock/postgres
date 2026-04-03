@@ -3,7 +3,7 @@
  * nodeFuncs.h
  *		Various general-purpose manipulations of Node trees
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/nodeFuncs.h
@@ -15,7 +15,7 @@
 
 #include "nodes/parsenodes.h"
 
-struct PlanState;				/* avoid including execnodes.h too */
+typedef struct PlanState PlanState; /* avoid including execnodes.h too */
 
 
 /* flags bits for query_tree_walker and query_tree_mutator */
@@ -31,12 +31,14 @@ struct PlanState;				/* avoid including execnodes.h too */
 #define QTW_DONT_COPY_QUERY			0x40	/* do not copy top Query */
 #define QTW_EXAMINE_SORTGROUP		0x80	/* include SortGroupClause lists */
 
+#define QTW_IGNORE_GROUPEXPRS		0x100	/* GROUP expressions list */
+
 /* callback function for check_functions_in_node */
 typedef bool (*check_function_callback) (Oid func_id, void *context);
 
 /* callback functions for tree walkers */
 typedef bool (*tree_walker_callback) (Node *node, void *context);
-typedef bool (*planstate_tree_walker_callback) (struct PlanState *planstate,
+typedef bool (*planstate_tree_walker_callback) (PlanState *planstate,
 												void *context);
 
 /* callback functions for tree mutators */
@@ -215,7 +217,7 @@ extern bool raw_expression_tree_walker_impl(Node *node,
 											tree_walker_callback walker,
 											void *context);
 
-extern bool planstate_tree_walker_impl(struct PlanState *planstate,
+extern bool planstate_tree_walker_impl(PlanState *planstate,
 									   planstate_tree_walker_callback walker,
 									   void *context);
 

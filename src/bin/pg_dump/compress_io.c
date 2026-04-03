@@ -4,7 +4,7 @@
  *	 Routines for archivers to write an uncompressed or compressed data
  *	 stream.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * This file includes two APIs for dealing with compressed data. The first
@@ -70,7 +70,6 @@
 #include "compress_lz4.h"
 #include "compress_none.h"
 #include "compress_zstd.h"
-#include "pg_backup_utils.h"
 
 /*----------------------
  * Generic functions
@@ -126,7 +125,7 @@ AllocateCompressor(const pg_compress_specification compression_spec,
 {
 	CompressorState *cs;
 
-	cs = (CompressorState *) pg_malloc0(sizeof(CompressorState));
+	cs = pg_malloc0_object(CompressorState);
 	cs->readF = readF;
 	cs->writeF = writeF;
 
@@ -196,7 +195,7 @@ InitCompressFileHandle(const pg_compress_specification compression_spec)
 {
 	CompressFileHandle *CFH;
 
-	CFH = pg_malloc0(sizeof(CompressFileHandle));
+	CFH = pg_malloc0_object(CompressFileHandle);
 
 	if (compression_spec.algorithm == PG_COMPRESSION_NONE)
 		InitCompressFileHandleNone(CFH, compression_spec);
@@ -249,7 +248,7 @@ InitDiscoverCompressFileHandle(const char *path, const char *mode)
 
 	Assert(strcmp(mode, PG_BINARY_R) == 0);
 
-	fname = strdup(path);
+	fname = pg_strdup(path);
 
 	if (hasSuffix(fname, ".gz"))
 		compression_spec.algorithm = PG_COMPRESSION_GZIP;
@@ -270,6 +269,7 @@ InitDiscoverCompressFileHandle(const char *path, const char *mode)
 	}
 
 	CFH = InitCompressFileHandle(compression_spec);
+	errno = 0;
 	if (!CFH->open_func(fname, -1, mode, CFH))
 	{
 		free_keep_errno(CFH);
@@ -290,6 +290,7 @@ EndCompressFileHandle(CompressFileHandle *CFH)
 {
 	bool		ret = false;
 
+	errno = 0;
 	if (CFH->private_data)
 		ret = CFH->close_func(CFH);
 

@@ -16,7 +16,7 @@
  * An older method that sent each archive using a separate COPY OUT
  * operation is no longer supported.
  *
- * Portions Copyright (c) 2010-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/backup/basebackup_copy.c
@@ -66,7 +66,7 @@ typedef struct bbsink_copystream
  * frequently. Ideally, we'd like to send a message when the time since the
  * last message reaches PROGRESS_REPORT_MILLISECOND_THRESHOLD, but checking
  * the system time every time we send a tiny bit of data seems too expensive.
- * So we only check it after the number of bytes sine the last check reaches
+ * So we only check it after the number of bytes since the last check reaches
  * PROGRESS_REPORT_BYTE_INTERVAL.
  */
 #define	PROGRESS_REPORT_BYTE_INTERVAL				65536
@@ -107,7 +107,7 @@ static const bbsink_ops bbsink_copystream_ops = {
 bbsink *
 bbsink_copystream_new(bool send_to_client)
 {
-	bbsink_copystream *sink = palloc0(sizeof(bbsink_copystream));
+	bbsink_copystream *sink = palloc0_object(bbsink_copystream);
 
 	*((const bbsink_ops **) &sink->base.bbs_ops) = &bbsink_copystream_ops;
 	sink->send_to_client = send_to_client;
@@ -143,7 +143,7 @@ bbsink_copystream_begin_backup(bbsink *sink)
 	buf = palloc(mysink->base.bbs_buffer_length + MAXIMUM_ALIGNOF);
 	mysink->msgbuffer = buf + (MAXIMUM_ALIGNOF - 1);
 	mysink->base.bbs_buffer = buf + MAXIMUM_ALIGNOF;
-	mysink->msgbuffer[0] = 'd'; /* archive or manifest data */
+	mysink->msgbuffer[0] = PqMsg_CopyData;	/* archive or manifest data */
 
 	/* Tell client the backup start location. */
 	SendXlogRecPtrResult(state->startptr, state->starttli);
@@ -152,7 +152,7 @@ bbsink_copystream_begin_backup(bbsink *sink)
 	SendTablespaceList(state->tablespaces);
 
 	/* Send a CommandComplete message */
-	pq_puttextmessage('C', "SELECT");
+	pq_puttextmessage(PqMsg_CommandComplete, "SELECT");
 
 	/* Begin COPY stream. This will be used for all archives + manifest. */
 	SendCopyOutResponse();
@@ -169,8 +169,8 @@ bbsink_copystream_begin_archive(bbsink *sink, const char *archive_name)
 	StringInfoData buf;
 
 	ti = list_nth(state->tablespaces, state->tablespace_num);
-	pq_beginmessage(&buf, 'd'); /* CopyData */
-	pq_sendbyte(&buf, 'n');		/* New archive */
+	pq_beginmessage(&buf, PqMsg_CopyData);
+	pq_sendbyte(&buf, PqBackupMsg_NewArchive);
 	pq_sendstring(&buf, archive_name);
 	pq_sendstring(&buf, ti->path == NULL ? "" : ti->path);
 	pq_endmessage(&buf);
@@ -191,7 +191,7 @@ bbsink_copystream_archive_contents(bbsink *sink, size_t len)
 	if (mysink->send_to_client)
 	{
 		/* Add one because we're also sending a leading type byte. */
-		pq_putmessage('d', mysink->msgbuffer, len + 1);
+		pq_putmessage(PqMsg_CopyData, mysink->msgbuffer, len + 1);
 	}
 
 	/* Consider whether to send a progress report to the client. */
@@ -220,8 +220,8 @@ bbsink_copystream_archive_contents(bbsink *sink, size_t len)
 		{
 			mysink->last_progress_report_time = now;
 
-			pq_beginmessage(&buf, 'd'); /* CopyData */
-			pq_sendbyte(&buf, 'p'); /* Progress report */
+			pq_beginmessage(&buf, PqMsg_CopyData);
+			pq_sendbyte(&buf, PqBackupMsg_ProgressReport);
 			pq_sendint64(&buf, state->bytes_done);
 			pq_endmessage(&buf);
 			pq_flush_if_writable();
@@ -246,8 +246,8 @@ bbsink_copystream_end_archive(bbsink *sink)
 
 	mysink->bytes_done_at_last_time_check = state->bytes_done;
 	mysink->last_progress_report_time = GetCurrentTimestamp();
-	pq_beginmessage(&buf, 'd'); /* CopyData */
-	pq_sendbyte(&buf, 'p');		/* Progress report */
+	pq_beginmessage(&buf, PqMsg_CopyData);
+	pq_sendbyte(&buf, PqBackupMsg_ProgressReport);
 	pq_sendint64(&buf, state->bytes_done);
 	pq_endmessage(&buf);
 	pq_flush_if_writable();
@@ -261,8 +261,8 @@ bbsink_copystream_begin_manifest(bbsink *sink)
 {
 	StringInfoData buf;
 
-	pq_beginmessage(&buf, 'd'); /* CopyData */
-	pq_sendbyte(&buf, 'm');		/* Manifest */
+	pq_beginmessage(&buf, PqMsg_CopyData);
+	pq_sendbyte(&buf, PqBackupMsg_Manifest);
 	pq_endmessage(&buf);
 }
 
@@ -277,7 +277,7 @@ bbsink_copystream_manifest_contents(bbsink *sink, size_t len)
 	if (mysink->send_to_client)
 	{
 		/* Add one because we're also sending a leading type byte. */
-		pq_putmessage('d', mysink->msgbuffer, len + 1);
+		pq_putmessage(PqMsg_CopyData, mysink->msgbuffer, len + 1);
 	}
 }
 
@@ -318,7 +318,7 @@ SendCopyOutResponse(void)
 {
 	StringInfoData buf;
 
-	pq_beginmessage(&buf, 'H');
+	pq_beginmessage(&buf, PqMsg_CopyOutResponse);
 	pq_sendbyte(&buf, 0);		/* overall format */
 	pq_sendint16(&buf, 0);		/* natts */
 	pq_endmessage(&buf);
@@ -330,7 +330,7 @@ SendCopyOutResponse(void)
 static void
 SendCopyDone(void)
 {
-	pq_putemptymessage('c');
+	pq_putemptymessage(PqMsg_CopyDone);
 }
 
 /*
@@ -361,14 +361,14 @@ SendXlogRecPtrResult(XLogRecPtr ptr, TimeLineID tli)
 	tstate = begin_tup_output_tupdesc(dest, tupdesc, &TTSOpsVirtual);
 
 	/* Data row */
-	values[0] = CStringGetTextDatum(psprintf("%X/%X", LSN_FORMAT_ARGS(ptr)));
+	values[0] = CStringGetTextDatum(psprintf("%X/%08X", LSN_FORMAT_ARGS(ptr)));
 	values[1] = Int64GetDatum(tli);
 	do_tup_output(tstate, values, nulls);
 
 	end_tup_output(tstate);
 
 	/* Send a CommandComplete message */
-	pq_puttextmessage('C', "SELECT");
+	pq_puttextmessage(PqMsg_CommandComplete, "SELECT");
 }
 
 /*
@@ -407,7 +407,7 @@ SendTablespaceList(List *tablespaces)
 		}
 		else
 		{
-			values[0] = ObjectIdGetDatum(strtoul(ti->oid, NULL, 10));
+			values[0] = ObjectIdGetDatum(ti->oid);
 			values[1] = CStringGetTextDatum(ti->path);
 		}
 		if (ti->size >= 0)

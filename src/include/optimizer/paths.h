@@ -4,7 +4,7 @@
  *	  prototypes for various files in optimizer/path
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/paths.h
@@ -21,11 +21,21 @@
  * allpaths.c
  */
 extern PGDLLIMPORT bool enable_geqo;
+extern PGDLLIMPORT bool enable_eager_aggregate;
 extern PGDLLIMPORT int geqo_threshold;
+extern PGDLLIMPORT double min_eager_agg_group_size;
 extern PGDLLIMPORT int min_parallel_table_scan_size;
 extern PGDLLIMPORT int min_parallel_index_scan_size;
+extern PGDLLIMPORT bool enable_group_by_reordering;
 
-/* Hook for plugins to get control in set_rel_pathlist() */
+/* Hooks for plugins to get control in set_rel_pathlist() */
+typedef void (*join_path_setup_hook_type) (PlannerInfo *root,
+										   RelOptInfo *joinrel,
+										   RelOptInfo *outerrel,
+										   RelOptInfo *innerrel,
+										   JoinType jointype,
+										   JoinPathExtraData *extra);
+extern PGDLLIMPORT join_path_setup_hook_type join_path_setup_hook;
 typedef void (*set_rel_pathlist_hook_type) (PlannerInfo *root,
 											RelOptInfo *rel,
 											Index rti,
@@ -56,16 +66,14 @@ extern void generate_gather_paths(PlannerInfo *root, RelOptInfo *rel,
 								  bool override_rows);
 extern void generate_useful_gather_paths(PlannerInfo *root, RelOptInfo *rel,
 										 bool override_rows);
+extern void generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
+								   RelOptInfo *rel);
 extern int	compute_parallel_worker(RelOptInfo *rel, double heap_pages,
 									double index_pages, int max_workers);
 extern void create_partial_bitmap_paths(PlannerInfo *root, RelOptInfo *rel,
 										Path *bitmapqual);
 extern void generate_partitionwise_join_paths(PlannerInfo *root,
 											  RelOptInfo *rel);
-
-#ifdef OPTIMIZER_DEBUG
-extern void debug_print_rel(PlannerInfo *root, RelOptInfo *rel);
-#endif
 
 /*
  * indxpath.c
@@ -74,19 +82,20 @@ extern void debug_print_rel(PlannerInfo *root, RelOptInfo *rel);
 extern void create_index_paths(PlannerInfo *root, RelOptInfo *rel);
 extern bool relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 										  List *restrictlist,
-										  List *exprlist, List *oprlist);
+										  List **extra_clauses);
 extern bool indexcol_is_bool_constant_for_query(PlannerInfo *root,
 												IndexOptInfo *index,
 												int indexcol);
 extern bool match_index_to_operand(Node *operand, int indexcol,
 								   IndexOptInfo *index);
+extern Node *strip_phvs_in_index_operand(Node *operand);
 extern void check_index_predicates(PlannerInfo *root, RelOptInfo *rel);
 
 /*
- * tidpath.h
+ * tidpath.c
  *	  routines to generate tid paths
  */
-extern void create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel);
+extern bool create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel);
 
 /*
  * joinpath.c
@@ -109,9 +118,9 @@ extern Relids add_outer_joins_to_relids(PlannerInfo *root, Relids input_relids,
 										List **pushed_down_joins);
 extern bool have_join_order_restriction(PlannerInfo *root,
 										RelOptInfo *rel1, RelOptInfo *rel2);
-extern bool have_dangerous_phv(PlannerInfo *root,
-							   Relids outer_relids, Relids inner_params);
 extern void mark_dummy_rel(RelOptInfo *rel);
+extern void init_dummy_sjinfo(SpecialJoinInfo *sjinfo, Relids left_relids,
+							  Relids right_relids);
 
 /*
  * equivclass.c
@@ -129,6 +138,7 @@ extern bool process_equivalence(PlannerInfo *root,
 extern Expr *canonicalize_ec_expression(Expr *expr,
 										Oid req_type, Oid req_collation);
 extern void reconsider_outer_join_clauses(PlannerInfo *root);
+extern void rebuild_eclass_attr_needed(PlannerInfo *root);
 extern EquivalenceClass *get_eclass_for_sort_expr(PlannerInfo *root,
 												  Expr *expr,
 												  List *opfamilies,
@@ -159,11 +169,13 @@ extern List *generate_join_implied_equalities_for_ecs(PlannerInfo *root,
 													  Relids join_relids,
 													  Relids outer_relids,
 													  RelOptInfo *inner_rel);
-extern bool exprs_known_equal(PlannerInfo *root, Node *item1, Node *item2);
+extern bool exprs_known_equal(PlannerInfo *root, Node *item1, Node *item2,
+							  Oid opfamily);
 extern EquivalenceClass *match_eclasses_to_foreign_key_col(PlannerInfo *root,
 														   ForeignKeyOptInfo *fkinfo,
 														   int colno);
-extern RestrictInfo *find_derived_clause_for_ec_member(EquivalenceClass *ec,
+extern RestrictInfo *find_derived_clause_for_ec_member(PlannerInfo *root,
+													   EquivalenceClass *ec,
 													   EquivalenceMember *em);
 extern void add_child_rel_equivalences(PlannerInfo *root,
 									   AppendRelInfo *appinfo,
@@ -174,6 +186,14 @@ extern void add_child_join_rel_equivalences(PlannerInfo *root,
 											AppendRelInfo **appinfos,
 											RelOptInfo *parent_joinrel,
 											RelOptInfo *child_joinrel);
+extern void add_setop_child_rel_equivalences(PlannerInfo *root,
+											 RelOptInfo *child_rel,
+											 List *child_tlist,
+											 List *setop_pathkeys);
+extern void setup_eclass_member_iterator(EquivalenceMemberIterator *it,
+										 EquivalenceClass *ec,
+										 Relids child_relids);
+extern EquivalenceMember *eclass_member_iterator_next(EquivalenceMemberIterator *it);
 extern List *generate_implied_equalities_for_column(PlannerInfo *root,
 													RelOptInfo *rel,
 													ec_matches_callback_type callback,
@@ -189,6 +209,7 @@ extern bool eclass_useful_for_merging(PlannerInfo *root,
 extern bool is_redundant_derived_clause(RestrictInfo *rinfo, List *clauselist);
 extern bool is_redundant_with_indexclauses(RestrictInfo *rinfo,
 										   List *indexclauses);
+extern void ec_clear_derived_clauses(EquivalenceClass *ec);
 
 /*
  * pathkeys.c
@@ -199,12 +220,13 @@ typedef enum
 	PATHKEYS_EQUAL,				/* pathkeys are identical */
 	PATHKEYS_BETTER1,			/* pathkey 1 is a superset of pathkey 2 */
 	PATHKEYS_BETTER2,			/* vice versa */
-	PATHKEYS_DIFFERENT			/* neither pathkey includes the other */
+	PATHKEYS_DIFFERENT,			/* neither pathkey includes the other */
 } PathKeysComparison;
 
 extern PathKeysComparison compare_pathkeys(List *keys1, List *keys2);
 extern bool pathkeys_contained_in(List *keys1, List *keys2);
 extern bool pathkeys_count_contained_in(List *keys1, List *keys2, int *n_common);
+extern List *get_useful_group_keys_orderings(PlannerInfo *root, Path *path);
 extern Path *get_cheapest_path_for_pathkeys(List *paths, List *pathkeys,
 											Relids required_outer,
 											CostSelector cost_criterion,
@@ -235,7 +257,9 @@ extern List *make_pathkeys_for_sortclauses_extended(PlannerInfo *root,
 													List **sortclauses,
 													List *tlist,
 													bool remove_redundant,
-													bool *sortable);
+													bool remove_group_rtindex,
+													bool *sortable,
+													bool set_ec_sortref);
 extern void initialize_mergeclause_eclasses(PlannerInfo *root,
 											RestrictInfo *restrictinfo);
 extern void update_mergeclause_eclasses(PlannerInfo *root,
@@ -259,7 +283,7 @@ extern bool has_useful_pathkeys(PlannerInfo *root, RelOptInfo *rel);
 extern List *append_pathkeys(List *target, List *source);
 extern PathKey *make_canonical_pathkey(PlannerInfo *root,
 									   EquivalenceClass *eclass, Oid opfamily,
-									   int strategy, bool nulls_first);
+									   CompareType cmptype, bool nulls_first);
 extern void add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 									List *live_childrels);
 

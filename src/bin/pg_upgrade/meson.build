@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 pg_upgrade_sources = files(
   'check.c',
@@ -8,12 +8,16 @@ pg_upgrade_sources = files(
   'file.c',
   'function.c',
   'info.c',
+  'multixact_read_v18.c',
+  'multixact_rewrite.c',
   'option.c',
   'parallel.c',
   'pg_upgrade.c',
   'relfilenumber.c',
   'server.c',
+  'slru_io.c',
   'tablespace.c',
+  'task.c',
   'util.c',
   'version.c',
 )
@@ -42,6 +46,11 @@ tests += {
     'tests': [
       't/001_basic.pl',
       't/002_pg_upgrade.pl',
+      't/003_logical_slots.pl',
+      't/004_subscription.pl',
+      't/005_char_signedness.pl',
+      't/006_transfer_modes.pl',
+      't/007_multixact_conversion.pl',
     ],
     'test_kwargs': {'priority': 40}, # pg_upgrade tests are slow
   },

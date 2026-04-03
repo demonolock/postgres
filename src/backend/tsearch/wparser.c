@@ -3,7 +3,7 @@
  * wparser.c
  *		Standard interface to word parser
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -14,13 +14,11 @@
 #include "postgres.h"
 
 #include "catalog/namespace.h"
-#include "catalog/pg_type.h"
 #include "commands/defrem.h"
-#include "common/jsonapi.h"
 #include "funcapi.h"
 #include "tsearch/ts_cache.h"
 #include "tsearch/ts_utils.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/jsonfuncs.h"
 #include "utils/varlena.h"
 
@@ -60,12 +58,12 @@ tt_setup_firstcall(FuncCallContext *funcctx, FunctionCallInfo fcinfo,
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-	st = (TSTokenTypeStorage *) palloc(sizeof(TSTokenTypeStorage));
+	st = palloc_object(TSTokenTypeStorage);
 	st->cur = 0;
 	/* lextype takes one dummy argument */
 	st->list = (LexDescr *) DatumGetPointer(OidFunctionCall1(prs->lextypeOid,
 															 (Datum) 0));
-	funcctx->user_fctx = (void *) st;
+	funcctx->user_fctx = st;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
@@ -175,14 +173,14 @@ prs_setup_firstcall(FuncCallContext *funcctx, FunctionCallInfo fcinfo,
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-	st = (PrsStorage *) palloc(sizeof(PrsStorage));
+	st = palloc_object(PrsStorage);
 	st->cur = 0;
 	st->len = 16;
-	st->list = (LexemeEntry *) palloc(sizeof(LexemeEntry) * st->len);
+	st->list = palloc_array(LexemeEntry, st->len);
 
-	prsdata = (void *) DatumGetPointer(FunctionCall2(&prs->prsstart,
-													 PointerGetDatum(VARDATA_ANY(txt)),
-													 Int32GetDatum(VARSIZE_ANY_EXHDR(txt))));
+	prsdata = DatumGetPointer(FunctionCall2(&prs->prsstart,
+											PointerGetDatum(VARDATA_ANY(txt)),
+											Int32GetDatum(VARSIZE_ANY_EXHDR(txt))));
 
 	while ((type = DatumGetInt32(FunctionCall3(&prs->prstoken,
 											   PointerGetDatum(prsdata),
@@ -206,7 +204,7 @@ prs_setup_firstcall(FuncCallContext *funcctx, FunctionCallInfo fcinfo,
 	st->len = st->cur;
 	st->cur = 0;
 
-	funcctx->user_fctx = (void *) st;
+	funcctx->user_fctx = st;
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	funcctx->tuple_desc = tupdesc;
@@ -309,7 +307,7 @@ ts_headline_byid_opt(PG_FUNCTION_ARGS)
 
 	memset(&prs, 0, sizeof(HeadlineParsedText));
 	prs.lenwords = 32;
-	prs.words = (HeadlineWordEntry *) palloc(sizeof(HeadlineWordEntry) * prs.lenwords);
+	prs.words = palloc_array(HeadlineWordEntry, prs.lenwords);
 
 	hlparsetext(cfg->cfgId, &prs, query,
 				VARDATA_ANY(in), VARSIZE_ANY_EXHDR(in));
@@ -375,11 +373,11 @@ ts_headline_jsonb_byid_opt(PG_FUNCTION_ARGS)
 	Jsonb	   *out;
 	JsonTransformStringValuesAction action = (JsonTransformStringValuesAction) headline_json_value;
 	HeadlineParsedText prs;
-	HeadlineJsonState *state = palloc0(sizeof(HeadlineJsonState));
+	HeadlineJsonState *state = palloc0_object(HeadlineJsonState);
 
 	memset(&prs, 0, sizeof(HeadlineParsedText));
 	prs.lenwords = 32;
-	prs.words = (HeadlineWordEntry *) palloc(sizeof(HeadlineWordEntry) * prs.lenwords);
+	prs.words = palloc_array(HeadlineWordEntry, prs.lenwords);
 
 	state->prs = &prs;
 	state->cfg = lookup_ts_config_cache(tsconfig);
@@ -452,11 +450,11 @@ ts_headline_json_byid_opt(PG_FUNCTION_ARGS)
 	JsonTransformStringValuesAction action = (JsonTransformStringValuesAction) headline_json_value;
 
 	HeadlineParsedText prs;
-	HeadlineJsonState *state = palloc0(sizeof(HeadlineJsonState));
+	HeadlineJsonState *state = palloc0_object(HeadlineJsonState);
 
 	memset(&prs, 0, sizeof(HeadlineParsedText));
 	prs.lenwords = 32;
-	prs.words = (HeadlineWordEntry *) palloc(sizeof(HeadlineWordEntry) * prs.lenwords);
+	prs.words = palloc_array(HeadlineWordEntry, prs.lenwords);
 
 	state->prs = &prs;
 	state->cfg = lookup_ts_config_cache(tsconfig);

@@ -6,7 +6,7 @@
  * for developers.  If you edit any of these, be sure to do a *full*
  * rebuild (and an initdb if noted).
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/pg_config_manual.h
@@ -18,6 +18,16 @@
  * without the --wal-segsize option.  It must be a valid segment size.
  */
 #define DEFAULT_XLOG_SEG_SIZE	(16*1024*1024)
+
+/*
+ * SLRU segment size.  A page is the same BLCKSZ as is used everywhere else in
+ * Postgres.  The segment size can be chosen somewhat arbitrarily; we make it
+ * 32 pages by default, or 256Kb, i.e. 1M transactions for CLOG or 64K
+ * transactions for SUBTRANS.
+ *
+ * Changing this requires an initdb.
+ */
+#define SLRU_PAGES_PER_SEGMENT	32
 
 /*
  * Maximum length for identifiers (e.g. table names, column names,
@@ -74,33 +84,13 @@
 #define PARTITION_MAX_KEYS	32
 
 /*
- * Decide whether built-in 8-byte types, including float8, int8, and
- * timestamp, are passed by value.  This is on by default if sizeof(Datum) >=
- * 8 (that is, on 64-bit platforms).  If sizeof(Datum) < 8 (32-bit platforms),
- * this must be off.  We keep this here as an option so that it is easy to
- * test the pass-by-reference code paths on 64-bit platforms.
- *
- * Changing this requires an initdb.
+ * This symbol is now vestigial: built-in 8-byte types, including float8,
+ * int8, and timestamp, are always passed by value since we require Datum
+ * to be wide enough to permit that.  We continue to define the symbol here
+ * so as not to unnecessarily break extension code.
  */
-#if SIZEOF_VOID_P >= 8
 #define USE_FLOAT8_BYVAL 1
-#endif
 
-/*
- * When we don't have native spinlocks, we use semaphores to simulate them.
- * Decreasing this value reduces consumption of OS resources; increasing it
- * may improve performance, but supplying a real spinlock implementation is
- * probably far better.
- */
-#define NUM_SPINLOCK_SEMAPHORES		128
-
-/*
- * When we have neither spinlocks nor atomic operations support we're
- * implementing atomic operations on top of spinlock on top of semaphores. To
- * be safe against atomic operations while holding a spinlock separate
- * semaphores have to be used.
- */
-#define NUM_ATOMICS_SEMAPHORES		64
 
 /*
  * MAXPGPATH: standard size of a pathname buffer in PostgreSQL (hence,
@@ -154,9 +144,8 @@
 /*
  * USE_PREFETCH code should be compiled only if we have a way to implement
  * prefetching.  (This is decoupled from USE_POSIX_FADVISE because there
- * might in future be support for alternative low-level prefetch APIs.
- * If you change this, you probably need to adjust the error message in
- * check_effective_io_concurrency.)
+ * might in future be support for alternative low-level prefetch APIs,
+ * as well as platform-specific APIs defined elsewhere.)
  */
 #ifdef USE_POSIX_FADVISE
 #define USE_PREFETCH
@@ -241,6 +230,13 @@
  */
 
 /*
+ * Force use of the non-recursive JSON parser in all cases. This is useful
+ * to validate the working of the parser, and the regression tests should
+ * pass except for some different error messages about the stack limit.
+ */
+/* #define FORCE_JSON_PSTACK */
+
+/*
  * Include Valgrind "client requests", mostly in the memory allocator, so
  * Valgrind understands PostgreSQL memory contexts.  This permits detecting
  * memory errors that Valgrind would not detect on a vanilla build.  It also
@@ -291,10 +287,10 @@
 
 /*
  * For cache-invalidation debugging, define DISCARD_CACHES_ENABLED to enable
- * use of the debug_discard_caches GUC to aggressively flush syscache/relcache
- * entries whenever it's possible to deliver invalidations.  See
- * AcceptInvalidationMessages() in src/backend/utils/cache/inval.c for
- * details.
+ * use of the debug_discard_caches GUC to aggressively flush
+ * syscache/relcache/relsynccache entries whenever it's possible to deliver
+ * invalidations.  See AcceptInvalidationMessages() in
+ * src/backend/utils/cache/inval.c for details.
  *
  * USE_ASSERT_CHECKING builds default to enabling this.  It's possible to use
  * DISCARD_CACHES_ENABLED without a cassert build and the implied
@@ -329,25 +325,31 @@
  /* #define RECOVER_RELATION_BUILD_MEMORY 1 */	/* Force enable */
 
 /*
- * Define this to force all parse and plan trees to be passed through
- * copyObject(), to facilitate catching errors and omissions in
- * copyObject().
+ * Define DEBUG_NODE_TESTS_ENABLED to enable use of the GUCs
+ * debug_copy_parse_plan_trees, debug_write_read_parse_plan_trees, and
+ * debug_raw_expression_coverage_test, to test coverage of node support
+ * functions in src/backend/nodes/.
+ *
+ * USE_ASSERT_CHECKING builds default to enabling this.
  */
-/* #define COPY_PARSE_PLAN_TREES */
+/* #define DEBUG_NODE_TESTS_ENABLED */
+
+#if defined(USE_ASSERT_CHECKING) && !defined(DEBUG_NODE_TESTS_ENABLED)
+#define DEBUG_NODE_TESTS_ENABLED
+#endif
 
 /*
- * Define this to force all parse and plan trees to be passed through
- * outfuncs.c/readfuncs.c, to facilitate catching errors and omissions in
- * those modules.
+ * Backwards compatibility for the older compile-time-only node-tests macros.
  */
-/* #define WRITE_READ_PARSE_PLAN_TREES */
+#if !defined(DEBUG_NODE_TESTS_ENABLED) && (defined(COPY_PARSE_PLAN_TREES) || defined(WRITE_READ_PARSE_PLAN_TREES) || defined(RAW_EXPRESSION_COVERAGE_TEST))
+#define DEBUG_NODE_TESTS_ENABLED
+#endif
 
 /*
- * Define this to force all raw parse trees for DML statements to be scanned
- * by raw_expression_tree_walker(), to facilitate catching errors and
- * omissions in that function.
+ * Define this to force Bitmapset reallocation on each modification.  Helps
+ * to find dangling pointers to Bitmapset's.
  */
-/* #define RAW_EXPRESSION_COVERAGE_TEST */
+/* #define REALLOCATE_BITMAPSETS */
 
 /*
  * Enable debugging print statements for lock-related operations.
@@ -359,12 +361,6 @@
  * also the wal_debug GUC var.
  */
 /* #define WAL_DEBUG */
-
-/*
- * Enable tracing of resource consumption during sort operations;
- * see also the trace_sort GUC var.  For 8.1 this is enabled by default.
- */
-#define TRACE_SORT 1
 
 /*
  * Enable tracing of syncscan operations (see also the trace_syncscan GUC var).

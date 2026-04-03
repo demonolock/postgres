@@ -3,7 +3,7 @@
  * orderedsetaggs.c
  *		Ordered-set aggregate functions.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,10 +24,8 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "utils/array.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
-#include "utils/timestamp.h"
 #include "utils/tuplesort.h"
 
 
@@ -155,7 +153,7 @@ ordered_set_startup(FunctionCallInfo fcinfo, bool use_tuples)
 		qcontext = fcinfo->flinfo->fn_mcxt;
 		oldcontext = MemoryContextSwitchTo(qcontext);
 
-		qstate = (OSAPerQueryState *) palloc0(sizeof(OSAPerQueryState));
+		qstate = palloc0_object(OSAPerQueryState);
 		qstate->aggref = aggref;
 		qstate->qcontext = qcontext;
 
@@ -272,7 +270,7 @@ ordered_set_startup(FunctionCallInfo fcinfo, bool use_tuples)
 								 &qstate->typAlign);
 		}
 
-		fcinfo->flinfo->fn_extra = (void *) qstate;
+		fcinfo->flinfo->fn_extra = qstate;
 
 		MemoryContextSwitchTo(oldcontext);
 	}
@@ -280,7 +278,7 @@ ordered_set_startup(FunctionCallInfo fcinfo, bool use_tuples)
 	/* Now build the stuff we need in group-lifespan context */
 	oldcontext = MemoryContextSwitchTo(gcontext);
 
-	osastate = (OSAPerGroupState *) palloc(sizeof(OSAPerGroupState));
+	osastate = palloc_object(OSAPerGroupState);
 	osastate->qstate = qstate;
 	osastate->gcontext = gcontext;
 
@@ -662,8 +660,8 @@ pct_info_cmp(const void *pa, const void *pb)
  */
 static struct pct_info *
 setup_pct_info(int num_percentiles,
-			   Datum *percentiles_datum,
-			   bool *percentiles_null,
+			   const Datum *percentiles_datum,
+			   const bool *percentiles_null,
 			   int64 rowcount,
 			   bool continuous)
 {
@@ -1009,7 +1007,7 @@ percentile_cont_float8_multi_final(PG_FUNCTION_ARGS)
 											  FLOAT8OID,
 	/* hard-wired info on type float8 */
 											  sizeof(float8),
-											  FLOAT8PASSBYVAL,
+											  true,
 											  TYPALIGN_DOUBLE,
 											  float8_lerp);
 }

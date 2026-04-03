@@ -73,9 +73,9 @@
 <screen>
 postgres=# SELECT * FROM pg_get_wal_record_info('0/E419E28');
 -[ RECORD 1 ]----+-------------------------------------------------
-start_lsn        | 0/E419E28
-end_lsn          | 0/E419E68
-prev_lsn         | 0/E419D78
+start_lsn        | 0/0E419E28
+end_lsn          | 0/0E419E68
+prev_lsn         | 0/0E419D78
 xid              | 0
 resource_manager | Heap2
 record_type      | VACUUM
@@ -146,9 +146,9 @@ block_ref        |
 <screen>
 postgres=# SELECT * FROM pg_get_wal_block_info('0/1230278', '0/12302B8');
 -[ RECORD 1 ]-----+-----------------------------------
-start_lsn         | 0/1230278
-end_lsn           | 0/12302B8
-prev_lsn          | 0/122FD40
+start_lsn         | 0/01230278
+end_lsn           | 0/012302B8
+prev_lsn          | 0/0122FD40
 block_id          | 0
 reltablespace     | 1663
 reldatabase       | 1
@@ -209,7 +209,7 @@ block_fpi_data    |
       <para>
        The <function>pg_filenode_relation</function> function (see
        <xref linkend="functions-admin-dblocation"/>) can help you to
-       determine which relation was modified during original execution
+       determine which relation was modified during original execution.
       </para>
      </tip>
      <para>

@@ -3,7 +3,7 @@
  * nodeTidscan.c
  *	  Routines to support direct tid scans of relations
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,12 +25,11 @@
 #include "access/sysattr.h"
 #include "access/tableam.h"
 #include "catalog/pg_type.h"
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeTidscan.h"
 #include "lib/qunique.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
-#include "storage/bufmgr.h"
 #include "utils/array.h"
 #include "utils/rel.h"
 
@@ -79,7 +78,7 @@ TidExprListCreate(TidScanState *tidstate)
 	foreach(l, node->tidquals)
 	{
 		Expr	   *expr = (Expr *) lfirst(l);
-		TidExpr    *tidexpr = (TidExpr *) palloc0(sizeof(TidExpr));
+		TidExpr    *tidexpr = palloc0_object(TidExpr);
 
 		if (is_opclause(expr))
 		{
@@ -403,12 +402,23 @@ TidNext(TidScanState *node)
 static bool
 TidRecheck(TidScanState *node, TupleTableSlot *slot)
 {
+	ItemPointer match;
+
+	/* WHERE CURRENT OF always intends to resolve to the latest tuple */
+	if (node->tss_isCurrentOf)
+		return true;
+
+	if (node->tss_TidList == NULL)
+		TidListEval(node);
+
 	/*
-	 * XXX shouldn't we check here to make sure tuple matches TID list? In
-	 * runtime-key case this is not certain, is it?  However, in the WHERE
-	 * CURRENT OF case it might not match anyway ...
+	 * Binary search the TidList to see if this ctid is mentioned and return
+	 * true if it is.
 	 */
-	return true;
+	match = (ItemPointer) bsearch(&slot->tts_tid, node->tss_TidList,
+								  node->tss_NumTids, sizeof(ItemPointerData),
+								  itemptr_comparator);
+	return match != NULL;
 }
 
 
@@ -472,18 +482,6 @@ ExecEndTidScan(TidScanState *node)
 {
 	if (node->ss.ss_currentScanDesc)
 		table_endscan(node->ss.ss_currentScanDesc);
-
-	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/*
-	 * clear out tuple table slots
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 }
 
 /* ----------------------------------------------------------------

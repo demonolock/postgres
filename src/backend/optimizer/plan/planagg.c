@@ -17,7 +17,7 @@
  * scan all the rows anyway.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -33,12 +33,12 @@
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
-#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
+#include "optimizer/planner.h"
 #include "optimizer/subselect.h"
 #include "optimizer/tlist.h"
 #include "parser/parse_clause.h"
@@ -49,7 +49,8 @@
 
 static bool can_minmax_aggs(PlannerInfo *root, List **context);
 static bool build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
-							  Oid eqop, Oid sortop, bool nulls_first);
+							  Oid eqop, Oid sortop, bool reverse_sort,
+							  bool nulls_first);
 static void minmax_qp_callback(PlannerInfo *root, void *extra);
 static Oid	fetch_agg_sort_op(Oid aggfnoid);
 
@@ -173,9 +174,9 @@ preprocess_minmax_aggregates(PlannerInfo *root)
 		 * FIRST is more likely to be available if the operator is a
 		 * reverse-sort operator, so try that first if reverse.
 		 */
-		if (build_minmax_path(root, mminfo, eqop, mminfo->aggsortop, reverse))
+		if (build_minmax_path(root, mminfo, eqop, mminfo->aggsortop, reverse, reverse))
 			continue;
-		if (build_minmax_path(root, mminfo, eqop, mminfo->aggsortop, !reverse))
+		if (build_minmax_path(root, mminfo, eqop, mminfo->aggsortop, reverse, !reverse))
 			continue;
 
 		/* No indexable path for this aggregate, so fail */
@@ -315,7 +316,7 @@ can_minmax_aggs(PlannerInfo *root, List **context)
  */
 static bool
 build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
-				  Oid eqop, Oid sortop, bool nulls_first)
+				  Oid eqop, Oid sortop, bool reverse_sort, bool nulls_first)
 {
 	PlannerInfo *subroot;
 	Query	   *parse;
@@ -335,10 +336,12 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	 * than before.  (This means that when we are done, there will be no Vars
 	 * of level 1, which is why the subquery can become an initplan.)
 	 */
-	subroot = (PlannerInfo *) palloc(sizeof(PlannerInfo));
+	subroot = palloc_object(PlannerInfo);
 	memcpy(subroot, root, sizeof(PlannerInfo));
 	subroot->query_level++;
 	subroot->parent_root = root;
+	subroot->plan_name = choose_plan_name(root->glob, "minmax", true);
+
 	/* reset subplan-related stuff */
 	subroot->plan_params = NIL;
 	subroot->outer_params = NULL;
@@ -400,6 +403,7 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	sortcl->tleSortGroupRef = assignSortGroupRef(tle, subroot->processed_tlist);
 	sortcl->eqop = eqop;
 	sortcl->sortop = sortop;
+	sortcl->reverse_sort = reverse_sort;
 	sortcl->nulls_first = nulls_first;
 	sortcl->hashable = false;	/* no need to make this accurate */
 	parse->sortClause = list_make1(sortcl);
@@ -409,7 +413,7 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	parse->limitCount = (Node *) makeConst(INT8OID, -1, InvalidOid,
 										   sizeof(int64),
 										   Int64GetDatum(1), false,
-										   FLOAT8PASSBYVAL);
+										   true);
 
 	/*
 	 * Generate the best paths for this query, telling query_planner that we

@@ -114,6 +114,7 @@ CREATE VIEW v1 AS SELECT * FROM base_table;
 -- should be created in temp object schema
 CREATE VIEW v1_temp AS SELECT * FROM temp_table;
 NOTICE:  view "v1_temp" will be a temporary view
+DETAIL:  It depends on temporary table temp_table.
 -- should be created in temp object schema
 CREATE TEMP VIEW v2_temp AS SELECT * FROM base_table;
 -- should be created in temp_views schema
@@ -121,6 +122,7 @@ CREATE VIEW temp_view_test.v2 AS SELECT * FROM base_table;
 -- should fail
 CREATE VIEW temp_view_test.v3_temp AS SELECT * FROM temp_table;
 NOTICE:  view "v3_temp" will be a temporary view
+DETAIL:  It depends on temporary table temp_table.
 ERROR:  cannot create temporary relation in non-temporary schema
 -- should fail
 CREATE SCHEMA test_view_schema
@@ -139,12 +141,14 @@ CREATE VIEW v4_temp AS
     FROM base_table t1, temp_table t2
     WHERE t1.id = t2.id;
 NOTICE:  view "v4_temp" will be a temporary view
+DETAIL:  It depends on temporary table temp_table.
 -- should be temp
 CREATE VIEW v5_temp AS
     SELECT t1.a AS t1_a, t2.a AS t2_a, t3.a AS t3_a
     FROM base_table t1, base_table2 t2, temp_table t3
     WHERE t1.id = t2.id and t2.id = t3.id;
 NOTICE:  view "v5_temp" will be a temporary view
+DETAIL:  It depends on temporary table temp_table.
 -- subqueries
 CREATE VIEW v4 AS SELECT * FROM base_table WHERE id IN (SELECT id FROM base_table2);
 CREATE VIEW v5 AS SELECT t1.id, t2.a FROM base_table t1, (SELECT * FROM base_table2) t2;
@@ -153,25 +157,33 @@ CREATE VIEW v7 AS SELECT * FROM base_table WHERE NOT EXISTS (SELECT 1 FROM base_
 CREATE VIEW v8 AS SELECT * FROM base_table WHERE EXISTS (SELECT 1);
 CREATE VIEW v6_temp AS SELECT * FROM base_table WHERE id IN (SELECT id FROM temp_table);
 NOTICE:  view "v6_temp" will be a temporary view
+DETAIL:  It depends on temporary table temp_table.
 CREATE VIEW v7_temp AS SELECT t1.id, t2.a FROM base_table t1, (SELECT * FROM temp_table) t2;
 NOTICE:  view "v7_temp" will be a temporary view
+DETAIL:  It depends on temporary table temp_table.
 CREATE VIEW v8_temp AS SELECT * FROM base_table WHERE EXISTS (SELECT 1 FROM temp_table);
 NOTICE:  view "v8_temp" will be a temporary view
+DETAIL:  It depends on temporary table temp_table.
 CREATE VIEW v9_temp AS SELECT * FROM base_table WHERE NOT EXISTS (SELECT 1 FROM temp_table);
 NOTICE:  view "v9_temp" will be a temporary view
+DETAIL:  It depends on temporary table temp_table.
 -- a view should also be temporary if it references a temporary view
 CREATE VIEW v10_temp AS SELECT * FROM v7_temp;
 NOTICE:  view "v10_temp" will be a temporary view
+DETAIL:  It depends on temporary view v7_temp.
 CREATE VIEW v11_temp AS SELECT t1.id, t2.a FROM base_table t1, v10_temp t2;
 NOTICE:  view "v11_temp" will be a temporary view
+DETAIL:  It depends on temporary view v10_temp.
 CREATE VIEW v12_temp AS SELECT true FROM v11_temp;
 NOTICE:  view "v12_temp" will be a temporary view
+DETAIL:  It depends on temporary view v11_temp.
 -- a view should also be temporary if it references a temporary sequence
 CREATE SEQUENCE seq1;
 CREATE TEMPORARY SEQUENCE seq1_temp;
-CREATE VIEW v9 AS SELECT seq1.is_called FROM seq1;
-CREATE VIEW v13_temp AS SELECT seq1_temp.is_called FROM seq1_temp;
+CREATE VIEW v9 AS SELECT nextval('seq1');
+CREATE VIEW v13_temp AS SELECT nextval('seq1_temp');
 NOTICE:  view "v13_temp" will be a temporary view
+DETAIL:  It depends on temporary sequence seq1_temp.
 SELECT relname FROM pg_class
     WHERE relname LIKE 'v_'
     AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'temp_view_test')
@@ -217,15 +229,19 @@ CREATE TEMP TABLE tt (num2 int, value text);
 CREATE VIEW nontemp1 AS SELECT * FROM t1 CROSS JOIN t2;
 CREATE VIEW temporal1 AS SELECT * FROM t1 CROSS JOIN tt;
 NOTICE:  view "temporal1" will be a temporary view
+DETAIL:  It depends on temporary table tt.
 CREATE VIEW nontemp2 AS SELECT * FROM t1 INNER JOIN t2 ON t1.num = t2.num2;
 CREATE VIEW temporal2 AS SELECT * FROM t1 INNER JOIN tt ON t1.num = tt.num2;
 NOTICE:  view "temporal2" will be a temporary view
+DETAIL:  It depends on temporary table tt.
 CREATE VIEW nontemp3 AS SELECT * FROM t1 LEFT JOIN t2 ON t1.num = t2.num2;
 CREATE VIEW temporal3 AS SELECT * FROM t1 LEFT JOIN tt ON t1.num = tt.num2;
 NOTICE:  view "temporal3" will be a temporary view
+DETAIL:  It depends on temporary table tt.
 CREATE VIEW nontemp4 AS SELECT * FROM t1 LEFT JOIN t2 ON t1.num = t2.num2 AND t2.value = 'xxx';
 CREATE VIEW temporal4 AS SELECT * FROM t1 LEFT JOIN tt ON t1.num = tt.num2 AND tt.value = 'xxx';
 NOTICE:  view "temporal4" will be a temporary view
+DETAIL:  It depends on temporary table tt.
 SELECT relname FROM pg_class
     WHERE relname LIKE 'nontemp%'
     AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'testviewschm2')
@@ -272,6 +288,7 @@ BETWEEN (SELECT d FROM tbl2 WHERE c = 1) AND (SELECT e FROM tbl3 WHERE f = 2)
 AND EXISTS (SELECT g FROM tbl4 LEFT JOIN tbl3 ON tbl4.h = tbl3.f)
 AND NOT EXISTS (SELECT g FROM tbl4 LEFT JOIN tmptbl ON tbl4.h = tmptbl.j);
 NOTICE:  view "mytempview" will be a temporary view
+DETAIL:  It depends on temporary table tmptbl.
 SELECT count(*) FROM pg_class where relname LIKE 'mytempview'
 And relnamespace IN (SELECT OID FROM pg_namespace WHERE nspname LIKE 'pg_temp%');
  count 
@@ -823,6 +840,54 @@ View definition:
   WHERE (EXISTS ( SELECT 1
            FROM temp_view_test.tx1 tx1_1
           WHERE tx1.y1 = tx1_1.f1));
+
+-- Test correct deparsing of ORDER BY when there is an output name conflict
+create view aliased_order_by as
+select x1 as x2, x2 as x1, x3 from tt1
+  order by x2;  -- this is interpreted per SQL92, so really ordering by x1
+\d+ aliased_order_by
+                   View "testviewschm2.aliased_order_by"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Description 
+--------+---------+-----------+----------+---------+----------+-------------
+ x2     | integer |           |          |         | plain    | 
+ x1     | integer |           |          |         | plain    | 
+ x3     | text    |           |          |         | extended | 
+View definition:
+ SELECT x1 AS x2,
+    x2 AS x1,
+    x3
+   FROM tt1
+  ORDER BY tt1.x1;
+
+alter view aliased_order_by rename column x1 to x0;
+\d+ aliased_order_by
+                   View "testviewschm2.aliased_order_by"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Description 
+--------+---------+-----------+----------+---------+----------+-------------
+ x2     | integer |           |          |         | plain    | 
+ x0     | integer |           |          |         | plain    | 
+ x3     | text    |           |          |         | extended | 
+View definition:
+ SELECT x1 AS x2,
+    x2 AS x0,
+    x3
+   FROM tt1
+  ORDER BY x1;
+
+alter view aliased_order_by rename column x3 to x1;
+\d+ aliased_order_by
+                   View "testviewschm2.aliased_order_by"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Description 
+--------+---------+-----------+----------+---------+----------+-------------
+ x2     | integer |           |          |         | plain    | 
+ x0     | integer |           |          |         | plain    | 
+ x1     | text    |           |          |         | extended | 
+View definition:
+ SELECT x1 AS x2,
+    x2 AS x0,
+    x3 AS x1
+   FROM tt1
+  ORDER BY tt1.x1;
 
 -- Test aliasing of joins
 create view view_of_joins as
@@ -1876,7 +1941,8 @@ select 'foo'::text = any((select array['abc','def','foo']::text[]));  -- fail
 ERROR:  operator does not exist: text = text[]
 LINE 1: select 'foo'::text = any((select array['abc','def','foo']::t...
                            ^
-HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 select 'foo'::text = any((select array['abc','def','foo']::text[])::text[]);
  ?column? 
 ----------
@@ -2202,6 +2268,21 @@ select pg_get_viewdef('tt26v', true);
     FROM ( VALUES (1,2,3)) v(x, y, z);
 (1 row)
 
+-- test restriction on non-system view expansion.
+create table tt27v_tbl (a int);
+create view tt27v as select a from tt27v_tbl;
+set restrict_nonsystem_relation_kind to 'view';
+select a from tt27v where a > 0; -- Error
+ERROR:  access to non-system view "tt27v" is restricted
+insert into tt27v values (1); -- Error
+ERROR:  access to non-system view "tt27v" is restricted
+select viewname from pg_views where viewname = 'tt27v'; -- Ok to access a system view.
+ viewname 
+----------
+ tt27v
+(1 row)
+
+reset restrict_nonsystem_relation_kind;
 -- clean up all the random objects we made above
 DROP SCHEMA temp_view_test CASCADE;
 NOTICE:  drop cascades to 27 other objects
@@ -2233,7 +2314,7 @@ drop cascades to view aliased_view_2
 drop cascades to view aliased_view_3
 drop cascades to view aliased_view_4
 DROP SCHEMA testviewschm2 CASCADE;
-NOTICE:  drop cascades to 77 other objects
+NOTICE:  drop cascades to 80 other objects
 DETAIL:  drop cascades to table t1
 drop cascades to view temporal1
 drop cascades to view temporal2
@@ -2260,6 +2341,7 @@ drop cascades to view mysecview9
 drop cascades to view unspecified_types
 drop cascades to table tt1
 drop cascades to table tx1
+drop cascades to view aliased_order_by
 drop cascades to view view_of_joins
 drop cascades to table tbl1a
 drop cascades to view view_of_joins_2a
@@ -2311,3 +2393,5 @@ drop cascades to view tt23v
 drop cascades to view tt24v
 drop cascades to view tt25v
 drop cascades to view tt26v
+drop cascades to table tt27v_tbl
+drop cascades to view tt27v

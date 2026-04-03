@@ -4,7 +4,7 @@
  *	  routines to manage scans on GiST index relations
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -90,7 +90,7 @@ gistbeginscan(Relation r, int nkeys, int norderbys)
 	oldCxt = MemoryContextSwitchTo(giststate->scanCxt);
 
 	/* initialize opaque data */
-	so = (GISTScanOpaque) palloc0(sizeof(GISTScanOpaqueData));
+	so = palloc0_object(GISTScanOpaqueData);
 	so->giststate = giststate;
 	giststate->tempCxt = createTempGistContext();
 	so->queue = NULL;
@@ -101,8 +101,8 @@ gistbeginscan(Relation r, int nkeys, int norderbys)
 	so->qual_ok = true;			/* in case there are zero keys */
 	if (scan->numberOfOrderBys > 0)
 	{
-		scan->xs_orderbyvals = palloc0(sizeof(Datum) * scan->numberOfOrderBys);
-		scan->xs_orderbynulls = palloc(sizeof(bool) * scan->numberOfOrderBys);
+		scan->xs_orderbyvals = palloc0_array(Datum, scan->numberOfOrderBys);
+		scan->xs_orderbynulls = palloc_array(bool, scan->numberOfOrderBys);
 		memset(scan->xs_orderbynulls, true, sizeof(bool) * scan->numberOfOrderBys);
 	}
 
@@ -233,8 +233,7 @@ gistrescan(IndexScanDesc scan, ScanKey key, int nkeys,
 				fn_extras[i] = scan->keyData[i].sk_func.fn_extra;
 		}
 
-		memmove(scan->keyData, key,
-				scan->numberOfKeys * sizeof(ScanKeyData));
+		memcpy(scan->keyData, key, scan->numberOfKeys * sizeof(ScanKeyData));
 
 		/*
 		 * Modify the scan key so that the Consistent method is called for all
@@ -289,8 +288,7 @@ gistrescan(IndexScanDesc scan, ScanKey key, int nkeys,
 				fn_extras[i] = scan->orderByData[i].sk_func.fn_extra;
 		}
 
-		memmove(scan->orderByData, orderbys,
-				scan->numberOfOrderBys * sizeof(ScanKeyData));
+		memcpy(scan->orderByData, orderbys, scan->numberOfOrderBys * sizeof(ScanKeyData));
 
 		so->orderByTypes = (Oid *) palloc(scan->numberOfOrderBys * sizeof(Oid));
 

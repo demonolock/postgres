@@ -8,7 +8,7 @@
  * storage implementation and the details about individual types of
  * statistics.
  *
- * Copyright (c) 2001-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_wal.c
@@ -17,11 +17,9 @@
 
 #include "postgres.h"
 
-#include "utils/pgstat_internal.h"
 #include "executor/instrument.h"
+#include "utils/pgstat_internal.h"
 
-
-PgStat_PendingWalStats PendingWalStats = {0};
 
 /*
  * WAL usage counters saved from pgWalUsage at the previous call to
@@ -38,13 +36,27 @@ static WalUsage prevWalUsage;
  *
  * Must be called by processes that generate WAL, that do not call
  * pgstat_report_stat(), like walwriter.
+ *
+ * "force" set to true ensures that the statistics are flushed; note that
+ * this needs to acquire the pgstat shmem LWLock, waiting on it.  When
+ * set to false, the statistics may not be flushed if the lock could not
+ * be acquired.
  */
 void
 pgstat_report_wal(bool force)
 {
-	pgstat_flush_wal(force);
+	bool		nowait;
 
-	pgstat_flush_io(force);
+	/* like in pgstat.c, don't wait for lock acquisition when !force */
+	nowait = !force;
+
+	/* flush wal stats */
+	(void) pgstat_wal_flush_cb(nowait);
+	pgstat_flush_backend(nowait, PGSTAT_BACKEND_FLUSH_WAL);
+
+	/* flush IO stats */
+	pgstat_flush_io(nowait);
+	(void) pgstat_flush_backend(nowait, PGSTAT_BACKEND_FLUSH_IO);
 }
 
 /*
@@ -60,6 +72,15 @@ pgstat_fetch_stat_wal(void)
 }
 
 /*
+ * To determine whether WAL usage happened.
+ */
+static inline bool
+pgstat_wal_have_pending(void)
+{
+	return pgWalUsage.wal_records != prevWalUsage.wal_records;
+}
+
+/*
  * Calculate how much WAL usage counters have increased by subtracting the
  * previous counters from the current ones.
  *
@@ -67,7 +88,7 @@ pgstat_fetch_stat_wal(void)
  * acquired. Otherwise return false.
  */
 bool
-pgstat_flush_wal(bool nowait)
+pgstat_wal_flush_cb(bool nowait)
 {
 	PgStatShared_Wal *stats_shmem = &pgStatLocal.shmem->wal;
 	WalUsage	wal_usage_diff = {0};
@@ -80,7 +101,7 @@ pgstat_flush_wal(bool nowait)
 	 * This function can be called even if nothing at all has happened. Avoid
 	 * taking lock for nothing in that case.
 	 */
-	if (!pgstat_have_pending_wal())
+	if (!pgstat_wal_have_pending())
 		return false;
 
 	/*
@@ -96,18 +117,12 @@ pgstat_flush_wal(bool nowait)
 		return true;
 
 #define WALSTAT_ACC(fld, var_to_add) \
-	(stats_shmem->stats.fld += var_to_add.fld)
-#define WALSTAT_ACC_INSTR_TIME(fld) \
-	(stats_shmem->stats.fld += INSTR_TIME_GET_MICROSEC(PendingWalStats.fld))
+	(stats_shmem->stats.wal_counters.fld += var_to_add.fld)
 	WALSTAT_ACC(wal_records, wal_usage_diff);
 	WALSTAT_ACC(wal_fpi, wal_usage_diff);
 	WALSTAT_ACC(wal_bytes, wal_usage_diff);
-	WALSTAT_ACC(wal_buffers_full, PendingWalStats);
-	WALSTAT_ACC(wal_write, PendingWalStats);
-	WALSTAT_ACC(wal_sync, PendingWalStats);
-	WALSTAT_ACC_INSTR_TIME(wal_write_time);
-	WALSTAT_ACC_INSTR_TIME(wal_sync_time);
-#undef WALSTAT_ACC_INSTR_TIME
+	WALSTAT_ACC(wal_fpi_bytes, wal_usage_diff);
+	WALSTAT_ACC(wal_buffers_full, wal_usage_diff);
 #undef WALSTAT_ACC
 
 	LWLockRelease(&stats_shmem->lock);
@@ -117,38 +132,26 @@ pgstat_flush_wal(bool nowait)
 	 */
 	prevWalUsage = pgWalUsage;
 
-	/*
-	 * Clear out the statistics buffer, so it can be re-used.
-	 */
-	MemSet(&PendingWalStats, 0, sizeof(PendingWalStats));
-
 	return false;
 }
 
 void
-pgstat_init_wal(void)
+pgstat_wal_init_backend_cb(void)
 {
 	/*
-	 * Initialize prevWalUsage with pgWalUsage so that pgstat_flush_wal() can
-	 * calculate how much pgWalUsage counters are increased by subtracting
+	 * Initialize prevWalUsage with pgWalUsage so that pgstat_wal_flush_cb()
+	 * can calculate how much pgWalUsage counters are increased by subtracting
 	 * prevWalUsage from pgWalUsage.
 	 */
 	prevWalUsage = pgWalUsage;
 }
 
-/*
- * To determine whether any WAL activity has occurred since last time, not
- * only the number of generated WAL records but also the numbers of WAL
- * writes and syncs need to be checked. Because even transaction that
- * generates no WAL records can write or sync WAL data when flushing the
- * data pages.
- */
-bool
-pgstat_have_pending_wal(void)
+void
+pgstat_wal_init_shmem_cb(void *stats)
 {
-	return pgWalUsage.wal_records != prevWalUsage.wal_records ||
-		PendingWalStats.wal_write != 0 ||
-		PendingWalStats.wal_sync != 0;
+	PgStatShared_Wal *stats_shmem = (PgStatShared_Wal *) stats;
+
+	LWLockInitialize(&stats_shmem->lock, LWTRANCHE_PGSTATS_DATA);
 }
 
 void

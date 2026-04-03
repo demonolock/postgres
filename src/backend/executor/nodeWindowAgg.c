@@ -23,7 +23,7 @@
  * aggregate function over all rows in the current row's window frame.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -69,6 +69,16 @@ typedef struct WindowObjectData
 	int			readptr;		/* tuplestore read pointer for this fn */
 	int64		markpos;		/* row that markptr is positioned on */
 	int64		seekpos;		/* row that readptr is positioned on */
+	uint8	  **notnull_info;	/* not null info for each func args */
+	int64	   *num_notnull_info;	/* track size (number of tuples in
+									 * partition) of the notnull_info array
+									 * for each func args */
+
+	/*
+	 * Null treatment options. One of: NO_NULLTREATMENT, PARSER_IGNORE_NULLS,
+	 * PARSER_RESPECT_NULLS or IGNORE_NULLS.
+	 */
+	int			ignore_nulls;
 } WindowObjectData;
 
 /*
@@ -96,9 +106,10 @@ typedef struct WindowStatePerFuncData
 
 	bool		plain_agg;		/* is it just a plain aggregate function? */
 	int			aggno;			/* if so, index of its WindowStatePerAggData */
+	uint8		ignore_nulls;	/* ignore nulls */
 
 	WindowObject winobj;		/* object used in window function API */
-}			WindowStatePerFuncData;
+} WindowStatePerFuncData;
 
 /*
  * For plain aggregate window functions, we also have one of these.
@@ -182,8 +193,8 @@ static void begin_partition(WindowAggState *winstate);
 static void spool_tuples(WindowAggState *winstate, int64 pos);
 static void release_partition(WindowAggState *winstate);
 
-static int	row_is_in_frame(WindowAggState *winstate, int64 pos,
-							TupleTableSlot *slot);
+static int	row_is_in_frame(WindowObject winobj, int64 pos,
+							TupleTableSlot *slot, bool fetch_tuple);
 static void update_frameheadpos(WindowAggState *winstate);
 static void update_frametailpos(WindowAggState *winstate);
 static void update_grouptailpos(WindowAggState *winstate);
@@ -198,6 +209,38 @@ static bool are_peers(WindowAggState *winstate, TupleTableSlot *slot1,
 static bool window_gettupleslot(WindowObject winobj, int64 pos,
 								TupleTableSlot *slot);
 
+static Datum ignorenulls_getfuncarginframe(WindowObject winobj, int argno,
+										   int relpos, int seektype,
+										   bool set_mark, bool *isnull,
+										   bool *isout);
+static Datum gettuple_eval_partition(WindowObject winobj, int argno,
+									 int64 abs_pos, bool *isnull,
+									 bool *isout);
+static void init_notnull_info(WindowObject winobj,
+							  WindowStatePerFunc perfuncstate);
+static void grow_notnull_info(WindowObject winobj,
+							  int64 pos, int argno);
+static uint8 get_notnull_info(WindowObject winobj,
+							  int64 pos, int argno);
+static void put_notnull_info(WindowObject winobj,
+							 int64 pos, int argno, bool isnull);
+
+/*
+ * Not null info bit array consists of 2-bit items
+ */
+#define	NN_UNKNOWN	0x00		/* value not calculated yet */
+#define	NN_NULL		0x01		/* NULL */
+#define	NN_NOTNULL	0x02		/* NOT NULL */
+#define	NN_MASK		0x03		/* mask for NOT NULL MAP */
+#define NN_BITS_PER_MEMBER	2	/* number of bits in not null map */
+/* number of items per variable */
+#define NN_ITEM_PER_VAR	(BITS_PER_BYTE / NN_BITS_PER_MEMBER)
+/* convert map position to byte offset */
+#define NN_POS_TO_BYTES(pos)	((pos) / NN_ITEM_PER_VAR)
+/* bytes offset to map position */
+#define NN_BYTES_TO_POS(bytes)	((bytes) * NN_ITEM_PER_VAR)
+/* calculate shift bits */
+#define	NN_SHIFT(pos)	((pos) % NN_ITEM_PER_VAR) * NN_BITS_PER_MEMBER
 
 /*
  * initialize_windowaggregate
@@ -216,7 +259,7 @@ initialize_windowaggregate(WindowAggState *winstate,
 	 * it, so we must leave it to the caller to reset at an appropriate time.
 	 */
 	if (peraggstate->aggcontext != winstate->aggcontext)
-		MemoryContextResetAndDeleteChildren(peraggstate->aggcontext);
+		MemoryContextReset(peraggstate->aggcontext);
 
 	if (peraggstate->initValueIsNull)
 		peraggstate->transValue = peraggstate->initValue;
@@ -339,7 +382,7 @@ advance_windowaggregate(WindowAggState *winstate,
 	InitFunctionCallInfoData(*fcinfo, &(peraggstate->transfn),
 							 numArguments + 1,
 							 perfuncstate->winCollation,
-							 (void *) winstate, NULL);
+							 (Node *) winstate, NULL);
 	fcinfo->args[0].value = peraggstate->transValue;
 	fcinfo->args[0].isnull = peraggstate->transValueIsNull;
 	winstate->curaggcontext = peraggstate->aggcontext;
@@ -510,7 +553,7 @@ advance_windowaggregate_base(WindowAggState *winstate,
 	InitFunctionCallInfoData(*fcinfo, &(peraggstate->invtransfn),
 							 numArguments + 1,
 							 perfuncstate->winCollation,
-							 (void *) winstate, NULL);
+							 (Node *) winstate, NULL);
 	fcinfo->args[0].value = peraggstate->transValue;
 	fcinfo->args[0].isnull = peraggstate->transValueIsNull;
 	winstate->curaggcontext = peraggstate->aggcontext;
@@ -601,7 +644,7 @@ finalize_windowaggregate(WindowAggState *winstate,
 		InitFunctionCallInfoData(fcinfodata.fcinfo, &(peraggstate->finalfn),
 								 numFinalArgs,
 								 perfuncstate->winCollation,
-								 (void *) winstate, NULL);
+								 (Node *) winstate, NULL);
 		fcinfo->args[0].value =
 			MakeExpandedObjectReadOnly(peraggstate->transValue,
 									   peraggstate->transValueIsNull,
@@ -875,7 +918,7 @@ eval_windowaggregates(WindowAggState *winstate)
 	 * result for it, else we'll leak memory.
 	 */
 	if (numaggs_restart > 0)
-		MemoryContextResetAndDeleteChildren(winstate->aggcontext);
+		MemoryContextReset(winstate->aggcontext);
 	for (i = 0; i < numaggs; i++)
 	{
 		peraggstate = &winstate->peragg[i];
@@ -942,7 +985,8 @@ eval_windowaggregates(WindowAggState *winstate)
 		 * Exit loop if no more rows can be in frame.  Skip aggregation if
 		 * current row is not in frame but there might be more in the frame.
 		 */
-		ret = row_is_in_frame(winstate, winstate->aggregatedupto, agg_row_slot);
+		ret = row_is_in_frame(agg_winobj, winstate->aggregatedupto,
+							  agg_row_slot, false);
 		if (ret < 0)
 			break;
 		if (ret == 0)
@@ -1047,7 +1091,7 @@ eval_windowfunction(WindowAggState *winstate, WindowStatePerFunc perfuncstate,
 	InitFunctionCallInfoData(*fcinfo, &(perfuncstate->flinfo),
 							 perfuncstate->numArguments,
 							 perfuncstate->winCollation,
-							 (void *) perfuncstate->winobj, NULL);
+							 (Node *) perfuncstate->winobj, NULL);
 	/* Just in case, make all the regular argument slots be null */
 	for (int argno = 0; argno < perfuncstate->numArguments; argno++)
 		fcinfo->args[argno].isnull = true;
@@ -1074,57 +1118,24 @@ eval_windowfunction(WindowAggState *winstate, WindowStatePerFunc perfuncstate,
 }
 
 /*
- * begin_partition
- * Start buffering rows of the next partition.
+ * prepare_tuplestore
+ *		Prepare the tuplestore and all of the required read pointers for the
+ *		WindowAggState's frameOptions.
+ *
+ * Note: We use pg_noinline to avoid bloating the calling function with code
+ * which is only called once.
  */
-static void
-begin_partition(WindowAggState *winstate)
+static pg_noinline void
+prepare_tuplestore(WindowAggState *winstate)
 {
 	WindowAgg  *node = (WindowAgg *) winstate->ss.ps.plan;
-	PlanState  *outerPlan = outerPlanState(winstate);
 	int			frameOptions = winstate->frameOptions;
 	int			numfuncs = winstate->numfuncs;
-	int			i;
 
-	winstate->partition_spooled = false;
-	winstate->framehead_valid = false;
-	winstate->frametail_valid = false;
-	winstate->grouptail_valid = false;
-	winstate->spooled_rows = 0;
-	winstate->currentpos = 0;
-	winstate->frameheadpos = 0;
-	winstate->frametailpos = 0;
-	winstate->currentgroup = 0;
-	winstate->frameheadgroup = 0;
-	winstate->frametailgroup = 0;
-	winstate->groupheadpos = 0;
-	winstate->grouptailpos = -1;	/* see update_grouptailpos */
-	ExecClearTuple(winstate->agg_row_slot);
-	if (winstate->framehead_slot)
-		ExecClearTuple(winstate->framehead_slot);
-	if (winstate->frametail_slot)
-		ExecClearTuple(winstate->frametail_slot);
+	/* we shouldn't be called if this was done already */
+	Assert(winstate->buffer == NULL);
 
-	/*
-	 * If this is the very first partition, we need to fetch the first input
-	 * row to store in first_part_slot.
-	 */
-	if (TupIsNull(winstate->first_part_slot))
-	{
-		TupleTableSlot *outerslot = ExecProcNode(outerPlan);
-
-		if (!TupIsNull(outerslot))
-			ExecCopySlot(winstate->first_part_slot, outerslot);
-		else
-		{
-			/* outer plan is empty, so we have nothing to do */
-			winstate->partition_spooled = true;
-			winstate->more_partitions = false;
-			return;
-		}
-	}
-
-	/* Create new tuplestore for this partition */
+	/* Create new tuplestore */
 	winstate->buffer = tuplestore_begin_heap(false, false, work_mem);
 
 	/*
@@ -1158,16 +1169,10 @@ begin_partition(WindowAggState *winstate)
 
 		agg_winobj->readptr = tuplestore_alloc_read_pointer(winstate->buffer,
 															readptr_flags);
-		agg_winobj->markpos = -1;
-		agg_winobj->seekpos = -1;
-
-		/* Also reset the row counters for aggregates */
-		winstate->aggregatedbase = 0;
-		winstate->aggregatedupto = 0;
 	}
 
 	/* create mark and read pointers for each real window function */
-	for (i = 0; i < numfuncs; i++)
+	for (int i = 0; i < numfuncs; i++)
 	{
 		WindowStatePerFunc perfuncstate = &(winstate->perfunc[i]);
 
@@ -1179,8 +1184,6 @@ begin_partition(WindowAggState *winstate)
 															0);
 			winobj->readptr = tuplestore_alloc_read_pointer(winstate->buffer,
 															EXEC_FLAG_BACKWARD);
-			winobj->markpos = -1;
-			winobj->seekpos = -1;
 		}
 	}
 
@@ -1223,6 +1226,104 @@ begin_partition(WindowAggState *winstate)
 	{
 		winstate->grouptail_ptr =
 			tuplestore_alloc_read_pointer(winstate->buffer, 0);
+	}
+}
+
+/*
+ * begin_partition
+ * Start buffering rows of the next partition.
+ */
+static void
+begin_partition(WindowAggState *winstate)
+{
+	PlanState  *outerPlan = outerPlanState(winstate);
+	int			numfuncs = winstate->numfuncs;
+
+	winstate->partition_spooled = false;
+	winstate->framehead_valid = false;
+	winstate->frametail_valid = false;
+	winstate->grouptail_valid = false;
+	winstate->spooled_rows = 0;
+	winstate->currentpos = 0;
+	winstate->frameheadpos = 0;
+	winstate->frametailpos = 0;
+	winstate->currentgroup = 0;
+	winstate->frameheadgroup = 0;
+	winstate->frametailgroup = 0;
+	winstate->groupheadpos = 0;
+	winstate->grouptailpos = -1;	/* see update_grouptailpos */
+	ExecClearTuple(winstate->agg_row_slot);
+	if (winstate->framehead_slot)
+		ExecClearTuple(winstate->framehead_slot);
+	if (winstate->frametail_slot)
+		ExecClearTuple(winstate->frametail_slot);
+
+	/*
+	 * If this is the very first partition, we need to fetch the first input
+	 * row to store in first_part_slot.
+	 */
+	if (TupIsNull(winstate->first_part_slot))
+	{
+		TupleTableSlot *outerslot = ExecProcNode(outerPlan);
+
+		if (!TupIsNull(outerslot))
+			ExecCopySlot(winstate->first_part_slot, outerslot);
+		else
+		{
+			/* outer plan is empty, so we have nothing to do */
+			winstate->partition_spooled = true;
+			winstate->more_partitions = false;
+			return;
+		}
+	}
+
+	/* Create new tuplestore if not done already. */
+	if (unlikely(winstate->buffer == NULL))
+		prepare_tuplestore(winstate);
+
+	winstate->next_partition = false;
+
+	if (winstate->numaggs > 0)
+	{
+		WindowObject agg_winobj = winstate->agg_winobj;
+
+		/* reset mark and see positions for aggregate functions */
+		agg_winobj->markpos = -1;
+		agg_winobj->seekpos = -1;
+
+		/* Also reset the row counters for aggregates */
+		winstate->aggregatedbase = 0;
+		winstate->aggregatedupto = 0;
+	}
+
+	/* reset mark and seek positions for each real window function */
+	for (int i = 0; i < numfuncs; i++)
+	{
+		WindowStatePerFunc perfuncstate = &(winstate->perfunc[i]);
+
+		if (!perfuncstate->plain_agg)
+		{
+			WindowObject winobj = perfuncstate->winobj;
+
+			winobj->markpos = -1;
+			winobj->seekpos = -1;
+
+			/* reset null map */
+			if (winobj->ignore_nulls == IGNORE_NULLS ||
+				winobj->ignore_nulls == PARSER_IGNORE_NULLS)
+			{
+				int			numargs = perfuncstate->numArguments;
+
+				for (int j = 0; j < numargs; j++)
+				{
+					int			n = winobj->num_notnull_info[j];
+
+					if (n > 0)
+						memset(winobj->notnull_info[j], 0,
+							   NN_POS_TO_BYTES(n));
+				}
+			}
+		}
 	}
 
 	/*
@@ -1351,18 +1452,18 @@ release_partition(WindowAggState *winstate)
 	 * any aggregate temp data).  We don't rely on retail pfree because some
 	 * aggregates might have allocated data we don't have direct pointers to.
 	 */
-	MemoryContextResetAndDeleteChildren(winstate->partcontext);
-	MemoryContextResetAndDeleteChildren(winstate->aggcontext);
+	MemoryContextReset(winstate->partcontext);
+	MemoryContextReset(winstate->aggcontext);
 	for (i = 0; i < winstate->numaggs; i++)
 	{
 		if (winstate->peragg[i].aggcontext != winstate->aggcontext)
-			MemoryContextResetAndDeleteChildren(winstate->peragg[i].aggcontext);
+			MemoryContextReset(winstate->peragg[i].aggcontext);
 	}
 
 	if (winstate->buffer)
-		tuplestore_end(winstate->buffer);
-	winstate->buffer = NULL;
+		tuplestore_clear(winstate->buffer);
 	winstate->partition_spooled = false;
+	winstate->next_partition = true;
 }
 
 /*
@@ -1371,8 +1472,8 @@ release_partition(WindowAggState *winstate)
  * to our window framing rule
  *
  * The caller must have already determined that the row is in the partition
- * and fetched it into a slot.  This function just encapsulates the framing
- * rules.
+ * and fetched it into a slot if fetch_tuple is false.
+ * This function just encapsulates the framing rules.
  *
  * Returns:
  * -1, if the row is out of frame and no succeeding rows can be in frame
@@ -1382,8 +1483,10 @@ release_partition(WindowAggState *winstate)
  * May clobber winstate->temp_slot_2.
  */
 static int
-row_is_in_frame(WindowAggState *winstate, int64 pos, TupleTableSlot *slot)
+row_is_in_frame(WindowObject winobj, int64 pos, TupleTableSlot *slot,
+				bool fetch_tuple)
 {
+	WindowAggState *winstate = winobj->winstate;
 	int			frameOptions = winstate->frameOptions;
 
 	Assert(pos >= 0);			/* else caller error */
@@ -1412,9 +1515,14 @@ row_is_in_frame(WindowAggState *winstate, int64 pos, TupleTableSlot *slot)
 		else if (frameOptions & (FRAMEOPTION_RANGE | FRAMEOPTION_GROUPS))
 		{
 			/* following row that is not peer is out of frame */
-			if (pos > winstate->currentpos &&
-				!are_peers(winstate, slot, winstate->ss.ss_ScanTupleSlot))
-				return -1;
+			if (pos > winstate->currentpos)
+			{
+				if (fetch_tuple)	/* need to fetch tuple? */
+					if (!window_gettupleslot(winobj, pos, slot))
+						return -1;
+				if (!are_peers(winstate, slot, winstate->ss.ss_ScanTupleSlot))
+					return -1;
+			}
 		}
 		else
 			Assert(false);
@@ -2032,6 +2140,82 @@ update_grouptailpos(WindowAggState *winstate)
 	MemoryContextSwitchTo(oldcontext);
 }
 
+/*
+ * calculate_frame_offsets
+ *		Determine the startOffsetValue and endOffsetValue values for the
+ *		WindowAgg's frame options.
+ */
+static pg_noinline void
+calculate_frame_offsets(PlanState *pstate)
+{
+	WindowAggState *winstate = castNode(WindowAggState, pstate);
+	ExprContext *econtext;
+	int			frameOptions = winstate->frameOptions;
+	Datum		value;
+	bool		isnull;
+	int16		len;
+	bool		byval;
+
+	/* Ensure we've not been called before for this scan */
+	Assert(winstate->all_first);
+
+	econtext = winstate->ss.ps.ps_ExprContext;
+
+	if (frameOptions & FRAMEOPTION_START_OFFSET)
+	{
+		Assert(winstate->startOffset != NULL);
+		value = ExecEvalExprSwitchContext(winstate->startOffset,
+										  econtext,
+										  &isnull);
+		if (isnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("frame starting offset must not be null")));
+		/* copy value into query-lifespan context */
+		get_typlenbyval(exprType((Node *) winstate->startOffset->expr),
+						&len,
+						&byval);
+		winstate->startOffsetValue = datumCopy(value, byval, len);
+		if (frameOptions & (FRAMEOPTION_ROWS | FRAMEOPTION_GROUPS))
+		{
+			/* value is known to be int8 */
+			int64		offset = DatumGetInt64(value);
+
+			if (offset < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PRECEDING_OR_FOLLOWING_SIZE),
+						 errmsg("frame starting offset must not be negative")));
+		}
+	}
+
+	if (frameOptions & FRAMEOPTION_END_OFFSET)
+	{
+		Assert(winstate->endOffset != NULL);
+		value = ExecEvalExprSwitchContext(winstate->endOffset,
+										  econtext,
+										  &isnull);
+		if (isnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("frame ending offset must not be null")));
+		/* copy value into query-lifespan context */
+		get_typlenbyval(exprType((Node *) winstate->endOffset->expr),
+						&len,
+						&byval);
+		winstate->endOffsetValue = datumCopy(value, byval, len);
+		if (frameOptions & (FRAMEOPTION_ROWS | FRAMEOPTION_GROUPS))
+		{
+			/* value is known to be int8 */
+			int64		offset = DatumGetInt64(value);
+
+			if (offset < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PRECEDING_OR_FOLLOWING_SIZE),
+						 errmsg("frame ending offset must not be negative")));
+		}
+	}
+	winstate->all_first = false;
+}
 
 /* -----------------
  * ExecWindowAgg
@@ -2061,73 +2245,13 @@ ExecWindowAgg(PlanState *pstate)
 	 * rescan).  These are assumed to hold constant throughout the scan; if
 	 * user gives us a volatile expression, we'll only use its initial value.
 	 */
-	if (winstate->all_first)
-	{
-		int			frameOptions = winstate->frameOptions;
-		Datum		value;
-		bool		isnull;
-		int16		len;
-		bool		byval;
-
-		econtext = winstate->ss.ps.ps_ExprContext;
-
-		if (frameOptions & FRAMEOPTION_START_OFFSET)
-		{
-			Assert(winstate->startOffset != NULL);
-			value = ExecEvalExprSwitchContext(winstate->startOffset,
-											  econtext,
-											  &isnull);
-			if (isnull)
-				ereport(ERROR,
-						(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-						 errmsg("frame starting offset must not be null")));
-			/* copy value into query-lifespan context */
-			get_typlenbyval(exprType((Node *) winstate->startOffset->expr),
-							&len, &byval);
-			winstate->startOffsetValue = datumCopy(value, byval, len);
-			if (frameOptions & (FRAMEOPTION_ROWS | FRAMEOPTION_GROUPS))
-			{
-				/* value is known to be int8 */
-				int64		offset = DatumGetInt64(value);
-
-				if (offset < 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PRECEDING_OR_FOLLOWING_SIZE),
-							 errmsg("frame starting offset must not be negative")));
-			}
-		}
-		if (frameOptions & FRAMEOPTION_END_OFFSET)
-		{
-			Assert(winstate->endOffset != NULL);
-			value = ExecEvalExprSwitchContext(winstate->endOffset,
-											  econtext,
-											  &isnull);
-			if (isnull)
-				ereport(ERROR,
-						(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-						 errmsg("frame ending offset must not be null")));
-			/* copy value into query-lifespan context */
-			get_typlenbyval(exprType((Node *) winstate->endOffset->expr),
-							&len, &byval);
-			winstate->endOffsetValue = datumCopy(value, byval, len);
-			if (frameOptions & (FRAMEOPTION_ROWS | FRAMEOPTION_GROUPS))
-			{
-				/* value is known to be int8 */
-				int64		offset = DatumGetInt64(value);
-
-				if (offset < 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PRECEDING_OR_FOLLOWING_SIZE),
-							 errmsg("frame ending offset must not be negative")));
-			}
-		}
-		winstate->all_first = false;
-	}
+	if (unlikely(winstate->all_first))
+		calculate_frame_offsets(pstate);
 
 	/* We need to loop as the runCondition or qual may filter out tuples */
 	for (;;)
 	{
-		if (winstate->buffer == NULL)
+		if (winstate->next_partition)
 		{
 			/* Initialize for first partition and set current row = 0 */
 			begin_partition(winstate);
@@ -2297,6 +2421,23 @@ ExecWindowAgg(PlanState *pstate)
 				if (winstate->use_pass_through)
 				{
 					/*
+					 * When switching into a pass-through mode, we'd better
+					 * NULLify the aggregate results as these are no longer
+					 * updated and NULLifying them avoids the old stale
+					 * results lingering.  Some of these might be byref types
+					 * so we can't have them pointing to free'd memory.  The
+					 * planner insisted that quals used in the runcondition
+					 * are strict, so the top-level WindowAgg will always
+					 * filter these NULLs out in the filter clause.
+					 */
+					numfuncs = winstate->numfuncs;
+					for (i = 0; i < numfuncs; i++)
+					{
+						econtext->ecxt_aggvalues[i] = (Datum) 0;
+						econtext->ecxt_aggnulls[i] = true;
+					}
+
+					/*
 					 * STRICT pass-through mode is required for the top window
 					 * when there is a PARTITION BY clause.  Otherwise we must
 					 * ensure we store tuples that don't match the
@@ -2310,24 +2451,6 @@ ExecWindowAgg(PlanState *pstate)
 					else
 					{
 						winstate->status = WINDOWAGG_PASSTHROUGH;
-
-						/*
-						 * If we're not the top-window, we'd better NULLify
-						 * the aggregate results.  In pass-through mode we no
-						 * longer update these and this avoids the old stale
-						 * results lingering.  Some of these might be byref
-						 * types so we can't have them pointing to free'd
-						 * memory.  The planner insisted that quals used in
-						 * the runcondition are strict, so the top-level
-						 * WindowAgg will filter these NULLs out in the filter
-						 * clause.
-						 */
-						numfuncs = winstate->numfuncs;
-						for (i = 0; i < numfuncs; i++)
-						{
-							econtext->ecxt_aggvalues[i] = (Datum) 0;
-							econtext->ecxt_aggnulls[i] = true;
-						}
 					}
 				}
 				else
@@ -2398,6 +2521,9 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 	winstate->ss.ps.plan = (Plan *) node;
 	winstate->ss.ps.state = estate;
 	winstate->ss.ps.ExecProcNode = ExecWindowAgg;
+
+	/* copy frame options to state node for easy access */
+	winstate->frameOptions = frameOptions;
 
 	/*
 	 * Create expression contexts.  We need two, one for per-input-tuple
@@ -2535,14 +2661,14 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 	numfuncs = winstate->numfuncs;
 	numaggs = winstate->numaggs;
 	econtext = winstate->ss.ps.ps_ExprContext;
-	econtext->ecxt_aggvalues = (Datum *) palloc0(sizeof(Datum) * numfuncs);
-	econtext->ecxt_aggnulls = (bool *) palloc0(sizeof(bool) * numfuncs);
+	econtext->ecxt_aggvalues = palloc0_array(Datum, numfuncs);
+	econtext->ecxt_aggnulls = palloc0_array(bool, numfuncs);
 
 	/*
 	 * allocate per-wfunc/per-agg state information.
 	 */
-	perfunc = (WindowStatePerFunc) palloc0(sizeof(WindowStatePerFuncData) * numfuncs);
-	peragg = (WindowStatePerAgg) palloc0(sizeof(WindowStatePerAggData) * numaggs);
+	perfunc = palloc0_array(WindowStatePerFuncData, numfuncs);
+	peragg = palloc0_array(WindowStatePerAggData, numaggs);
 	winstate->perfunc = perfunc;
 	winstate->peragg = peragg;
 
@@ -2560,14 +2686,17 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 			elog(ERROR, "WindowFunc with winref %u assigned to WindowAgg with winref %u",
 				 wfunc->winref, node->winref);
 
-		/* Look for a previous duplicate window function */
+		/*
+		 * Look for a previous duplicate window function, which needs the same
+		 * ignore_nulls value
+		 */
 		for (i = 0; i <= wfuncno; i++)
 		{
 			if (equal(wfunc, perfunc[i].wfunc) &&
 				!contain_volatile_functions((Node *) wfunc))
 				break;
 		}
-		if (i <= wfuncno)
+		if (i <= wfuncno && wfunc->ignore_nulls == perfunc[i].ignore_nulls)
 		{
 			/* Found a match to an existing entry, so just mark it */
 			wfuncstate->wfuncno = i;
@@ -2620,6 +2749,8 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 			winobj->argstates = wfuncstate->args;
 			winobj->localmem = NULL;
 			perfuncstate->winobj = winobj;
+			winobj->ignore_nulls = wfunc->ignore_nulls;
+			init_notnull_info(winobj, perfuncstate);
 
 			/* It's a real window function, so set up to call it. */
 			fmgr_info_cxt(wfunc->winfnoid, &perfuncstate->flinfo,
@@ -2649,9 +2780,6 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 	/* Set the status to running */
 	winstate->status = WINDOWAGG_RUN;
 
-	/* copy frame options to state node for easy access */
-	winstate->frameOptions = frameOptions;
-
 	/* initialize frame bound offset expressions */
 	winstate->startOffset = ExecInitExpr((Expr *) node->startOffset,
 										 (PlanState *) winstate);
@@ -2670,6 +2798,7 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 	winstate->all_first = true;
 	winstate->partition_spooled = false;
 	winstate->more_partitions = false;
+	winstate->next_partition = true;
 
 	return winstate;
 }
@@ -2684,24 +2813,15 @@ ExecEndWindowAgg(WindowAggState *node)
 	PlanState  *outerPlan;
 	int			i;
 
+	if (node->buffer != NULL)
+	{
+		tuplestore_end(node->buffer);
+
+		/* nullify so that release_partition skips the tuplestore_clear() */
+		node->buffer = NULL;
+	}
+
 	release_partition(node);
-
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
-	ExecClearTuple(node->first_part_slot);
-	ExecClearTuple(node->agg_row_slot);
-	ExecClearTuple(node->temp_slot_1);
-	ExecClearTuple(node->temp_slot_2);
-	if (node->framehead_slot)
-		ExecClearTuple(node->framehead_slot);
-	if (node->frametail_slot)
-		ExecClearTuple(node->frametail_slot);
-
-	/*
-	 * Free both the expr contexts.
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-	node->ss.ps.ps_ExprContext = node->tmpcontext;
-	ExecFreeExprContext(&node->ss.ps);
 
 	for (i = 0; i < node->numaggs; i++)
 	{
@@ -2802,7 +2922,7 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 
 	/*
 	 * Figure out whether we want to use the moving-aggregate implementation,
-	 * and collect the right set of fields from the pg_attribute entry.
+	 * and collect the right set of fields from the pg_aggregate entry.
 	 *
 	 * It's possible that an aggregate would supply a safe moving-aggregate
 	 * implementation and an unsafe normal one, in which case our hand is
@@ -3166,11 +3286,314 @@ window_gettupleslot(WindowObject winobj, int64 pos, TupleTableSlot *slot)
 	return true;
 }
 
+/* gettuple_eval_partition
+ * get tuple in a partition and evaluate the window function's argument
+ * expression on it.
+ */
+static Datum
+gettuple_eval_partition(WindowObject winobj, int argno,
+						int64 abs_pos, bool *isnull, bool *isout)
+{
+	WindowAggState *winstate;
+	ExprContext *econtext;
+	TupleTableSlot *slot;
+
+	winstate = winobj->winstate;
+	slot = winstate->temp_slot_1;
+	if (!window_gettupleslot(winobj, abs_pos, slot))
+	{
+		/* out of partition */
+		if (isout)
+			*isout = true;
+		*isnull = true;
+		return (Datum) 0;
+	}
+
+	if (isout)
+		*isout = false;
+	econtext = winstate->ss.ps.ps_ExprContext;
+	econtext->ecxt_outertuple = slot;
+	return ExecEvalExpr((ExprState *) list_nth
+						(winobj->argstates, argno),
+						econtext, isnull);
+}
+
+/*
+ * ignorenulls_getfuncarginframe
+ * For IGNORE NULLS, get the next nonnull value in the frame, moving forward
+ * or backward until we find a value or reach the frame's end.
+ */
+static Datum
+ignorenulls_getfuncarginframe(WindowObject winobj, int argno,
+							  int relpos, int seektype, bool set_mark,
+							  bool *isnull, bool *isout)
+{
+	WindowAggState *winstate;
+	ExprContext *econtext;
+	TupleTableSlot *slot;
+	Datum		datum;
+	int64		abs_pos;
+	int64		mark_pos;
+	int			notnull_offset;
+	int			notnull_relpos;
+	int			forward;
+
+	Assert(WindowObjectIsValid(winobj));
+	winstate = winobj->winstate;
+	econtext = winstate->ss.ps.ps_ExprContext;
+	slot = winstate->temp_slot_1;
+	datum = (Datum) 0;
+	notnull_offset = 0;
+	notnull_relpos = abs(relpos);
+
+	switch (seektype)
+	{
+		case WINDOW_SEEK_CURRENT:
+			elog(ERROR, "WINDOW_SEEK_CURRENT is not supported for WinGetFuncArgInFrame");
+			abs_pos = mark_pos = 0; /* keep compiler quiet */
+			break;
+		case WINDOW_SEEK_HEAD:
+			/* rejecting relpos < 0 is easy and simplifies code below */
+			if (relpos < 0)
+				goto out_of_frame;
+			update_frameheadpos(winstate);
+			abs_pos = winstate->frameheadpos;
+			mark_pos = winstate->frameheadpos;
+			forward = 1;
+			break;
+		case WINDOW_SEEK_TAIL:
+			/* rejecting relpos > 0 is easy and simplifies code below */
+			if (relpos > 0)
+				goto out_of_frame;
+			update_frametailpos(winstate);
+			abs_pos = winstate->frametailpos - 1;
+			mark_pos = 0;		/* keep compiler quiet */
+			forward = -1;
+			break;
+		default:
+			elog(ERROR, "unrecognized window seek type: %d", seektype);
+			abs_pos = mark_pos = 0; /* keep compiler quiet */
+			break;
+	}
+
+	/*
+	 * Get the next nonnull value in the frame, moving forward or backward
+	 * until we find a value or reach the frame's end.
+	 */
+	do
+	{
+		int			inframe;
+		int			v;
+
+		/*
+		 * Check apparent out of frame case.  We need to do this because we
+		 * may not call window_gettupleslot before row_is_in_frame, which
+		 * supposes abs_pos is never negative.
+		 */
+		if (abs_pos < 0)
+			goto out_of_frame;
+
+		/* check whether row is in frame */
+		inframe = row_is_in_frame(winobj, abs_pos, slot, true);
+		if (inframe == -1)
+			goto out_of_frame;
+		else if (inframe == 0)
+			goto advance;
+
+		if (isout)
+			*isout = false;
+
+		v = get_notnull_info(winobj, abs_pos, argno);
+		if (v == NN_NULL)		/* this row is known to be NULL */
+			goto advance;
+
+		else if (v == NN_UNKNOWN)	/* need to check NULL or not */
+		{
+			if (!window_gettupleslot(winobj, abs_pos, slot))
+				goto out_of_frame;
+
+			econtext->ecxt_outertuple = slot;
+			datum = ExecEvalExpr(
+								 (ExprState *) list_nth(winobj->argstates,
+														argno), econtext,
+								 isnull);
+			if (!*isnull)
+				notnull_offset++;
+
+			/* record the row status */
+			put_notnull_info(winobj, abs_pos, argno, *isnull);
+		}
+		else					/* this row is known to be NOT NULL */
+		{
+			notnull_offset++;
+			if (notnull_offset > notnull_relpos)
+			{
+				/* to prepare exiting this loop, datum needs to be set */
+				if (!window_gettupleslot(winobj, abs_pos, slot))
+					goto out_of_frame;
+
+				econtext->ecxt_outertuple = slot;
+				datum = ExecEvalExpr(
+									 (ExprState *) list_nth
+									 (winobj->argstates, argno),
+									 econtext, isnull);
+			}
+		}
+advance:
+		abs_pos += forward;
+	} while (notnull_offset <= notnull_relpos);
+
+	if (set_mark)
+		WinSetMarkPosition(winobj, mark_pos);
+
+	return datum;
+
+out_of_frame:
+	if (isout)
+		*isout = true;
+	*isnull = true;
+	return (Datum) 0;
+}
+
+
+/*
+ * init_notnull_info
+ * Initialize non null map.
+ */
+static void
+init_notnull_info(WindowObject winobj, WindowStatePerFunc perfuncstate)
+{
+	int			numargs = perfuncstate->numArguments;
+
+	if (winobj->ignore_nulls == PARSER_IGNORE_NULLS)
+	{
+		winobj->notnull_info = palloc0_array(uint8 *, numargs);
+		winobj->num_notnull_info = palloc0_array(int64, numargs);
+	}
+}
+
+/*
+ * grow_notnull_info
+ * expand notnull_info if necessary.
+ * pos: not null info position
+ * argno: argument number
+*/
+static void
+grow_notnull_info(WindowObject winobj, int64 pos, int argno)
+{
+/* initial number of notnull info members */
+#define	INIT_NOT_NULL_INFO_NUM	128
+
+	if (pos >= winobj->num_notnull_info[argno])
+	{
+		/* We may be called in a short-lived context */
+		MemoryContext oldcontext = MemoryContextSwitchTo
+			(winobj->winstate->ss.ps.ps_ExprContext->ecxt_per_query_memory);
+
+		for (;;)
+		{
+			Size		oldsize = NN_POS_TO_BYTES
+				(winobj->num_notnull_info[argno]);
+			Size		newsize;
+
+			if (oldsize == 0)	/* memory has not been allocated yet for this
+								 * arg */
+			{
+				newsize = NN_POS_TO_BYTES(INIT_NOT_NULL_INFO_NUM);
+				winobj->notnull_info[argno] = palloc0(newsize);
+			}
+			else
+			{
+				newsize = oldsize * 2;
+				winobj->notnull_info[argno] =
+					repalloc0(winobj->notnull_info[argno], oldsize, newsize);
+			}
+			winobj->num_notnull_info[argno] = NN_BYTES_TO_POS(newsize);
+			if (winobj->num_notnull_info[argno] > pos)
+				break;
+		}
+		MemoryContextSwitchTo(oldcontext);
+	}
+}
+
+/*
+ * get_notnull_info
+ * retrieve a map
+ * pos: map position
+ * argno: argument number
+ */
+static uint8
+get_notnull_info(WindowObject winobj, int64 pos, int argno)
+{
+	uint8	   *mbp;
+	uint8		mb;
+	int64		bpos;
+
+	grow_notnull_info(winobj, pos, argno);
+	bpos = NN_POS_TO_BYTES(pos);
+	mbp = winobj->notnull_info[argno];
+	mb = mbp[bpos];
+	return (mb >> (NN_SHIFT(pos))) & NN_MASK;
+}
+
+/*
+ * put_notnull_info
+ * update map
+ * pos: map position
+ * argno: argument number
+ * isnull: indicate NULL or NOT
+ */
+static void
+put_notnull_info(WindowObject winobj, int64 pos, int argno, bool isnull)
+{
+	uint8	   *mbp;
+	uint8		mb;
+	int64		bpos;
+	uint8		val = isnull ? NN_NULL : NN_NOTNULL;
+	int			shift;
+
+	grow_notnull_info(winobj, pos, argno);
+	bpos = NN_POS_TO_BYTES(pos);
+	mbp = winobj->notnull_info[argno];
+	mb = mbp[bpos];
+	shift = NN_SHIFT(pos);
+	mb &= ~(NN_MASK << shift);	/* clear map */
+	mb |= (val << shift);		/* update map */
+	mbp[bpos] = mb;
+}
 
 /***********************************************************************
  * API exposed to window functions
  ***********************************************************************/
 
+
+/*
+ * WinCheckAndInitializeNullTreatment
+ *		Check null treatment clause and sets ignore_nulls
+ *
+ * Window functions should call this to check if they are being called with
+ * a null treatment clause when they don't allow it, or to set ignore_nulls.
+ */
+void
+WinCheckAndInitializeNullTreatment(WindowObject winobj,
+								   bool allowNullTreatment,
+								   FunctionCallInfo fcinfo)
+{
+	Assert(WindowObjectIsValid(winobj));
+	if (winobj->ignore_nulls != NO_NULLTREATMENT && !allowNullTreatment)
+	{
+		const char *funcname = get_func_name(fcinfo->flinfo->fn_oid);
+
+		if (!funcname)
+			elog(ERROR, "could not get function name");
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function %s does not allow RESPECT/IGNORE NULLS",
+						funcname)));
+	}
+	else if (winobj->ignore_nulls == PARSER_IGNORE_NULLS)
+		winobj->ignore_nulls = IGNORE_NULLS;
+}
 
 /*
  * WinGetPartitionLocalMemory
@@ -3330,23 +3753,33 @@ WinGetFuncArgInPartition(WindowObject winobj, int argno,
 						 bool *isnull, bool *isout)
 {
 	WindowAggState *winstate;
-	ExprContext *econtext;
-	TupleTableSlot *slot;
-	bool		gottuple;
 	int64		abs_pos;
+	int64		mark_pos;
+	Datum		datum;
+	bool		null_treatment;
+	int			notnull_offset;
+	int			notnull_relpos;
+	int			forward;
+	bool		myisout;
 
 	Assert(WindowObjectIsValid(winobj));
 	winstate = winobj->winstate;
-	econtext = winstate->ss.ps.ps_ExprContext;
-	slot = winstate->temp_slot_1;
+
+	null_treatment = (winobj->ignore_nulls == IGNORE_NULLS && relpos != 0);
 
 	switch (seektype)
 	{
 		case WINDOW_SEEK_CURRENT:
-			abs_pos = winstate->currentpos + relpos;
+			if (null_treatment)
+				abs_pos = winstate->currentpos;
+			else
+				abs_pos = winstate->currentpos + relpos;
 			break;
 		case WINDOW_SEEK_HEAD:
-			abs_pos = relpos;
+			if (null_treatment)
+				abs_pos = 0;
+			else
+				abs_pos = relpos;
 			break;
 		case WINDOW_SEEK_TAIL:
 			spool_tuples(winstate, -1);
@@ -3358,25 +3791,94 @@ WinGetFuncArgInPartition(WindowObject winobj, int argno,
 			break;
 	}
 
-	gottuple = window_gettupleslot(winobj, abs_pos, slot);
-
-	if (!gottuple)
+	/* Easy case if IGNORE NULLS is not specified */
+	if (!null_treatment)
 	{
+		/* get tuple and evaluate in partition */
+		datum = gettuple_eval_partition(winobj, argno,
+										abs_pos, isnull, &myisout);
+		if (!myisout && set_mark)
+			WinSetMarkPosition(winobj, abs_pos);
 		if (isout)
-			*isout = true;
-		*isnull = true;
-		return (Datum) 0;
+			*isout = myisout;
+		return datum;
 	}
+
+	/* Prepare for loop */
+	notnull_offset = 0;
+	notnull_relpos = abs(relpos);
+	forward = relpos > 0 ? 1 : -1;
+	myisout = false;
+	datum = 0;
+
+	/*
+	 * IGNORE NULLS + WINDOW_SEEK_CURRENT + relpos > 0 case, we would fetch
+	 * beyond the current row + relpos to find out the target row. If we mark
+	 * at abs_pos, next call to WinGetFuncArgInPartition or
+	 * WinGetFuncArgInFrame (in case when a window function have multiple
+	 * args) could fail with "cannot fetch row before WindowObject's mark
+	 * position". So keep the mark position at currentpos.
+	 */
+	if (seektype == WINDOW_SEEK_CURRENT && relpos > 0)
+		mark_pos = winstate->currentpos;
 	else
 	{
-		if (isout)
-			*isout = false;
-		if (set_mark)
-			WinSetMarkPosition(winobj, abs_pos);
-		econtext->ecxt_outertuple = slot;
-		return ExecEvalExpr((ExprState *) list_nth(winobj->argstates, argno),
-							econtext, isnull);
+		/*
+		 * For other cases we have no idea what position of row callers would
+		 * fetch next time. Also for relpos < 0 case (we go backward), we
+		 * cannot set mark either. For those cases we always set mark at 0.
+		 */
+		mark_pos = 0;
 	}
+
+	/*
+	 * Get the next nonnull value in the partition, moving forward or backward
+	 * until we find a value or reach the partition's end.  We cache the
+	 * nullness status because we may repeat this process many times.
+	 */
+	do
+	{
+		int			nn_info;	/* NOT NULL status */
+
+		abs_pos += forward;
+		if (abs_pos < 0)		/* clearly out of partition */
+			break;
+
+		/* check NOT NULL cached info */
+		nn_info = get_notnull_info(winobj, abs_pos, argno);
+		if (nn_info == NN_NOTNULL)	/* this row is known to be NOT NULL */
+			notnull_offset++;
+		else if (nn_info == NN_NULL)	/* this row is known to be NULL */
+			continue;			/* keep on moving forward or backward */
+		else					/* need to check NULL or not */
+		{
+			/*
+			 * NOT NULL info does not exist yet.  Get tuple and evaluate func
+			 * arg in partition. We ignore the return value from
+			 * gettuple_eval_partition because we are just interested in
+			 * whether we are inside or outside of partition, NULL or NOT
+			 * NULL.
+			 */
+			(void) gettuple_eval_partition(winobj, argno,
+										   abs_pos, isnull, &myisout);
+			if (myisout)		/* out of partition? */
+				break;
+			if (!*isnull)
+				notnull_offset++;
+			/* record the row status */
+			put_notnull_info(winobj, abs_pos, argno, *isnull);
+		}
+	} while (notnull_offset < notnull_relpos);
+
+	/* get tuple and evaluate func arg in partition */
+	datum = gettuple_eval_partition(winobj, argno,
+									abs_pos, isnull, &myisout);
+	if (!myisout && set_mark)
+		WinSetMarkPosition(winobj, mark_pos);
+	if (isout)
+		*isout = myisout;
+
+	return datum;
 }
 
 /*
@@ -3427,6 +3929,10 @@ WinGetFuncArgInFrame(WindowObject winobj, int argno,
 	winstate = winobj->winstate;
 	econtext = winstate->ss.ps.ps_ExprContext;
 	slot = winstate->temp_slot_1;
+
+	if (winobj->ignore_nulls == IGNORE_NULLS)
+		return ignorenulls_getfuncarginframe(winobj, argno, relpos, seektype,
+											 set_mark, isnull, isout);
 
 	switch (seektype)
 	{
@@ -3576,7 +4082,7 @@ WinGetFuncArgInFrame(WindowObject winobj, int argno,
 		goto out_of_frame;
 
 	/* The code above does not detect all out-of-frame cases, so check */
-	if (row_is_in_frame(winstate, abs_pos, slot) <= 0)
+	if (row_is_in_frame(winobj, abs_pos, slot, false) <= 0)
 		goto out_of_frame;
 
 	if (isout)

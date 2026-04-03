@@ -7,7 +7,7 @@
  *
  * src/backend/utils/misc/ps_status.c
  *
- * Copyright (c) 2000-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  * various details abducted from various places
  *--------------------------------------------------------------------
  */
@@ -19,13 +19,13 @@
 #include <crt_externs.h>
 #endif
 
-#include "libpq/libpq.h"
 #include "miscadmin.h"
-#include "pgstat.h"
 #include "utils/guc.h"
 #include "utils/ps_status.h"
 
+#if !defined(WIN32)
 extern char **environ;
+#endif
 
 /* GUC variable */
 bool		update_process_title = DEFAULT_UPDATE_PROCESS_TITLE;
@@ -52,7 +52,7 @@ bool		update_process_title = DEFAULT_UPDATE_PROCESS_TITLE;
 #define PS_USE_SETPROCTITLE_FAST
 #elif defined(HAVE_SETPROCTITLE)
 #define PS_USE_SETPROCTITLE
-#elif defined(__linux__) || defined(_AIX) || defined(__sun) || defined(__darwin__)
+#elif defined(__linux__) || defined(_AIX) || defined(__sun) || defined(__darwin__) || defined(__GNU__)
 #define PS_USE_CLOBBER_ARGV
 #elif defined(WIN32)
 #define PS_USE_WIN32
@@ -62,7 +62,7 @@ bool		update_process_title = DEFAULT_UPDATE_PROCESS_TITLE;
 
 
 /* Different systems want the buffer padded differently */
-#if defined(_AIX) || defined(__linux__) || defined(__darwin__)
+#if defined(_AIX) || defined(__linux__) || defined(__darwin__) || defined(__GNU__)
 #define PS_PADDING '\0'
 #else
 #define PS_PADDING ' '
@@ -100,6 +100,17 @@ static void flush_ps_display(void);
 static int	save_argc;
 static char **save_argv;
 
+/*
+ * Valgrind seems not to consider the global "environ" variable as a valid
+ * root pointer; so when we allocate a new environment array, it claims that
+ * data is leaked.  To fix that, keep our own statically-allocated copy of the
+ * pointer.  (Oddly, this doesn't seem to be a problem for "argv".)
+ */
+#if defined(PS_USE_CLOBBER_ARGV) && defined(USE_VALGRIND)
+extern char **ps_status_new_environ;
+char	  **ps_status_new_environ;
+#endif
+
 
 /*
  * Call this early in startup to save the original argc/argv values.
@@ -109,7 +120,8 @@ static char **save_argv;
  * (The original argv[] will not be overwritten by this routine, but may be
  * overwritten during init_ps_display.  Also, the physical location of the
  * environment strings may be moved, so this should be called before any code
- * that might try to hang onto a getenv() result.)
+ * that might try to hang onto a getenv() result.  But see hack for musl
+ * within.)
  *
  * Note that in case of failure this cannot call elog() as that is not
  * initialized yet.  We rely on write_stderr() instead.
@@ -124,7 +136,7 @@ save_ps_display_args(int argc, char **argv)
 
 	/*
 	 * If we're going to overwrite the argv area, count the available space.
-	 * Also move the environment to make additional room.
+	 * Also move the environment strings to make additional room.
 	 */
 	{
 		char	   *end_of_area = NULL;
@@ -153,7 +165,33 @@ save_ps_display_args(int argc, char **argv)
 		for (i = 0; environ[i] != NULL; i++)
 		{
 			if (end_of_area + 1 == environ[i])
-				end_of_area = environ[i] + strlen(environ[i]);
+			{
+				/*
+				 * The musl dynamic linker keeps a static pointer to the
+				 * initial value of LD_LIBRARY_PATH, if that is defined in the
+				 * process's environment. Therefore, we must not overwrite the
+				 * value of that setting and thus cannot advance end_of_area
+				 * beyond it.  Musl does not define any identifying compiler
+				 * symbol, so we have to do this unless we see a symbol
+				 * identifying a Linux libc we know is safe.
+				 */
+#if defined(__linux__) && (!defined(__GLIBC__) && !defined(__UCLIBC__))
+				if (strncmp(environ[i], "LD_LIBRARY_PATH=", 16) == 0)
+				{
+					/*
+					 * We can overwrite the name, but stop at the equals sign.
+					 * Future loop iterations will not find any more
+					 * contiguous space, but we don't break early because we
+					 * need to count the total number of environ[] entries.
+					 */
+					end_of_area = environ[i] + 15;
+				}
+				else
+#endif
+				{
+					end_of_area = environ[i] + strlen(environ[i]);
+				}
+			}
 		}
 
 		ps_buffer = argv[0];
@@ -179,13 +217,18 @@ save_ps_display_args(int argc, char **argv)
 		}
 		new_environ[i] = NULL;
 		environ = new_environ;
+
+		/* See notes about Valgrind above. */
+#ifdef USE_VALGRIND
+		ps_status_new_environ = new_environ;
+#endif
 	}
 
 	/*
 	 * If we're going to change the original argv[] then make a copy for
 	 * argument parsing purposes.
 	 *
-	 * (NB: do NOT think to remove the copying of argv[], even though
+	 * NB: do NOT think to remove the copying of argv[], even though
 	 * postmaster.c finishes looking at argv[] long before we ever consider
 	 * changing the ps display.  On some platforms, getopt() keeps pointers
 	 * into the argv array, and will get horribly confused when it is
